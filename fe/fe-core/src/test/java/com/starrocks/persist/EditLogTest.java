@@ -1,33 +1,48 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.persist;
 
 import com.starrocks.common.io.Text;
-import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.ha.FrontendNodeType;
 import com.starrocks.journal.JournalEntity;
+import com.starrocks.journal.JournalInconsistentException;
 import com.starrocks.journal.JournalTask;
-import com.starrocks.lake.ShardDeleter;
-import com.starrocks.lake.ShardManager;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.NodeMgr;
 import com.starrocks.system.Frontend;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.junit.Assert;
+import org.junit.Before;
 import org.junit.Test;
 
 import java.lang.reflect.Field;
 import java.util.ArrayList;
-import java.util.HashSet;
 import java.util.List;
-import java.util.Set;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentHashMap;
 
 public class EditLogTest {
     public static final Logger LOG = LogManager.getLogger(EditLogTest.class);
+
+    @Before
+    public void setUp() {
+        GlobalStateMgr.getCurrentState().setFrontendNodeType(FrontendNodeType.LEADER);
+    }
 
     @Test
     public void testtNormal() throws Exception {
@@ -125,7 +140,7 @@ public class EditLogTest {
     private GlobalStateMgr mockGlobalStateMgr() throws Exception {
         GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
 
-        NodeMgr nodeMgr = new NodeMgr(false, globalStateMgr);
+        NodeMgr nodeMgr = new NodeMgr();
         Field field1 = nodeMgr.getClass().getDeclaredField("frontends");
         field1.setAccessible(true);
 
@@ -138,49 +153,36 @@ public class EditLogTest {
         field2.setAccessible(true);
         field2.set(globalStateMgr, nodeMgr);
 
-        ShardManager shardManager = new ShardManager();
-        Field field3 = globalStateMgr.getClass().getDeclaredField("shardManager");
-        field3.setAccessible(true);
-        field3.set(globalStateMgr, shardManager);
-
         return globalStateMgr;
     }
 
     @Test
     public void testOpUpdateFrontend() throws Exception {
         GlobalStateMgr mgr = mockGlobalStateMgr();
-        List<Frontend> frontends = mgr.getFrontends(null);
+        List<Frontend> frontends = mgr.getNodeMgr().getFrontends(null);
         Frontend fe = frontends.get(0);
         fe.updateHostAndEditLogPort("testHost", 1000);
         JournalEntity journal = new JournalEntity();
         journal.setData(fe);
         journal.setOpCode(OperationType.OP_UPDATE_FRONTEND);
         EditLog.loadJournal(mgr, journal);
-        List<Frontend> updatedFrontends = mgr.getFrontends(null);
+        List<Frontend> updatedFrontends = mgr.getNodeMgr().getFrontends(null);
         Frontend updatedfFe = updatedFrontends.get(0);
         Assert.assertEquals("testHost", updatedfFe.getHost());
         Assert.assertTrue(updatedfFe.getEditLogPort() == 1000);
     }
 
     @Test
-    public void testUpdateUnusedShardId() throws Exception {
-        GlobalStateMgr mgr = mockGlobalStateMgr();
+    public void testLoadJournalException() {
         JournalEntity journal = new JournalEntity();
-        Set<Long> shardIds = new HashSet<>();
-        shardIds.add(1L);
-        shardIds.add(2L);
-        ShardInfo info = new ShardInfo(shardIds);
-        journal.setData(info);
-        journal.setOpCode(OperationType.OP_ADD_UNUSED_SHARD);
-        EditLog.loadJournal(mgr, journal);
+        journal.setOpCode(OperationType.OP_SAVE_NEXTID);
+        // set data to null, and it will throw NPE in loadJournal()
+        journal.setData(null);
 
-        ShardDeleter shardDeleter = mgr.getShardManager().getShardDeleter();
-        Assert.assertEquals(Deencapsulation.getField(shardDeleter, "shardIds"), shardIds);
-
-        journal.setData(info);
-        journal.setOpCode(OperationType.OP_DELETE_UNUSED_SHARD);
-        EditLog.loadJournal(mgr, journal);
-        Assert.assertEquals(Deencapsulation.getField(shardDeleter, "shardIds"), new HashSet<>());
+        try {
+            EditLog.loadJournal(GlobalStateMgr.getCurrentState(), journal);
+        } catch (JournalInconsistentException e) {
+            Assert.assertEquals(OperationType.OP_SAVE_NEXTID, e.getOpCode());
+        }
     }
-
 }

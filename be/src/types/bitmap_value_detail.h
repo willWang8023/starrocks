@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/bitmap_value.h
 
@@ -26,6 +39,14 @@
 // So other files should not include this file except bitmap_value.cpp.
 #include <cstdint>
 #include <optional>
+
+#include "roaring/array_util.h"
+#include "roaring/bitset_util.h"
+#include "roaring/containers/containers.h"
+#include "roaring/roaring.h"
+#include "roaring/roaring_array.h"
+#include "util/coding.h"
+
 namespace starrocks {
 
 // serialized bitmap := TypeCode(1), Payload
@@ -69,6 +90,13 @@ struct BitmapTypeCode {
 };
 
 namespace detail {
+
+// https://github.com/RoaringBitmap/CRoaring/blob/5d6dd2342d9e3ffaf481aa5ebe344e19984faa4a/src/roaring.c#L21
+// The tow macro is not in .h file, so copy to here.
+#define SERIALIZATION_ARRAY_UINT32 1
+#define SERIALIZATION_CONTAINER 2
+
+using Roaring = roaring::Roaring;
 
 class Roaring64MapSetBitForwardIterator;
 
@@ -142,11 +170,10 @@ public:
      *
      */
     void addMany(size_t n_args, const uint32_t* vals) {
-        for (size_t lcv = 0; lcv < n_args; lcv++) {
-            roarings[0].add(vals[lcv]);
-            roarings[0].setCopyOnWrite(copyOnWrite);
-        }
+        roarings[0].addMany(n_args, vals);
+        roarings[0].setCopyOnWrite(copyOnWrite);
     }
+
     void addMany(size_t n_args, const uint64_t* vals) {
         for (size_t lcv = 0; lcv < n_args; lcv++) {
             roarings[highBytes(vals[lcv])].add(lowBytes(vals[lcv]));
@@ -389,25 +416,22 @@ public:
                 continue;
             }
 
-            do {
-                // if the right map has reached its end, ensure that the right
-                // map contains only empty Bitmaps
-                if (rhs_iter == r.roarings.cend()) {
-                    while (lhs_iter != roarings.cend()) {
-                        if (lhs_iter->second.isEmpty()) {
-                            ++lhs_iter;
-                            continue;
-                        }
-                        return false;
+            // if the right map has reached its end, ensure that the right
+            // map contains only empty Bitmaps
+            if (rhs_iter == r.roarings.cend()) {
+                while (lhs_iter != roarings.cend()) {
+                    if (lhs_iter->second.isEmpty()) {
+                        ++lhs_iter;
+                        continue;
                     }
-                    return true;
+                    return false;
                 }
-                // if the right map has an empty bitmap, skip it
-                if (rhs_iter->second.isEmpty()) {
-                    ++rhs_iter;
-                    continue;
-                }
-            } while (false);
+                return true;
+            }
+            // if the right map has an empty bitmap, skip it
+            if (rhs_iter->second.isEmpty()) {
+                ++rhs_iter;
+            }
             // if neither map has reached its end ensure elements are equal and
             // move to the next element in both
         } while (lhs_iter++->second == rhs_iter++->second);
@@ -612,6 +636,93 @@ public:
             Roaring read = Roaring::read(buf, usev1);
             // forward buffer past the last Roaring Bitmap
             buf += read.getSizeInBytes(usev1);
+            result.emplace(key, std::move(read));
+        }
+        return result;
+    }
+
+    static bool roaring_bitmap_portable_deserialize_check(const char* buf, size_t max_bytes) {
+        return roaring_bitmap_portable_deserialize_size(buf, max_bytes) > 0;
+    }
+
+    static bool roaring_bitmap_deserialize_check(const char* buf, size_t max_bytes) {
+        if (!max_bytes) {
+            return false;
+        }
+
+        const char* bufaschar = (const char*)buf;
+        if (*(const unsigned char*)buf == SERIALIZATION_ARRAY_UINT32) {
+            if (max_bytes < (1 + sizeof(uint32_t))) {
+                return false;
+            }
+            max_bytes -= (1 + sizeof(uint32_t));
+
+            uint32_t card;
+            memcpy(&card, bufaschar + 1, sizeof(uint32_t));
+
+            if (max_bytes < (card * sizeof(uint32_t))) {
+                return false;
+            }
+
+            return true;
+        } else if (bufaschar[0] == SERIALIZATION_CONTAINER) {
+            return roaring_bitmap_portable_deserialize_check(bufaschar + 1, max_bytes - 1);
+        } else {
+            return false;
+        }
+    }
+
+    static bool read_roaring_check(const char* buf, size_t max_bytes, bool portable = true) {
+        return portable ? roaring_bitmap_portable_deserialize_check(buf, max_bytes)
+                        : roaring_bitmap_deserialize_check(buf, max_bytes);
+    }
+
+    static Roaring64Map read_safe(const char* buf, size_t max_bytes, bool* is_valid_ptr) {
+        Roaring64Map result;
+        bool usev1 = BitmapTypeCode::BITMAP32 == *buf || BitmapTypeCode::BITMAP64 == *buf;
+        bool is_bitmap32 = BitmapTypeCode::BITMAP32 == *buf || BitmapTypeCode::BITMAP32_SERIV2 == *buf;
+        if (is_bitmap32) {
+            // check whether there is no valid bitmap.
+            if (!read_roaring_check(buf + 1, max_bytes - 1, usev1)) {
+                *is_valid_ptr = false;
+                return result;
+            }
+
+            Roaring read = Roaring::read(buf + 1, usev1);
+            result.emplace(0, std::move(read));
+            return result;
+        }
+
+        DCHECK(BitmapTypeCode::BITMAP64 == *buf || BitmapTypeCode::BITMAP64_SERIV2 == *buf);
+        buf++;
+        max_bytes--;
+
+        // get map size (varint64 took 1~10 bytes)
+        uint64_t map_size;
+        buf = reinterpret_cast<const char*>(decode_varint64_ptr(reinterpret_cast<const uint8_t*>(buf),
+                                                                reinterpret_cast<const uint8_t*>(buf + 10), &map_size));
+        DCHECK(buf != nullptr);
+        for (uint64_t lcv = 0; lcv < map_size; lcv++) {
+            // get map key
+            if (max_bytes < sizeof(uint32_t)) {
+                *is_valid_ptr = false;
+                return result;
+            }
+            uint32_t key = decode_fixed32_le(reinterpret_cast<const uint8_t*>(buf));
+            buf += sizeof(uint32_t);
+            max_bytes -= sizeof(uint32_t);
+
+            // check whether there is no valid bitmap.
+            if (!read_roaring_check(buf, max_bytes, usev1)) {
+                *is_valid_ptr = false;
+                return result;
+            }
+
+            // read map value Roaring
+            Roaring read = Roaring::read(buf, usev1);
+            // forward buffer past the last Roaring Bitmap
+            buf += read.getSizeInBytes(usev1);
+            max_bytes -= read.getSizeInBytes(usev1);
             result.emplace(key, std::move(read));
         }
         return result;

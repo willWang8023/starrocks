@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.starrocks.analysis.AnalyticExpr;
@@ -7,6 +20,7 @@ import com.starrocks.analysis.ExprId;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.LimitElement;
 import com.starrocks.analysis.OrderByElement;
+import com.starrocks.analysis.SlotRef;
 import com.starrocks.common.IdGenerator;
 import com.starrocks.sql.ast.Relation;
 import com.starrocks.sql.ast.SelectRelation;
@@ -28,7 +42,6 @@ public class AnalyzeState {
     private List<Expr> outputExpressions;
     private Scope outputScope;
     private boolean isDistinct = false;
-    private Scope orderScope;
     private Expr predicate;
     private Relation relation;
     private LimitElement limit;
@@ -40,8 +53,21 @@ public class AnalyzeState {
     private List<Expr> groupingFunctionCallExprs;
 
     private List<OrderByElement> orderBy;
-
+    private Scope orderScope;
     private List<Expr> orderSourceExpressions;
+
+    private Map<Expr, SlotRef> generatedExprToColumnRef = new HashMap<>();
+
+    /**
+     * outputExprInOrderByScope is used to record which expressions in outputExpression are to be
+     * recorded in the first level of OrderByScope (order by expressions can refer to columns in output)
+     * Which columns satisfy the condition?
+     * 1. An expression of type SlotRef.
+     * When both tables t0 and t1 contain the v1 column, select t0.v1 from t0, t1 order by v1 will
+     * refer to v1 in outputExpr instead of reporting an error.
+     * 2. There is an aliased output expression
+     */
+    private List<Integer> outputExprInOrderByScope;
 
     private List<AnalyticExpr> outputAnalytic;
     private List<AnalyticExpr> orderByAnalytic;
@@ -61,7 +87,7 @@ public class AnalyzeState {
 
     /**
      * Columns that do not appear in GroupBy for use with MODE_ONLY_FULL_GROUP_BY.
-     * */
+     */
     private final List<Expr> columnNotInGroupBy = new ArrayList<>();
 
     public AnalyzeState() {
@@ -106,6 +132,14 @@ public class AnalyzeState {
 
     public void setOrderSourceExpressions(List<Expr> orderSourceExpressions) {
         this.orderSourceExpressions = orderSourceExpressions;
+    }
+
+    public List<Integer> getOutputExprInOrderByScope() {
+        return outputExprInOrderByScope;
+    }
+
+    public void setOutputExprInOrderByScope(List<Integer> outputExprInOrderByScope) {
+        this.outputExprInOrderByScope = outputExprInOrderByScope;
     }
 
     public List<Expr> getOutputExpressions() {
@@ -223,5 +257,12 @@ public class AnalyzeState {
     public List<Expr> getColumnNotInGroupBy() {
         return columnNotInGroupBy;
     }
-    
+
+    public void setGeneratedExprToColumnRef(Map<Expr, SlotRef> generatedExprToColumnRef) {
+        this.generatedExprToColumnRef = generatedExprToColumnRef;
+    }
+
+    public Map<Expr, SlotRef> getGeneratedExprToColumnRef() {
+        return generatedExprToColumnRef;
+    }
 }

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/Function.java
 
@@ -22,21 +35,30 @@
 package com.starrocks.catalog;
 
 import com.google.common.base.Joiner;
+import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.gson.annotations.SerializedName;
+import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionName;
-import com.starrocks.analysis.HdfsURI;
+import com.starrocks.common.Pair;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.sql.ast.HdfsURI;
 import com.starrocks.thrift.TFunction;
 import com.starrocks.thrift.TFunctionBinaryType;
+import org.apache.commons.lang.ArrayUtils;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.Arrays;
 import java.util.List;
+import java.util.Vector;
+import java.util.function.BiFunction;
+import java.util.stream.Collectors;
 
+import static com.starrocks.common.io.IOUtils.readOptionStringOrNull;
 import static com.starrocks.common.io.IOUtils.writeOptionString;
 
 /**
@@ -73,39 +95,51 @@ public class Function implements Writable {
         // Nonstrict supertypes broaden the definition of supertype to accept implicit casts
         // of arguments that may result in loss of precision - e.g. decimal to float.
         IS_NONSTRICT_SUPERTYPE_OF,
-
-        // Used to drop UDF. User can drop function through name or name and arguments.
-        // If X is matchable with Y, this will only check X's element is identical with Y's.
-        // e.g. fn is matchable with fn(int), fn(float) and fn(int) is only matchable with fn(int).
-        IS_MATCHABLE
     }
 
-    // Function id, every function has a unique id. Now all built-in functions' id is 0
-    private long id = 0;
-    // User specified function name e.g. "Add"
+    // for vectorized engine, function-id
+    @SerializedName(value = "fid")
+    protected long functionId;
+
+    @SerializedName(value = "name")
     private FunctionName name;
+
+    @SerializedName(value = "retType")
     private Type retType;
+
     // Array of parameter types.  empty array if this function does not have parameters.
+    @SerializedName(value = "argTypes")
     private Type[] argTypes;
+
+    @SerializedName(value = "argNames")
+    private String[] argNames;
+
     // If true, this function has variable arguments.
     // TODO: we don't currently support varargs with no fixed types. i.e. fn(...)
+    @SerializedName(value = "hasVarArgs")
     private boolean hasVarArgs;
 
     // If true (default), this function is called directly by the user. For operators,
     // this is false. If false, it also means the function is not visible from
     // 'show functions'.
+    @SerializedName(value = "userVisible")
     private boolean userVisible;
+
+    @SerializedName(value = "binaryType")
+    private TFunctionBinaryType binaryType;
 
     // Absolute path in HDFS for the binary that contains this function.
     // e.g. /udfs/udfs.jar
+    @SerializedName(value = "location")
     private HdfsURI location;
-    private TFunctionBinaryType binaryType;
 
     // library's checksum to make sure all backends use one library to serve user's request
+    @SerializedName(value = "checksum")
     protected String checksum = "";
 
-    // for vectorized engine, function-id
-    protected long functionId;
+    // Function id, every function has a unique id. Now all built-in functions' id is 0
+    private long id = 0;
+    // User specified function name e.g. "Add"
 
     private boolean isPolymorphic = false;
 
@@ -115,6 +149,7 @@ public class Function implements Writable {
 
     private boolean isNullable = true;
 
+    private Vector<Pair<String, Expr>> defaultArgExprs;
     // Only used for serialization
     protected Function() {
     }
@@ -123,26 +158,17 @@ public class Function implements Writable {
         this(0, name, argTypes, retType, varArgs);
     }
 
+    public Function(FunctionName name, Type[] argTypes, String[] argNames, Type retType, boolean varArgs) {
+        this(0, name, argTypes, argNames, retType, varArgs);
+    }
+
     public Function(FunctionName name, List<Type> args, Type retType, boolean varArgs) {
         this(0, name, args, retType, varArgs);
     }
 
-    public Function(long functionId, FunctionName name, List<Type> argTypes, Type retType, boolean hasVarArgs,
-                    boolean isVectorized) {
-        this.functionId = functionId;
-        this.name = name;
-        this.hasVarArgs = hasVarArgs;
-        if (argTypes == null) {
-            this.argTypes = new Type[0];
-        } else {
-            this.argTypes = argTypes.toArray(new Type[argTypes.size()]);
-        }
-        this.retType = retType;
-        this.isPolymorphic = Arrays.stream(this.argTypes).anyMatch(Type::isPseudoType);
-    }
-
     public Function(long id, FunctionName name, Type[] argTypes, Type retType, boolean hasVarArgs) {
         this.id = id;
+        this.functionId = id;
         this.name = name;
         this.hasVarArgs = hasVarArgs;
         if (argTypes == null) {
@@ -154,14 +180,51 @@ public class Function implements Writable {
         this.isPolymorphic = Arrays.stream(this.argTypes).anyMatch(Type::isPseudoType);
     }
 
-    public Function(long id, FunctionName name, List<Type> argTypes, Type retType, boolean hasVarArgs) {
-        this(id, name, (Type[]) null, retType, hasVarArgs);
-        if (argTypes.size() > 0) {
-            this.argTypes = argTypes.toArray(new Type[argTypes.size()]);
-        } else {
+    public Function(long id, FunctionName name, Type[] argTypes, String[] argNames, Type retType, boolean hasVarArgs) {
+        this.id = id;
+        this.functionId = id;
+        this.name = name;
+        this.hasVarArgs = hasVarArgs;
+        if (argTypes == null) {
             this.argTypes = new Type[0];
+        } else {
+            this.argTypes = argTypes;
         }
+        this.argNames = argNames;
+        this.retType = retType;
         this.isPolymorphic = Arrays.stream(this.argTypes).anyMatch(Type::isPseudoType);
+    }
+
+    public Function(long id, FunctionName name, List<Type> argTypes, Type retType, boolean hasVarArgs) {
+        this.id = id;
+        this.functionId = id;
+        this.name = name;
+        this.hasVarArgs = hasVarArgs;
+        if (argTypes == null) {
+            this.argTypes = new Type[0];
+        } else {
+            this.argTypes = argTypes.toArray(new Type[0]);
+        }
+        this.retType = retType;
+        this.isPolymorphic = Arrays.stream(this.argTypes).anyMatch(Type::isPseudoType);
+    }
+
+    // copy constructor
+    public Function(Function other) {
+        id = other.id;
+        name = other.name;
+        retType = other.retType;
+        argTypes = other.argTypes;
+        argNames = other.argNames;
+        hasVarArgs = other.hasVarArgs;
+        userVisible = other.userVisible;
+        location = other.location;
+        binaryType = other.binaryType;
+        checksum = other.checksum;
+        functionId = other.functionId;
+        isPolymorphic = other.isPolymorphic;
+        couldApplyDictOptimize = other.couldApplyDictOptimize;
+        isNullable = other.isNullable;
     }
 
     public FunctionName getFunctionName() {
@@ -182,6 +245,14 @@ public class Function implements Writable {
 
     public Type[] getArgs() {
         return argTypes;
+    }
+
+    public String[] getArgNames() {
+        return argNames;
+    }
+
+    public boolean hasNamedArg() {
+        return argNames != null && argNames.length > 0;
     }
 
     // Returns the number of arguments to this function.
@@ -205,6 +276,41 @@ public class Function implements Writable {
         binaryType = type;
     }
 
+    public void setArgNames(List<String> names) {
+        if (names != null) {
+            argNames = names.toArray(new String[0]);
+            Preconditions.checkState(argNames.length == argTypes.length);
+        }
+    }
+
+    public void setDefaultNamedArgs(Vector<Pair<String, Expr>> defaultArgExprs) {
+        this.defaultArgExprs = defaultArgExprs;
+    }
+
+    public List<Expr> getLastDefaultsFromN(int n) {
+        if (defaultArgExprs == null || n >= argTypes.length || n < getRequiredArgNum()) {
+            return null;
+        }
+        return defaultArgExprs.subList(n - getRequiredArgNum(), defaultArgExprs.size()).
+                stream().map(x -> x.second).collect(Collectors.toList());
+    }
+
+    public Expr getDefaultNamedExpr(String argName) {
+        if (defaultArgExprs == null) {
+            return null;
+        }
+        for (Pair<String, Expr> arg : defaultArgExprs) {
+            if (arg.first.equals(argName)) {
+                return arg.second;
+            }
+        }
+        return null;
+    }
+
+    public int getRequiredArgNum() {
+        return argTypes.length - (defaultArgExprs == null ? 0 : defaultArgExprs.size());
+    }
+
     public boolean hasVarArgs() {
         return hasVarArgs;
     }
@@ -217,16 +323,18 @@ public class Function implements Writable {
         this.userVisible = userVisible;
     }
 
+    // TODO: It's dangerous to change this directly because it may change the global function state.
+    // Make sure you use a copy of the global function.
+    public void setArgsType(Type[] newTypes) {
+        argTypes = newTypes;
+    }
+
     public Type getVarArgsType() {
         if (!hasVarArgs) {
             return Type.INVALID;
         }
         Preconditions.checkState(argTypes.length > 0);
         return argTypes[argTypes.length - 1];
-    }
-
-    public boolean isVectorized() {
-        return true;
     }
 
     public boolean isPolymorphic() {
@@ -259,6 +367,12 @@ public class Function implements Writable {
 
     public String getChecksum() {
         return checksum;
+    }
+
+    // TODO: It's dangerous to change this directly because it may change the global function state.
+    // Make sure you use a copy of the global function.
+    public void setRetType(Type retType) {
+        this.retType = retType;
     }
 
     // TODO(cmy): Currently we judge whether it is UDF by wheter the 'location' is set.
@@ -307,14 +421,51 @@ public class Function implements Writable {
                 return isSubtype(other);
             case IS_NONSTRICT_SUPERTYPE_OF:
                 return isAssignCompatible(other);
-            case IS_MATCHABLE:
-                return isMatchable(other);
             default:
                 Preconditions.checkState(false);
                 return false;
         }
     }
 
+    private boolean compareNamedArguments(Function other, int start, BiFunction<Type, Type, Boolean> notMatch) {
+        if (!this.hasNamedArg() || other.argNames.length > this.argNames.length ||
+                other.hasVarArgs || this.hasVarArgs) {
+            return false;
+        }
+        boolean[] mask = new boolean[other.argTypes.length];
+        for (int i = start; i < this.argTypes.length; ++i) {
+            boolean found = false;
+            for (int j = start; j < other.argTypes.length && !found; ++j) {
+                if (!mask[j] && this.argNames[i].equals(other.argNames[j])) {
+                    if (notMatch.apply(other.argTypes[j], argTypes[i])) {
+                        return false;
+                    }
+                    found = true;
+                    mask[j] = true;
+                }
+            }
+            if (!found) {
+                // not default
+                if (this.getDefaultNamedExpr(this.argNames[i]) == null) {
+                    return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    private boolean comparePositionalArguments(Function other, int start, BiFunction<Type, Type, Boolean> notMatch) {
+        if (other.argTypes.length > this.argTypes.length ||
+                other.hasVarArgs || this.hasVarArgs || other.argTypes.length < getRequiredArgNum()) {
+            return false;
+        }
+        for (int i = start; i < other.argTypes.length; ++i) {
+            if (notMatch.apply(other.argTypes[i], argTypes[i])) {
+                return false;
+            }
+        }
+        return true;
+    }
     /**
      * Returns true if 'this' is a supertype of 'other'. Each argument in other must
      * be implicitly castable to the matching argument in this.
@@ -322,38 +473,47 @@ public class Function implements Writable {
      * for "most" compatible or maybe return an error if it is ambiguous?
      */
     private boolean isSubtype(Function other) {
-        if (!this.hasVarArgs && other.argTypes.length != this.argTypes.length) {
-            return false;
-        }
-        if (this.hasVarArgs && other.argTypes.length < this.argTypes.length) {
-            return false;
-        }
-
         int startArgIndex = 0;
         String functionName = other.getFunctionName().getFunction();
         // If function first arg must be boolean, we don't check it.
         if (functionName.equalsIgnoreCase("if")) {
             startArgIndex = 1;
         }
-        for (int i = startArgIndex; i < this.argTypes.length; ++i) {
-            // Normally, if type A matches type B, then A and B must be implicitly castable,
-            // but if one of the types is pseudotype, this rule does not hold anymore, so here
-            // we check type matche first.
-            if (other.argTypes[i].matchesType(this.argTypes[i])) {
-                continue;
-            }
-            if (!Type.isImplicitlyCastable(other.argTypes[i], this.argTypes[i], true)) {
+        if (other.hasNamedArg()) {
+            return compareNamedArguments(other, startArgIndex,
+                    (Type ot, Type m) -> !ot.matchesType(m) && !Type.isImplicitlyCastable(ot, m, true));
+        } else if (this.defaultArgExprs != null && !other.hasVarArgs) {
+            // positional args with defaults in table functions
+            return comparePositionalArguments(other, startArgIndex,
+                    (Type ot, Type m) -> !ot.matchesType(m) && !Type.isImplicitlyCastable(ot, m, true));
+        } else {
+            if (!this.hasVarArgs && other.argTypes.length != this.argTypes.length) {
                 return false;
             }
-        }
-        // Check trailing varargs.
-        if (this.hasVarArgs) {
-            for (int i = this.argTypes.length; i < other.argTypes.length; ++i) {
-                if (other.argTypes[i].matchesType(getVarArgsType())) {
+            if (this.hasVarArgs && other.argTypes.length < this.argTypes.length) {
+                return false;
+            }
+            for (int i = startArgIndex; i < this.argTypes.length; ++i) {
+                // Normally, if type A matches type B, then A and B must be implicitly castable,
+                // but if one of the types is pseudotype, this rule does not hold anymore, so here
+                // we check type match first.
+                if (other.argTypes[i].matchesType(this.argTypes[i])) {
                     continue;
                 }
-                if (!Type.isImplicitlyCastable(other.argTypes[i], getVarArgsType(), true)) {
+                if (!Type.isImplicitlyCastable(other.argTypes[i], this.argTypes[i], true)) {
                     return false;
+                }
+            }
+
+            // Check trailing varargs.
+            if (this.hasVarArgs) {
+                for (int i = this.argTypes.length; i < other.argTypes.length; ++i) {
+                    if (other.argTypes[i].matchesType(getVarArgsType())) {
+                        continue;
+                    }
+                    if (!Type.isImplicitlyCastable(other.argTypes[i], getVarArgsType(), true)) {
+                        return false;
+                    }
                 }
             }
         }
@@ -363,53 +523,41 @@ public class Function implements Writable {
     // return true if 'this' is assign-compatible from 'other'.
     // Each argument in 'other' must be assign-compatible to the matching argument in 'this'.
     private boolean isAssignCompatible(Function other) {
-        if (!this.hasVarArgs && other.argTypes.length != this.argTypes.length) {
-            return false;
-        }
-        if (this.hasVarArgs && other.argTypes.length < this.argTypes.length) {
-            return false;
-        }
-        for (int i = 0; i < this.argTypes.length; ++i) {
-            if (other.argTypes[i].matchesType(this.argTypes[i])) {
-                continue;
-            }
-            if (!Type.canCastTo(other.argTypes[i], argTypes[i])) {
+        if (other.hasNamedArg()) {
+            return compareNamedArguments(other, 0,
+                    (Type ot, Type m) -> !ot.matchesType(m) && !Type.canCastTo(ot, m));
+        } else if (this.defaultArgExprs != null && !other.hasVarArgs) {
+            // positional args with defaults in table functions
+            return comparePositionalArguments(other, 0,
+                    (Type ot, Type m) -> !ot.matchesType(m) && !Type.canCastTo(ot, m));
+        } else {
+            if (!this.hasVarArgs && other.argTypes.length != this.argTypes.length) {
                 return false;
             }
-        }
-        // Check trailing varargs.
-        if (this.hasVarArgs) {
-            for (int i = this.argTypes.length; i < other.argTypes.length; ++i) {
-                if (other.argTypes[i].matchesType(getVarArgsType())) {
-                    continue;
-                }
-                if (!Type.canCastTo(other.argTypes[i], getVarArgsType())) {
-                    return false;
-                }
-            }
-        }
-        return true;
-    }
-
-    private boolean isMatchable(Function o) {
-        if (!o.name.equals(name)) {
-            return false;
-        }
-        if (argTypes != null) {
-            if (o.argTypes.length != this.argTypes.length) {
-                return false;
-            }
-            if (o.hasVarArgs != this.hasVarArgs) {
+            if (this.hasVarArgs && other.argTypes.length < this.argTypes.length) {
                 return false;
             }
             for (int i = 0; i < this.argTypes.length; ++i) {
-                if (!o.argTypes[i].matchesType(this.argTypes[i])) {
+                if (other.argTypes[i].matchesType(this.argTypes[i])) {
+                    continue;
+                }
+                if (!Type.canCastTo(other.argTypes[i], argTypes[i])) {
                     return false;
+                }
+            }
+            // Check trailing varargs.
+            if (this.hasVarArgs) {
+                for (int i = this.argTypes.length; i < other.argTypes.length; ++i) {
+                    if (other.argTypes[i].matchesType(getVarArgsType())) {
+                        continue;
+                    }
+                    if (!Type.canCastTo(other.argTypes[i], getVarArgsType())) {
+                        return false;
+                    }
                 }
             }
         }
         return true;
-
     }
 
     private boolean isIdentical(Function o) {
@@ -422,9 +570,18 @@ public class Function implements Writable {
         if (o.hasVarArgs != this.hasVarArgs) {
             return false;
         }
-        for (int i = 0; i < this.argTypes.length; ++i) {
-            if (!o.argTypes[i].matchesType(this.argTypes[i])) {
-                return false;
+
+        if (o.hasNamedArg()) {
+            return compareNamedArguments(o, 0,
+                    (Type ot, Type m) -> !ot.matchesType(m));
+        } else if (this.defaultArgExprs != null && !o.hasVarArgs) { // positional args with defaults in table functions
+            return comparePositionalArguments(o, 0,
+                    (Type ot, Type m) -> !ot.matchesType(m));
+        } else {
+            for (int i = 0; i < this.argTypes.length; ++i) {
+                if (!o.argTypes[i].matchesType(this.argTypes[i])) {
+                    return false;
+                }
             }
         }
         return true;
@@ -436,23 +593,54 @@ public class Function implements Writable {
         }
         int minArgs = Math.min(o.argTypes.length, this.argTypes.length);
         // The first fully specified args must be identical.
-        for (int i = 0; i < minArgs; ++i) {
-            if (o.argTypes[i].isNull() || this.argTypes[i].isNull()) {
-                continue;
+        if (o.hasNamedArg()) {
+            return compareNamedArguments(o, 0,
+                    (Type ot, Type m) -> !ot.isNull() && !m.isNull() && !ot.matchesType(m));
+        } else if (this.defaultArgExprs != null && !o.hasVarArgs) { // positional args with defaults in table functions
+            return comparePositionalArguments(o, 0,
+                    (Type ot, Type m) -> !ot.isNull() && !m.isNull() && !ot.matchesType(m));
+        } else {
+            for (int i = 0; i < minArgs; ++i) {
+                if (o.argTypes[i].isNull() || this.argTypes[i].isNull()) {
+                    continue;
+                }
+                if (!o.argTypes[i].matchesType(this.argTypes[i])) {
+                    return false;
+                }
             }
-            if (!o.argTypes[i].matchesType(this.argTypes[i])) {
-                return false;
+            if (o.argTypes.length == this.argTypes.length) {
+                return true;
             }
-        }
-        if (o.argTypes.length == this.argTypes.length) {
-            return true;
-        }
 
-        if (o.hasVarArgs && this.hasVarArgs) {
-            if (!o.getVarArgsType().matchesType(this.getVarArgsType())) {
-                return false;
-            }
-            if (this.getNumArgs() > o.getNumArgs()) {
+            if (o.hasVarArgs && this.hasVarArgs) {
+                if (!o.getVarArgsType().matchesType(this.getVarArgsType())) {
+                    return false;
+                }
+                if (this.getNumArgs() > o.getNumArgs()) {
+                    for (int i = minArgs; i < this.getNumArgs(); ++i) {
+                        if (this.argTypes[i].isNull()) {
+                            continue;
+                        }
+                        if (!this.argTypes[i].matchesType(o.getVarArgsType())) {
+                            return false;
+                        }
+                    }
+                } else {
+                    for (int i = minArgs; i < o.getNumArgs(); ++i) {
+                        if (o.argTypes[i].isNull()) {
+                            continue;
+                        }
+                        if (!o.argTypes[i].matchesType(this.getVarArgsType())) {
+                            return false;
+                        }
+                    }
+                }
+                return true;
+            } else if (o.hasVarArgs) {
+                // o has var args so check the remaining arguments from this
+                if (o.getNumArgs() > minArgs) {
+                    return false;
+                }
                 for (int i = minArgs; i < this.getNumArgs(); ++i) {
                     if (this.argTypes[i].isNull()) {
                         continue;
@@ -461,7 +649,12 @@ public class Function implements Writable {
                         return false;
                     }
                 }
-            } else {
+                return true;
+            } else if (this.hasVarArgs) {
+                // this has var args so check the remaining arguments from s
+                if (this.getNumArgs() > minArgs) {
+                    return false;
+                }
                 for (int i = minArgs; i < o.getNumArgs(); ++i) {
                     if (o.argTypes[i].isNull()) {
                         continue;
@@ -470,45 +663,16 @@ public class Function implements Writable {
                         return false;
                     }
                 }
-            }
-            return true;
-        } else if (o.hasVarArgs) {
-            // o has var args so check the remaining arguments from this
-            if (o.getNumArgs() > minArgs) {
+                return true;
+            } else {
+                // Neither has var args and the lengths don't match
                 return false;
             }
-            for (int i = minArgs; i < this.getNumArgs(); ++i) {
-                if (this.argTypes[i].isNull()) {
-                    continue;
-                }
-                if (!this.argTypes[i].matchesType(o.getVarArgsType())) {
-                    return false;
-                }
-            }
-            return true;
-        } else if (this.hasVarArgs) {
-            // this has var args so check the remaining arguments from s
-            if (this.getNumArgs() > minArgs) {
-                return false;
-            }
-            for (int i = minArgs; i < o.getNumArgs(); ++i) {
-                if (o.argTypes[i].isNull()) {
-                    continue;
-                }
-                if (!o.argTypes[i].matchesType(this.getVarArgsType())) {
-                    return false;
-                }
-            }
-            return true;
-        } else {
-            // Neither has var args and the lengths don't match
-            return false;
         }
     }
 
     public TFunction toThrift() {
         TFunction fn = new TFunction();
-        fn.setSignature(signatureString());
         fn.setName(name.toThrift());
         fn.setBinary_type(binaryType);
         if (location != null) {
@@ -577,7 +741,8 @@ public class Function implements Writable {
         ORIGIN(0),
         SCALAR(1),
         AGGREGATE(2),
-        TABLE(3);
+        TABLE(3),
+        UNSUPPORTED(-1);
 
         private int code;
 
@@ -599,8 +764,9 @@ public class Function implements Writable {
                     return AGGREGATE;
                 case 3:
                     return TABLE;
+                default:
+                    return UNSUPPORTED;
             }
-            return null;
         }
 
         public void write(DataOutput output) throws IOException {
@@ -619,6 +785,14 @@ public class Function implements Writable {
         output.writeInt(argTypes.length);
         for (Type type : argTypes) {
             ColumnType.write(output, type);
+        }
+        if (hasNamedArg()) {
+            output.writeBoolean(true);
+            for (String name : argNames) {
+                writeOptionString(output, name);
+            }
+        } else {
+            output.writeBoolean(false);
         }
         output.writeBoolean(hasVarArgs);
         output.writeBoolean(userVisible);
@@ -646,6 +820,14 @@ public class Function implements Writable {
         argTypes = new Type[numArgs];
         for (int i = 0; i < numArgs; ++i) {
             argTypes[i] = ColumnType.read(input);
+        }
+        boolean hasNamedArg = input.readBoolean();
+        if (hasNamedArg) {
+            argNames = new String[numArgs];
+            for (int i = 0; i < numArgs; ++i) {
+                argNames[i] = readOptionStringOrNull(input);
+                argNames[i] = argNames[i] == null ? "" : argNames[i];
+            }
         }
         hasVarArgs = input.readBoolean();
         userVisible = input.readBoolean();
@@ -736,6 +918,11 @@ public class Function implements Writable {
     }
 
     @Override
+    public int hashCode() {
+        return Objects.hashCode(name, hasVarArgs, argTypes.length);
+    }
+
+    @Override
     public boolean equals(Object obj) {
         if (this == obj) {
             return true;
@@ -743,5 +930,20 @@ public class Function implements Writable {
         return obj != null && obj.getClass() == this.getClass() && isIdentical((Function) obj);
     }
 
+
+    // just shallow copy
+    public Function copy() {
+        return new Function(this);
+    }
+
+    public Function updateArgType(Type[] newTypes) {
+        if (!ArrayUtils.isEquals(argTypes, newTypes)) {
+            Function newFunc = copy();
+            newFunc.setArgsType(newTypes);
+            return newFunc;
+        }
+
+        return this;
+    }
 
 }

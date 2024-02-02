@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/rowset_writer_context.h
 
@@ -44,8 +57,9 @@ public:
 
     std::string rowset_path_prefix;
 
-    const TabletSchema* tablet_schema = nullptr;
-    std::shared_ptr<TabletSchema> partial_update_tablet_schema = nullptr;
+    TabletSchemaCSPtr tablet_schema = nullptr;
+    TabletSchemaCSPtr full_tablet_schema = nullptr;
+    bool is_partial_update = false;
     std::vector<int32_t> referenced_column_ids;
 
     RowsetId rowset_id{};
@@ -66,9 +80,16 @@ public:
     // test cases can change this value to control flush timing
     uint32_t max_rows_per_segment = INT32_MAX;
 
-    vectorized::GlobalDictByNameMaps* global_dicts = nullptr;
+    GlobalDictByNameMaps* global_dicts = nullptr;
 
     RowsetWriterType writer_type = kHorizontal;
+
+    std::string merge_condition;
+
+    bool miss_auto_increment_column = false;
+
+    // partial update mode
+    PartialUpdateMode partial_update_mode = PartialUpdateMode::UNKNOWN_MODE;
 };
 
 } // namespace starrocks

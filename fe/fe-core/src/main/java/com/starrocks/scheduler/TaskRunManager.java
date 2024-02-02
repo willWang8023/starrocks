@@ -1,13 +1,30 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.scheduler;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Queues;
+import com.google.gson.JsonObject;
 import com.starrocks.common.Config;
-import com.starrocks.common.util.QueryableReentrantLock;
 import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.common.util.Util;
+import com.starrocks.common.util.concurrent.QueryableReentrantLock;
+import com.starrocks.memory.MemoryTrackable;
+import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.scheduler.persist.TaskRunStatus;
 import com.starrocks.scheduler.persist.TaskRunStatusChange;
@@ -23,7 +40,7 @@ import java.util.concurrent.Future;
 import java.util.concurrent.PriorityBlockingQueue;
 import java.util.concurrent.TimeUnit;
 
-public class TaskRunManager {
+public class TaskRunManager implements MemoryTrackable {
 
     private static final Logger LOG = LogManager.getLogger(TaskRunManager.class);
 
@@ -53,13 +70,13 @@ public class TaskRunManager {
         for (Long taskId : pendingTaskRunMap.keySet()) {
             PriorityBlockingQueue<TaskRun> taskRuns = pendingTaskRunMap.get(taskId);
             if (taskRuns != null && !taskRuns.isEmpty()) {
-                validPendingCount++;
+                validPendingCount += taskRuns.size();
             }
         }
 
         if (validPendingCount >= Config.task_runs_queue_length) {
-            LOG.warn("pending TaskRun exceeds task_runs_queue_length:{}, reject the submit.",
-                    Config.task_runs_queue_length);
+            LOG.warn("pending TaskRun exceeds task_runs_queue_length:{}, reject the submit: {}",
+                    Config.task_runs_queue_length, taskRun);
             return new SubmitResult(null, SubmitResult.SubmitStatus.REJECTED);
         }
 
@@ -67,11 +84,14 @@ public class TaskRunManager {
         TaskRunStatus status = taskRun.initStatus(queryId, System.currentTimeMillis());
         status.setPriority(option.getPriority());
         status.setMergeRedundant(option.isMergeRedundant());
+        status.setProperties(option.getTaskRunProperties());
         GlobalStateMgr.getCurrentState().getEditLog().logTaskRunCreateStatus(status);
-        arrangeTaskRun(taskRun, option.isMergeRedundant());
-        return new SubmitResult(queryId, SubmitResult.SubmitStatus.SUBMITTED);
+        if (!arrangeTaskRun(taskRun)) {
+            LOG.warn("Submit task run to pending queue failed, reject the submit:{}", taskRun);
+            return new SubmitResult(null, SubmitResult.SubmitStatus.REJECTED);
+        }
+        return new SubmitResult(queryId, SubmitResult.SubmitStatus.SUBMITTED, taskRun.getFuture());
     }
-
 
     public boolean killTaskRun(Long taskId) {
         TaskRun taskRun = runningTaskRunMap.get(taskId);
@@ -80,7 +100,7 @@ public class TaskRunManager {
         }
         ConnectContext runCtx = taskRun.getRunCtx();
         if (runCtx != null) {
-            runCtx.kill(false);
+            runCtx.kill(false, "kill TaskRun");
             return true;
         }
         return false;
@@ -90,39 +110,60 @@ public class TaskRunManager {
     // The manual priority is higher. For manual tasks, we do not merge operations.
     // For automatic tasks, we will compare the definition, and if they are the same,
     // we will perform the merge operation.
-    public void arrangeTaskRun(TaskRun taskRun, boolean mergeRedundant) {
+    public boolean arrangeTaskRun(TaskRun taskRun) {
         if (!tryTaskRunLock()) {
-            return;
+            return false;
         }
         try {
             long taskId = taskRun.getTaskId();
             PriorityBlockingQueue<TaskRun> taskRuns = pendingTaskRunMap.computeIfAbsent(taskId,
                     u -> Queues.newPriorityBlockingQueue());
-            if (mergeRedundant) {
-                TaskRun oldTaskRun = getTaskRun(taskRuns, taskRun);
-                if (oldTaskRun != null) {
+            // If the task run is sync-mode, it will hang forever if the task run is merged because
+            // user's using `future.get()` to wait and the future will not be set forever.
+            ExecuteOption executeOption = taskRun.getExecuteOption();
+            if (executeOption.isMergeRedundant()) {
+                Iterator<TaskRun> iter = taskRuns.iterator();
+                while (iter.hasNext()) {
+                    TaskRun oldTaskRun = iter.next();
+                    if (oldTaskRun == null) {
+                        continue;
+                    }
+                    // If old task run is a sync-mode task, skip to merge it to avoid sync-mode task
+                    // hanging after removing it.
+                    if (!oldTaskRun.getExecuteOption().isMergeRedundant()) {
+                        continue;
+                    }
+                    // skip if old task run is not equal to the task run
                     // The remove here is actually remove the old TaskRun.
                     // Note that the old TaskRun and new TaskRun may have the same definition,
                     // but other attributes may be different, such as priority, creation time.
                     // higher priority and create time will be result after merge is complete
-                    // and queryId will be change.
-                    boolean isRemove = taskRuns.remove(taskRun);
-                    if (!isRemove) {
+                    // and queryId will be changed.
+                    if (!oldTaskRun.equals(taskRun)) {
                         LOG.warn("failed to remove TaskRun definition is [{}]",
-                                taskRun.getStatus().getDefinition());
+                                taskRun);
+                        continue;
                     }
+
                     if (oldTaskRun.getStatus().getPriority() > taskRun.getStatus().getPriority()) {
                         taskRun.getStatus().setPriority(oldTaskRun.getStatus().getPriority());
                     }
                     if (oldTaskRun.getStatus().getCreateTime() > taskRun.getStatus().getCreateTime()) {
                         taskRun.getStatus().setCreateTime(oldTaskRun.getStatus().getCreateTime());
                     }
+                    LOG.info("Merge redundant task run, oldTaskRun: {}, taskRun: {}",
+                            oldTaskRun, taskRun);
+                    iter.remove();
                 }
             }
-            taskRuns.offer(taskRun);
+            if (!taskRuns.offer(taskRun)) {
+                LOG.warn("failed to offer task: {}", taskRun);
+                return false;
+            }
         } finally {
             taskRunUnlock();
         }
+        return true;
     }
 
     // Because java PriorityQueue does not provide an interface for searching by element,
@@ -153,6 +194,7 @@ public class TaskRunManager {
             Future<?> future = taskRun.getFuture();
             if (future.isDone()) {
                 runningIterator.remove();
+                LOG.info("Task run is done from state RUNNING to {}, {}", taskRun.getStatus().getState(), taskRun);
                 taskRunHistory.addHistory(taskRun.getStatus());
                 TaskRunStatusChange statusChange = new TaskRunStatusChange(taskRun.getTaskId(), taskRun.getStatus(),
                         Constants.TaskRunState.RUNNING, taskRun.getStatus().getState());
@@ -171,6 +213,9 @@ public class TaskRunManager {
             TaskRun runningTaskRun = runningTaskRunMap.get(taskId);
             if (runningTaskRun == null) {
                 Queue<TaskRun> taskRunQueue = pendingTaskRunMap.get(taskId);
+                if (taskRunQueue == null) {
+                    continue;
+                }
                 if (taskRunQueue.size() == 0) {
                     pendingIterator.remove();
                 } else {
@@ -178,13 +223,17 @@ public class TaskRunManager {
                         break;
                     }
                     TaskRun pendingTaskRun = taskRunQueue.poll();
-                    taskRunExecutor.executeTaskRun(pendingTaskRun);
-                    runningTaskRunMap.put(taskId, pendingTaskRun);
-                    // RUNNING state persistence is for FE FOLLOWER update state
-                    TaskRunStatusChange statusChange = new TaskRunStatusChange(taskId, pendingTaskRun.getStatus(),
-                            Constants.TaskRunState.PENDING, Constants.TaskRunState.RUNNING);
-                    GlobalStateMgr.getCurrentState().getEditLog().logUpdateTaskRun(statusChange);
-                    currentRunning++;
+                    if (taskRunExecutor.executeTaskRun(pendingTaskRun)) {
+                        LOG.info("start to schedule pending task run to execute: {}", pendingTaskRun);
+                        runningTaskRunMap.put(taskId, pendingTaskRun);
+                        // RUNNING state persistence is for FE FOLLOWER update state
+                        TaskRunStatusChange statusChange = new TaskRunStatusChange(taskId, pendingTaskRun.getStatus(),
+                                Constants.TaskRunState.PENDING, Constants.TaskRunState.RUNNING);
+                        GlobalStateMgr.getCurrentState().getEditLog().logUpdateTaskRun(statusChange);
+                        currentRunning++;
+                    } else {
+                        LOG.warn("failed to scheduled task-run {}", pendingTaskRun);
+                    }
                 }
             }
         }
@@ -209,9 +258,24 @@ public class TaskRunManager {
         return false;
     }
 
-
     public void taskRunUnlock() {
         this.taskRunLock.unlock();
+    }
+
+    public TaskRun getRunnableTaskRun(long taskId) {
+        TaskRun res = runningTaskRunMap.get(taskId);
+        if (res != null) {
+            return res;
+        }
+        PriorityBlockingQueue<TaskRun> queue = pendingTaskRunMap.get(taskId);
+        if (queue != null) {
+            for (TaskRun run : queue) {
+                if (run.getTaskId() == taskId) {
+                    return run;
+                }
+            }
+        }
+        return null;
     }
 
     public Map<Long, PriorityBlockingQueue<TaskRun>> getPendingTaskRunMap() {
@@ -224,5 +288,60 @@ public class TaskRunManager {
 
     public TaskRunHistory getTaskRunHistory() {
         return taskRunHistory;
+    }
+
+    public long getPendingTaskRunCount() {
+        return pendingTaskRunMap.size();
+    }
+
+    public boolean containsTaskInRunningTaskRunMap(long taskId) {
+        return this.runningTaskRunMap.containsKey(taskId);
+    }
+
+    public long getPendingTaskRunCount(long taskId) {
+        taskRunLock.lock();
+        try {
+            return pendingTaskRunMap.containsKey(taskId) ? 0L :
+                    pendingTaskRunMap.get(taskId).size();
+        } catch (Exception e) {
+            return 0L;
+        } finally {
+            taskRunLock.unlock();
+        }
+    }
+
+    public long getRunningTaskRunCount() {
+        return runningTaskRunMap.size();
+    }
+
+    public long getHistoryTaskRunCount() {
+        return taskRunHistory.getTaskRunCount();
+    }
+
+    @Override
+    public Map<String, Long> estimateCount() {
+        long validPendingCount = 0;
+        for (Long taskId : pendingTaskRunMap.keySet()) {
+            PriorityBlockingQueue<TaskRun> taskRuns = pendingTaskRunMap.get(taskId);
+            if (taskRuns != null && !taskRuns.isEmpty()) {
+                validPendingCount += taskRuns.size();
+            }
+        }
+
+        return ImmutableMap.of("PendingTaskRun", validPendingCount,
+                "RunningTaskRun", (long) runningTaskRunMap.size(),
+                "HistoryTaskRun", taskRunHistory.getTaskRunCount());
+    }
+  
+    /**
+     * For diagnosis purpose
+     *
+     * @return JSON-representation of the whole status
+     */
+    public String inspect() {
+        JsonObject res = new JsonObject();
+        res.addProperty("running", GsonUtils.GSON.toJson(runningTaskRunMap));
+        res.addProperty("pending", GsonUtils.GSON.toJson(pendingTaskRunMap));
+        return res.toString();
     }
 }

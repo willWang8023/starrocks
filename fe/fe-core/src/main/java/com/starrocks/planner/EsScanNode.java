@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/planner/EsScanNode.java
 
@@ -31,12 +44,12 @@ import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.catalog.EsTable;
 import com.starrocks.common.UserException;
-import com.starrocks.external.elasticsearch.EsShardPartitions;
-import com.starrocks.external.elasticsearch.EsShardRouting;
-import com.starrocks.external.elasticsearch.QueryBuilders;
-import com.starrocks.external.elasticsearch.QueryConverter;
+import com.starrocks.connector.elasticsearch.EsShardPartitions;
+import com.starrocks.connector.elasticsearch.EsShardRouting;
+import com.starrocks.connector.elasticsearch.QueryBuilders;
+import com.starrocks.connector.elasticsearch.QueryConverter;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.system.Backend;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.thrift.TEsScanNode;
 import com.starrocks.thrift.TEsScanRange;
 import com.starrocks.thrift.TExplainLevel;
@@ -55,14 +68,15 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.Set;
+import java.util.stream.Collectors;
 
 public class EsScanNode extends ScanNode {
 
     private static final Logger LOG = LogManager.getLogger(EsScanNode.class);
 
     private final Random random = new Random(System.currentTimeMillis());
-    private Multimap<String, Backend> backendMap;
-    private List<Backend> backendList;
+    private Multimap<String, ComputeNode> nodeMap;
+    private List<ComputeNode> nodeList;
     private List<TScanRangeLocations> shardScanRanges = Lists.newArrayList();
     private EsTable table;
 
@@ -75,7 +89,7 @@ public class EsScanNode extends ScanNode {
     public void init(Analyzer analyzer) throws UserException {
         super.init(analyzer);
 
-        assignBackends();
+        assignNodes();
     }
 
     @Override
@@ -126,20 +140,25 @@ public class EsScanNode extends ScanNode {
 
     @Override
     protected void toThrift(TPlanNode msg) {
-        if (EsTable.TRANSPORT_HTTP.equals(table.getTransport())) {
+        if (EsTable.KEY_TRANSPORT_HTTP.equals(table.getTransport())) {
             msg.node_type = TPlanNodeType.ES_HTTP_SCAN_NODE;
         } else {
             msg.node_type = TPlanNodeType.ES_SCAN_NODE;
         }
         Map<String, String> properties = Maps.newHashMap();
-        properties.put(EsTable.USER, table.getUserName());
-        properties.put(EsTable.PASSWORD, table.getPasswd());
-        properties.put(EsTable.ES_NET_SSL, String.valueOf(table.sslEnabled()));
+        properties.put(EsTable.KEY_USER, table.getUserName());
+        properties.put(EsTable.KEY_PASSWORD, table.getPasswd());
+        properties.put(EsTable.KEY_ES_NET_SSL, String.valueOf(table.sslEnabled()));
+        String time_zone = table.getTimeZone();
+        if (time_zone != null) {
+            // If user has set timezone, we need to send it to BE
+            properties.put(EsTable.KEY_TIME_ZONE, time_zone);
+        }
         TEsScanNode esScanNode = new TEsScanNode(desc.getId().asInt());
         esScanNode.setProperties(properties);
         if (table.isDocValueScanEnable()) {
             esScanNode.setDocvalue_context(table.docValueContext());
-            properties.put(EsTable.DOC_VALUES_MODE, String.valueOf(useDocValueScan(desc, table.docValueContext())));
+            properties.put(EsTable.KEY_DOC_VALUES_MODE, String.valueOf(useDocValueScan(desc, table.docValueContext())));
         }
         if (table.isKeywordSniffEnable() && table.fieldsContext().size() > 0) {
             esScanNode.setFields_context(table.fieldsContext());
@@ -147,55 +166,61 @@ public class EsScanNode extends ScanNode {
         msg.es_scan_node = esScanNode;
     }
 
-    public void assignBackends() throws UserException {
-        backendMap = HashMultimap.create();
-        backendList = Lists.newArrayList();
-        for (Backend be : GlobalStateMgr.getCurrentSystemInfo().getIdToBackend().values()) {
-            if (be.isAlive()) {
-                backendMap.put(be.getHost(), be);
-                backendList.add(be);
+    public void assignNodes() throws UserException {
+        nodeMap = HashMultimap.create();
+        nodeList = Lists.newArrayList();
+        for (ComputeNode node : GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().
+                backendAndComputeNodeStream().collect(Collectors.toList())) {
+            if (node.isAlive()) {
+                nodeMap.put(node.getHost(), node);
+                nodeList.add(node);
             }
         }
-        if (backendMap.isEmpty()) {
-            throw new UserException("No Alive backends");
+        if (nodeMap.isEmpty()) {
+            throw new UserException("No Alive backends or compute nodes");
         }
     }
 
     public List<TScanRangeLocations> computeShardLocations(List<EsShardPartitions> selectedIndex) {
-        int size = backendList.size();
-        int beIndex = random.nextInt(size);
+        int size = nodeList.size();
+        int nodeIndex = random.nextInt(size);
         List<TScanRangeLocations> result = Lists.newArrayList();
         for (EsShardPartitions indexState : selectedIndex) {
             for (List<EsShardRouting> shardRouting : indexState.getShardRoutings().values()) {
-                // get backends
-                Set<Backend> colocatedBes = Sets.newHashSet();
-                int numBe = Math.min(3, size);
+                // get compute nodes
+                Set<ComputeNode> colocatedNodes = Sets.newHashSet();
+                int numNode = Math.min(3, size);
                 List<TNetworkAddress> shardAllocations = new ArrayList<>();
                 for (EsShardRouting item : shardRouting) {
-                    shardAllocations.add(EsTable.TRANSPORT_HTTP.equals(table.getTransport()) ? item.getHttpAddress() :
+                    shardAllocations.add(EsTable.KEY_TRANSPORT_HTTP.equals(table.getTransport()) ? item.getHttpAddress() :
                             item.getAddress());
                 }
 
                 Collections.shuffle(shardAllocations, random);
                 for (TNetworkAddress address : shardAllocations) {
-                    colocatedBes.addAll(backendMap.get(address.getHostname()));
+                    if (address == null) {
+                        continue;
+                    }
+                    colocatedNodes.addAll(nodeMap.get(address.getHostname()));
                 }
-                boolean usingRandomBackend = colocatedBes.size() == 0;
-                List<Backend> candidateBeList = Lists.newArrayList();
-                if (usingRandomBackend) {
-                    for (int i = 0; i < numBe; ++i) {
-                        candidateBeList.add(backendList.get(beIndex++ % size));
+                boolean usingRandomNode = colocatedNodes.size() == 0;
+                List<ComputeNode> candidateNodeList = Lists.newArrayList();
+                if (usingRandomNode) {
+                    for (int i = 0; i < numNode; ++i) {
+                        candidateNodeList.add(nodeList.get(nodeIndex++ % size));
                     }
                 } else {
-                    candidateBeList.addAll(colocatedBes);
-                    Collections.shuffle(candidateBeList);
+                    candidateNodeList.addAll(colocatedNodes);
+                    if (!candidateNodeList.isEmpty()) {
+                        Collections.shuffle(candidateNodeList);
+                    }
                 }
 
                 // Locations
                 TScanRangeLocations locations = new TScanRangeLocations();
-                for (int i = 0; i < numBe && i < candidateBeList.size(); ++i) {
+                for (int i = 0; i < numNode && i < candidateNodeList.size(); ++i) {
                     TScanRangeLocation location = new TScanRangeLocation();
-                    Backend be = candidateBeList.get(i);
+                    ComputeNode be = candidateNodeList.get(i);
                     location.setBackend_id(be.getId());
                     location.setServer(new TNetworkAddress(be.getHost(), be.getBePort()));
                     locations.addToLocations(location);
@@ -275,7 +300,7 @@ public class EsScanNode extends ScanNode {
     }
 
     @Override
-    public boolean canUsePipeLine() {
+    public boolean canUseRuntimeAdaptiveDop() {
         return true;
     }
 }

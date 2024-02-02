@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.statistic;
 
@@ -10,6 +22,8 @@ import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.optimizer.statistics.TableStatistic;
+import org.apache.commons.collections4.MapUtils;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -38,6 +52,9 @@ public class BasicStatsMeta implements Writable {
     @SerializedName("properties")
     private Map<String, String> properties;
 
+    // The old semantics indicated the increment of ingestion tasks after last statistical collect job.
+    // Since manually collecting sampled job would reset it to zero, affecting the incremental information,
+    // it is now changed to record the total number of rows in the table.
     @SerializedName("updateRows")
     private long updateRows;
 
@@ -45,13 +62,21 @@ public class BasicStatsMeta implements Writable {
                           StatsConstants.AnalyzeType type,
                           LocalDateTime updateTime,
                           Map<String, String> properties) {
+        this(dbId, tableId, columns, type, updateTime, properties, 0);
+    }
+
+    public BasicStatsMeta(long dbId, long tableId, List<String> columns,
+                          StatsConstants.AnalyzeType type,
+                          LocalDateTime updateTime,
+                          Map<String, String> properties,
+                          long updateRows) {
         this.dbId = dbId;
         this.tableId = tableId;
         this.columns = columns;
         this.type = type;
         this.updateTime = updateTime;
         this.properties = properties;
-        this.updateRows = 0;
+        this.updateRows = updateRows;
     }
 
     @Override
@@ -97,47 +122,67 @@ public class BasicStatsMeta implements Writable {
     public double getHealthy() {
         Database database = GlobalStateMgr.getCurrentState().getDb(dbId);
         OlapTable table = (OlapTable) database.getTable(tableId);
-        long minRowCount = Long.MAX_VALUE;
+        long totalPartitionCount = table.getPartitions().size();
+
+        long tableRowCount = 1L;
+        long cachedTableRowCount = 1L;
+        long updatePartitionRowCount = 0L;
+        long updatePartitionCount = 0L;
         for (Partition partition : table.getPartitions()) {
-            if (!partition.hasData()) {
-                //skip init empty partition
-                continue;
+            tableRowCount += partition.getRowCount();
+            TableStatistic tableStatistic = GlobalStateMgr.getCurrentState().getStatisticStorage()
+                    .getTableStatistic(table.getId(), partition.getId());
+            if (tableStatistic != null) {
+                cachedTableRowCount += tableStatistic.getRowCount();
             }
-            if (partition.getRowCount() < minRowCount) {
-                minRowCount = partition.getRowCount();
+            LocalDateTime loadTime = StatisticUtils.getPartitionLastUpdateTime(partition);
+
+            if (partition.hasData() && !isUpdatedAfterLoad(loadTime)) {
+                updatePartitionCount++;
             }
         }
+        updatePartitionRowCount = Math.max(1, Math.max(tableRowCount, updateRows) - cachedTableRowCount);
 
-        /*
-         * The ratio of the number of modified lines to the total number of lines.
-         * Because we cannot obtain complete table-level information, we use the row count of
-         * the partition with the smallest row count as totalRowCount.
-         * It can be understood that we assume an extreme case where all imported and modified lines
-         * are concentrated in only one partition
-         */
-        double healthy;
-        if (minRowCount == Long.MAX_VALUE) {
-            //All partition is empty
-            healthy = 1;
-        } else if (updateRows > minRowCount) {
-            healthy = 0;
-        } else if (minRowCount == 0) {
-            // updateRows == 0 && minRowCount == 0
-            // If minRowCount == 0 and partition.hasData is true.
-            // Indicates that a truncate or delete operation has occurred on this table.
-            healthy = 1;
+        double updateRatio;
+        // 1. If none updated partitions, health is 1
+        // 2. If there are few updated partitions, the health only to calculated on rows
+        // 3. If there are many updated partitions, the health needs to be calculated based on partitions
+        if (updatePartitionRowCount == 0 || updatePartitionCount == 0) {
+            return 1;
+        } else if (updatePartitionCount < StatsConstants.STATISTICS_PARTITION_UPDATED_THRESHOLD) {
+            updateRatio = (updateRows * 1.0) / updatePartitionRowCount;
         } else {
-            healthy = 1 - (double) updateRows / (double) minRowCount;
+            double rowUpdateRatio = (updateRows * 1.0) / updatePartitionRowCount;
+            double partitionUpdateRatio = (updatePartitionCount * 1.0) / totalPartitionCount;
+            updateRatio = Math.min(rowUpdateRatio, partitionUpdateRatio);
         }
-
-        return healthy;
+        return 1 - Math.min(updateRatio, 1.0);
     }
 
     public long getUpdateRows() {
         return updateRows;
     }
 
+    public void setUpdateRows(Long updateRows) {
+        this.updateRows = updateRows;
+    }
+
     public void increaseUpdateRows(Long delta) {
         updateRows += delta;
+    }
+
+    public boolean isInitJobMeta() {
+        return MapUtils.isNotEmpty(properties) && properties.containsKey(StatsConstants.INIT_SAMPLE_STATS_JOB);
+    }
+
+    public boolean isUpdatedAfterLoad(LocalDateTime loadTime) {
+        if (isInitJobMeta()) {
+            // We update the updateTime of a partition then we may do an init sample collect job, these auto init
+            // sample may return a wrong healthy value which may block the auto full collect job.
+            // so we return false to regard it like a manual collect job before load.
+            return false;
+        } else {
+            return updateTime.isAfter(loadTime);
+        }
     }
 }

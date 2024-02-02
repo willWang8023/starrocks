@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <benchmark/benchmark.h>
 #include <gtest/gtest.h>
@@ -13,13 +25,13 @@
 #include "column/datum_tuple.h"
 #include "common/config.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 inline int kTestChunkSize = 4096;
 
 class Bench {
 public:
-    static ColumnPtr create_series_column(TypeDescriptor type_desc, int num_rows, bool nullable = true) {
+    static ColumnPtr create_series_column(const TypeDescriptor& type_desc, int num_rows, bool nullable = true) {
         // TODO: support more types.
         DCHECK_EQ(TYPE_INT, type_desc.type);
 
@@ -32,7 +44,8 @@ public:
         return column;
     }
 
-    static ColumnPtr create_random_column(TypeDescriptor type_desc, int num_rows, bool low_card, bool nullable) {
+    static ColumnPtr create_random_column(const TypeDescriptor& type_desc, int num_rows, bool low_card, bool nullable,
+                                          size_t min_length = 0) {
         using UniformInt = std::uniform_int_distribution<std::mt19937::result_type>;
         using PoissonInt = std::poisson_distribution<std::mt19937::result_type>;
         ColumnPtr column = ColumnHelper::create_column(type_desc, nullable);
@@ -52,7 +65,7 @@ public:
                 "abcdefghijklmnopqrstuvwxyz";
 
         auto gen_rand_str = [&]() {
-            int str_len = uniform_int(rng) % 20;
+            int str_len = uniform_int(rng) % 20 + min_length;
             int str_start = std::min(poisson_int(rng) % alphanum.size(), alphanum.size() - str_len);
             Slice rand_str(alphanum.c_str() + str_start, str_len);
             return rand_str;
@@ -79,4 +92,4 @@ public:
     }
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

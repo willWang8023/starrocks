@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/View.java
 
@@ -22,10 +35,14 @@
 package com.starrocks.catalog;
 
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.analysis.ParseNode;
+import com.starrocks.analysis.TableName;
 import com.starrocks.common.UserException;
 import com.starrocks.common.io.Text;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.StarRocksPlannerException;
@@ -35,8 +52,8 @@ import org.apache.logging.log4j.Logger;
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
-import java.lang.ref.SoftReference;
 import java.util.List;
+import java.util.Map;
 
 /**
  * Table metadata representing a globalStateMgr view or a local view from a WITH clause.
@@ -66,49 +83,26 @@ public class View extends Table {
     //
     // Corresponds to Hive's viewExpandedText, but is not identical to the SQL
     // Hive would produce in view creation.
-    private String inlineViewDef;
+    @SerializedName(value = "i")
+    String inlineViewDef;
 
     // for persist
+    @SerializedName(value = "m")
     private long sqlMode = 0L;
 
-    // View definition created by parsing inlineViewDef_ into a QueryStmt.
-    // 'queryStmt' is a strong reference, which is used when this view is created directly from a QueryStmt
-    // 'queryStmtRef' is a soft reference, it is created from parsing query stmt, and it will be cleared if
-    // JVM memory is not enough.
-    private QueryStatement queryStmt;
-    @Deprecated
-    // Can't keep a cache in meta data
-    private SoftReference<QueryStatement> queryStmtRef = new SoftReference<QueryStatement>(null);
-
-    // Set if this View is from a WITH clause and not persisted in the globalStateMgr.
-    private boolean isLocalView;
-
-    // Set if this View is from a WITH clause with column labels.
-    private List<String> colLabels;
+    // cache used table names
+    private List<TableName> tableRefsCache = Lists.newArrayList();
 
     // Used for read from image
     public View() {
         super(TableType.VIEW);
-        isLocalView = false;
     }
 
     public View(long id, String name, List<Column> schema) {
         super(id, name, TableType.VIEW, schema);
-        isLocalView = false;
-    }
-
-    public View(String alias, QueryStatement queryStmt, List<String> colLabels) {
-        super(-1, alias, TableType.VIEW, null);
-        this.isLocalView = true;
-        this.queryStmt = queryStmt;
-        this.colLabels = colLabels;
     }
 
     public QueryStatement getQueryStatement() throws StarRocksPlannerException {
-        if (queryStmt != null) {
-            return queryStmt;
-        }
-
         Preconditions.checkNotNull(inlineViewDef);
         ParseNode node;
         try {
@@ -142,7 +136,7 @@ public class View extends Table {
      * Initializes the originalViewDef, inlineViewDef, and queryStmt members
      * by parsing the expanded view definition SQL-string.
      * Throws a TableLoadingException if there was any error parsing the
-     * the SQL or if the view definition did not parse into a QueryStmt.
+     * SQL or if the view definition did not parse into a QueryStmt.
      */
     public synchronized QueryStatement init() throws UserException {
         Preconditions.checkNotNull(inlineViewDef);
@@ -152,32 +146,28 @@ public class View extends Table {
         try {
             node = com.starrocks.sql.parser.SqlParser.parse(inlineViewDef, sqlMode).get(0);
         } catch (Exception e) {
-            LOG.info("stmt is {}", inlineViewDef);
-            LOG.info("exception because: ", e);
-            LOG.info("msg is {}", inlineViewDef);
+            LOG.warn("view-definition: {}. got exception: {}", inlineViewDef, e.getMessage(), e);
             // Do not pass e as the exception cause because it might reveal the existence
             // of tables that the user triggering this load may not have privileges on.
             throw new UserException(
-                    String.format("Failed to parse view-definition statement of view: %s", name), e);
+                    String.format("Failed to parse view: %s. Its definition is:%n%s ", name, inlineViewDef));
         }
         // Make sure the view definition parses to a query statement.
         if (!(node instanceof QueryStatement)) {
-            throw new UserException(String.format("View definition of %s " +
-                    "is not a query statement", name));
+            throw new UserException(String.format("View %s without query statement. Its definition is:%n%s",
+                    name, inlineViewDef));
         }
-        queryStmtRef = new SoftReference<>((QueryStatement) node);
         return (QueryStatement) node;
     }
 
-    /**
-     * Returns the column labels the user specified in the WITH-clause.
-     */
-    public List<String> getOriginalColLabels() {
-        return colLabels;
-    }
+    public synchronized List<TableName> getTableRefs() {
+        if (this.tableRefsCache.isEmpty()) {
+            QueryStatement qs = getQueryStatement();
+            Map<TableName, Table> allTables = AnalyzerUtils.collectAllTableAndView(qs);
+            this.tableRefsCache = Lists.newArrayList(allTables.keySet());
+        }
 
-    public boolean hasColLabels() {
-        return colLabels != null;
+        return Lists.newArrayList(this.tableRefsCache);
     }
 
     @Override
@@ -193,5 +183,6 @@ public class View extends Table {
         originalViewDef = Text.readString(in);
         originalViewDef = "";
         inlineViewDef = Text.readString(in);
+        inlineViewDef = inlineViewDef.replaceAll("default_cluster:", "");
     }
 }

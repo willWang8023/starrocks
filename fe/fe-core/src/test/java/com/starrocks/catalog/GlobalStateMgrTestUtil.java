@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/catalog/CatalogTestUtil.java
 
@@ -69,6 +82,11 @@ public class GlobalStateMgrTestUtil {
     public static String testTxnLable2 = "testTxnLable2";
     public static String testTxnLable3 = "testTxnLable3";
     public static String testTxnLable4 = "testTxnLable4";
+    public static String testTxnLable5 = "testTxnLable5";
+    public static String testTxnLable6 = "testTxnLable6";
+    public static String testTxnLable7 = "testTxnLable7";
+    public static String testTxnLable8 = "testTxnLable8";
+    public static String testTxnLable9 = "testTxnLable9";
     public static String testEsTable1 = "partitionedEsTable1";
     public static long testEsTableId1 = 14;
 
@@ -79,13 +97,15 @@ public class GlobalStateMgrTestUtil {
         GlobalStateMgr globalStateMgr = constructor.newInstance();
         globalStateMgr.setEditLog(new EditLog(new ArrayBlockingQueue<>(100)));
         FakeGlobalStateMgr.setGlobalStateMgr(globalStateMgr);
+        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().clear();
+        globalStateMgr.initDefaultCluster();
+
         Backend backend1 = createBackend(testBackendId1, "host1", 123, 124, 125);
         Backend backend2 = createBackend(testBackendId2, "host2", 123, 124, 125);
         Backend backend3 = createBackend(testBackendId3, "host3", 123, 124, 125);
-        GlobalStateMgr.getCurrentSystemInfo().addBackend(backend1);
-        GlobalStateMgr.getCurrentSystemInfo().addBackend(backend2);
-        GlobalStateMgr.getCurrentSystemInfo().addBackend(backend3);
-        globalStateMgr.initDefaultCluster();
+        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addBackend(backend1);
+        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addBackend(backend2);
+        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addBackend(backend3);
         Database db = createSimpleDb(testDbId1, testTableId1, testPartitionId1, testIndexId1, testTabletId1,
                 testStartVersion);
         LocalMetastore metastore = (LocalMetastore) globalStateMgr.getMetadata();
@@ -144,7 +164,7 @@ public class GlobalStateMgrTestUtil {
 
     public static Database createSimpleDb(long dbId, long tableId, long partitionId, long indexId, long tabletId,
                                           long version) {
-        GlobalStateMgr.getCurrentInvertedIndex().clear();
+        GlobalStateMgr.getCurrentState().getTabletInvertedIndex().clear();
 
         // replica
         long replicaId = 0;
@@ -203,7 +223,7 @@ public class GlobalStateMgrTestUtil {
         table.setBaseIndexId(indexId);
         // db
         Database db = new Database(dbId, testDb1);
-        db.createTable(table);
+        db.registerTableUnlocked(table);
 
         // add a es table to globalStateMgr
         try {
@@ -233,16 +253,16 @@ public class GlobalStateMgrTestUtil {
 
         RangePartitionInfo partitionInfo = new RangePartitionInfo(partitionColumns);
         Map<String, String> properties = Maps.newHashMap();
-        properties.put(EsTable.HOSTS, "xxx");
-        properties.put(EsTable.INDEX, "doe");
-        properties.put(EsTable.TYPE, "doc");
-        properties.put(EsTable.PASSWORD, "");
-        properties.put(EsTable.USER, "root");
-        properties.put(EsTable.DOC_VALUE_SCAN, "true");
-        properties.put(EsTable.KEYWORD_SNIFF, "true");
+        properties.put(EsTable.KEY_HOSTS, "xxx");
+        properties.put(EsTable.KEY_INDEX, "doe");
+        properties.put(EsTable.KEY_TYPE, "doc");
+        properties.put(EsTable.KEY_PASSWORD, "");
+        properties.put(EsTable.KEY_USER, "root");
+        properties.put(EsTable.KEY_DOC_VALUE_SCAN, "true");
+        properties.put(EsTable.KEY_KEYWORD_SNIFF, "true");
         EsTable esTable = new EsTable(testEsTableId1, testEsTable1,
                 columns, properties, partitionInfo);
-        db.createTable(esTable);
+        db.registerTableUnlocked(esTable);
     }
 
     public static Backend createBackend(long id, String host, int heartPort, int bePort, int httpPort) {

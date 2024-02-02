@@ -1,24 +1,33 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
-#include <string>
-
-#include "common/compiler_util.h"
-DIAGNOSTIC_PUSH
-DIAGNOSTIC_IGNORE("-Wclass-memaccess")
 #include <rapidjson/document.h>
 #include <rapidjson/stringbuffer.h>
 #include <rapidjson/writer.h>
-DIAGNOSTIC_POP
+
+#include <string>
 
 #include "column/chunk.h"
 #include "column/type_traits.h"
 #include "column/vectorized_fwd.h"
+#include "common/compiler_util.h"
 #include "http/http_client.h"
 #include "runtime/descriptors.h"
-#include "runtime/primitive_type.h"
+#include "types/logical_type.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 class ScrollParser {
 public:
     ScrollParser(bool doc_value_mode);
@@ -31,12 +40,13 @@ public:
     int get_size() { return _size; }
     bool current_eos() { return _cur_line == _size; }
 
-    void set_params(const TupleDescriptor* descs, const std::map<std::string, std::string>* docvalue_context);
+    void set_params(const TupleDescriptor* descs, const std::map<std::string, std::string>* docvalue_context,
+                    std::string& timezone);
 
 private:
     static bool _is_pure_doc_value(const rapidjson::Value& obj);
 
-    template <PrimitiveType type, class CppType = RunTimeCppType<type>>
+    template <LogicalType type, class CppType = RunTimeCppType<type>>
     static void _append_data(Column* column, CppType& value);
 
     static void _append_null(Column* column);
@@ -46,16 +56,17 @@ private:
 
     Slice _json_val_to_slice(const rapidjson::Value& val);
 
-    template <PrimitiveType type, typename T = RunTimeCppType<type>>
+    template <LogicalType type, typename T = RunTimeCppType<type>>
     static Status _append_int_val(const rapidjson::Value& col, Column* column, bool pure_doc_value);
 
-    template <PrimitiveType type, typename T = RunTimeCppType<type>>
+    template <LogicalType type, typename T = RunTimeCppType<type>>
     static Status _append_float_val(const rapidjson::Value& col, Column* column, bool pure_doc_value);
 
     static Status _append_bool_val(const rapidjson::Value& col, Column* column, bool pure_doc_value);
 
-    template <PrimitiveType type, typename T = RunTimeCppType<type>>
-    static Status _append_date_val(const rapidjson::Value& col, Column* column, bool pure_doc_value);
+    template <LogicalType type, typename T = RunTimeCppType<type>>
+    static Status _append_date_val(const rapidjson::Value& col, Column* column, bool pure_doc_value,
+                                   const std::string& timezone);
 
     // The representation of array value in _source and doc_value (column storage) is inconsistent
     // in Elasticsearch, we need to do different processing to show consistent behavior.
@@ -67,6 +78,9 @@ private:
     Status _append_array_val(const rapidjson::Value& col, const TypeDescriptor& type_desc, Column* column,
                              bool pure_doc_value);
 
+    Status _append_json_val(const rapidjson::Value& col, const TypeDescriptor& type_desc, Column* column,
+                            bool pure_doc_value);
+
     Status _append_array_val_from_docvalue(const rapidjson::Value& val, const TypeDescriptor& child_type_desc,
                                            Column* column);
 
@@ -76,16 +90,15 @@ private:
 
     const TupleDescriptor* _tuple_desc;
     const std::map<std::string, std::string>* _doc_value_context;
+    std::string _timezone;
 
     std::string _scroll_id;
     size_t _size;
     rapidjson::SizeType _cur_line;
     rapidjson::Document _document_node;
     rapidjson::Value _inner_hits_node;
-    // TODO: This value assigned but never used.
-    bool _doc_value_mode;
 
     rapidjson::StringBuffer _scratch_buffer;
     rapidjson::Writer<rapidjson::StringBuffer> _temp_writer;
 };
-} // namespace starrocks::vectorized
+} // namespace starrocks

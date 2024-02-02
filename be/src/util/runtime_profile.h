@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/runtime_profile.h
 
@@ -40,6 +53,10 @@
 
 namespace starrocks {
 
+inline unsigned long long operator"" _ms(unsigned long long x) {
+    return x * 1000 * 1000;
+}
+
 // Define macros for updating counters.  The macros make it very easy to disable
 // all counters at compile time.  Set this to 0 to remove counters.  This is useful
 // to do to make sure the counters aren't affecting the system.
@@ -50,16 +67,36 @@ namespace starrocks {
 #define MACRO_CONCAT(x, y) CONCAT_IMPL(x, y)
 
 #if ENABLE_COUNTERS
-#define ADD_COUNTER(profile, name, type) (profile)->add_counter(name, type)
-#define ADD_TIMER(profile, name) (profile)->add_counter(name, TUnit::TIME_NS)
-#define ADD_CHILD_COUNTER(profile, name, type, parent) (profile)->add_counter(name, type, parent)
-#define ADD_CHILD_TIMER(profile, name, parent) (profile)->add_counter(name, TUnit::TIME_NS, parent)
+#define ADD_COUNTER(profile, name, type) \
+    (profile)->add_counter(name, type, RuntimeProfile::Counter::create_strategy(type))
+#define ADD_COUNTER_SKIP_MERGE(profile, name, type, merge_type) \
+    (profile)->add_counter(name, type, RuntimeProfile::Counter::create_strategy(type, merge_type))
+#define ADD_TIMER(profile, name) \
+    (profile)->add_counter(name, TUnit::TIME_NS, RuntimeProfile::Counter::create_strategy(TUnit::TIME_NS))
+#define ADD_PEAK_COUNTER(profile, name, type) \
+    (profile)->AddHighWaterMarkCounter(name, type, RuntimeProfile::Counter::create_strategy(TCounterAggregateType::AVG))
+#define ADD_CHILD_COUNTER(profile, name, type, parent) \
+    (profile)->add_child_counter(name, type, RuntimeProfile::Counter::create_strategy(type), parent)
+#define ADD_CHILD_COUNTER_SKIP_MERGE(profile, name, type, merge_type, parent) \
+    (profile)->add_child_counter(name, type, RuntimeProfile::Counter::create_strategy(type, merge_type), parent)
+#define ADD_CHILD_COUNTER_SKIP_MIN_MAX(profile, name, type, min_max_type, parent)                                      \
+    (profile)->add_child_counter(                                                                                      \
+            name, type, RuntimeProfile::Counter::create_strategy(type, TCounterMergeType::MERGE_ALL, 0, min_max_type), \
+            parent)
+#define ADD_CHILD_TIMER_THESHOLD(profile, name, parent, threshold) \
+    (profile)->add_child_counter(                                  \
+            name, TUnit::TIME_NS,                                  \
+            RuntimeProfile::Counter::create_strategy(TUnit::TIME_NS, TCounterMergeType::MERGE_ALL, threshold), parent)
+#define ADD_CHILD_TIMER(profile, name, parent) \
+    (profile)->add_child_counter(name, TUnit::TIME_NS, RuntimeProfile::Counter::create_strategy(TUnit::TIME_NS), parent)
 #define SCOPED_TIMER(c) ScopedTimer<MonotonicStopWatch> MACRO_CONCAT(SCOPED_TIMER, __COUNTER__)(c)
 #define CANCEL_SAFE_SCOPED_TIMER(c, is_cancelled) \
     ScopedTimer<MonotonicStopWatch> MACRO_CONCAT(SCOPED_TIMER, __COUNTER__)(c, is_cancelled)
 #define SCOPED_RAW_TIMER(c) ScopedRawTimer<MonotonicStopWatch> MACRO_CONCAT(SCOPED_RAW_TIMER, __COUNTER__)(c)
 #define COUNTER_UPDATE(c, v) (c)->update(v)
 #define COUNTER_SET(c, v) (c)->set(v)
+// this is only used for HighWaterMarkCounter
+#define COUNTER_ADD(c, v) (c)->add(v)
 #define ADD_THREAD_COUNTERS(profile, prefix) (profile)->add_thread_counters(prefix)
 #define SCOPED_THREAD_COUNTER_MEASUREMENT(c) \
     /*ThreadCounterMeasurement                                        \
@@ -71,6 +108,7 @@ namespace starrocks {
 #define SCOPED_RAW_TIMER(c)
 #define COUNTER_UPDATE(c, v)
 #define COUNTER_SET(c, v)
+#define COUNTER_ADD(c, v)
 #define ADD_THREADCOUNTERS(profile, prefix) NULL
 #define SCOPED_THREAD_COUNTER_MEASUREMENT(c)
 #endif
@@ -87,9 +125,35 @@ class ObjectPool;
 // Thread-safe.
 class RuntimeProfile {
 public:
+    inline static const std::string MERGED_INFO_PREFIX_MIN = "__MIN_OF_";
+    inline static const std::string MERGED_INFO_PREFIX_MAX = "__MAX_OF_";
+
     class Counter {
     public:
-        explicit Counter(TUnit::type type, int64_t value = 0) : _value(value), _type(type) {}
+        static TCounterStrategy create_strategy(
+                TCounterAggregateType::type aggregate_type,
+                TCounterMergeType::type merge_type = TCounterMergeType::MERGE_ALL, int64_t display_threshold = 0,
+                TCounterMinMaxType::type min_max_type = TCounterMinMaxType::MIN_MAX_ALL) {
+            TCounterStrategy strategy;
+            strategy.aggregate_type = aggregate_type;
+            strategy.merge_type = merge_type;
+            strategy.display_threshold = display_threshold;
+            strategy.min_max_type = min_max_type;
+            return strategy;
+        }
+
+        static TCounterStrategy create_strategy(
+                TUnit::type type, TCounterMergeType::type merge_type = TCounterMergeType::MERGE_ALL,
+                int64_t display_threshold = 0,
+                TCounterMinMaxType::type min_max_type = TCounterMinMaxType::MIN_MAX_ALL) {
+            auto aggregate_type = is_time_type(type) ? TCounterAggregateType::AVG : TCounterAggregateType::SUM;
+            return create_strategy(aggregate_type, merge_type, display_threshold, min_max_type);
+        }
+
+        explicit Counter(TUnit::type type, int64_t value = 0)
+                : _value(0), _type(type), _strategy(create_strategy(type)) {}
+        explicit Counter(TUnit::type type, const TCounterStrategy& strategy, int64_t value = 0)
+                : _value(value), _type(type), _strategy(strategy) {}
 
         virtual ~Counter() = default;
 
@@ -114,30 +178,55 @@ public:
 
         TUnit::type type() const { return _type; }
 
+        const TCounterStrategy& strategy() const { return _strategy; }
+
+        bool is_sum() const {
+            return _strategy.aggregate_type == TCounterAggregateType::SUM ||
+                   _strategy.aggregate_type == TCounterAggregateType::SUM_AVG;
+        }
+        bool is_avg() const {
+            return _strategy.aggregate_type == TCounterAggregateType::AVG ||
+                   _strategy.aggregate_type == TCounterAggregateType::AVG_SUM;
+        }
+
+        bool skip_merge() const {
+            return _strategy.merge_type == TCounterMergeType::SKIP_ALL ||
+                   _strategy.merge_type == TCounterMergeType::SKIP_FIRST_MERGE;
+        }
+
+        bool skip_min_max() const { return _strategy.min_max_type == TCounterMinMaxType::SKIP_ALL; }
+
+        int64_t display_threshold() const { return _strategy.display_threshold; }
+
     private:
         friend class RuntimeProfile;
 
         std::atomic<int64_t> _value;
-        TUnit::type _type;
+        const TUnit::type _type;
+        const TCounterStrategy _strategy;
     };
 
     class ConcurrentTimerCounter;
     class DerivedCounter;
     class EventSequence;
-    class HighWaterMarkCounter;
     class SummaryStatsCounter;
     class ThreadCounters;
     class TimeSeriesCounter;
 
-    /// A counter that keeps track of the highest value seen (reporting that
+    /// A counter that keeps track of the highest/lowest value seen (reporting that
     /// as value()) and the current value.
-    class HighWaterMarkCounter : public Counter {
+    template <bool is_high>
+    class WaterMarkCounter : public Counter {
     public:
-        explicit HighWaterMarkCounter(TUnit::type unit) : Counter(unit) {}
+        explicit WaterMarkCounter(TUnit::type type, int64_t value = 0) : Counter(type, value) { _set_init_value(); }
+        explicit WaterMarkCounter(TUnit::type type, const TCounterStrategy& strategy, int64_t value = 0)
+                : Counter(type, strategy, value) {
+            _set_init_value();
+        }
 
         virtual void add(int64_t delta) {
             int64_t new_val = current_value_.fetch_add(delta, std::memory_order_relaxed) + delta;
-            UpdateMax(new_val);
+            Update(new_val);
         }
 
         /// Tries to increase the current value by delta. If current_value() + delta
@@ -148,7 +237,7 @@ public:
                 int64_t new_val = old_val + delta;
                 if (UNLIKELY(new_val > max)) return false;
                 if (LIKELY(current_value_.compare_exchange_strong(old_val, new_val, std::memory_order_relaxed))) {
-                    UpdateMax(new_val);
+                    Update(new_val);
                     return true;
                 }
             }
@@ -156,27 +245,46 @@ public:
 
         void set(int64_t v) override {
             current_value_.store(v, std::memory_order_relaxed);
-            UpdateMax(v);
+            Update(v);
         }
 
         int64_t current_value() const { return current_value_.load(std::memory_order_relaxed); }
 
     private:
-        /// Set '_value' to 'v' if 'v' is larger than '_value'. The entire operation is
+        void _set_init_value() {
+            if constexpr (is_high) {
+                _value.store(0, std::memory_order_relaxed);
+                current_value_.store(0, std::memory_order_relaxed);
+            } else {
+                _value.store(MAX_INT64, std::memory_order_relaxed);
+                current_value_.store(MAX_INT64, std::memory_order_relaxed);
+            }
+        }
+
+        /// Set '_value' to 'v' if 'v' is larger/lower than '_value'. The entire operation is
         /// atomic.
-        void UpdateMax(int64_t v) {
+        void Update(int64_t v) {
             while (true) {
-                int64_t old_max = _value.load(std::memory_order_relaxed);
-                int64_t new_max = std::max(old_max, v);
-                if (new_max == old_max) break; // Avoid atomic update.
-                if (LIKELY(_value.compare_exchange_strong(old_max, new_max, std::memory_order_relaxed))) break;
+                int64_t old_value = _value.load(std::memory_order_relaxed);
+                int64_t new_value;
+                if constexpr (is_high) {
+                    new_value = std::max(old_value, v);
+                } else {
+                    new_value = std::min(old_value, v);
+                }
+                if (new_value == old_value) break; // Avoid atomic update.
+                if (LIKELY(_value.compare_exchange_strong(old_value, new_value, std::memory_order_relaxed))) break;
             }
         }
 
         /// The current value of the counter. _value in the super class represents
         /// the high water mark.
-        std::atomic<int64_t> current_value_{0};
+        std::atomic<int64_t> current_value_;
+        static const int64_t MAX_INT64 = 9223372036854775807ll;
     };
+
+    using HighWaterMarkCounter = WaterMarkCounter<true>;
+    using LowWaterMarkCounter = WaterMarkCounter<false>;
 
     typedef std::function<int64_t()> DerivedCounterFunction;
 
@@ -185,7 +293,7 @@ public:
     class DerivedCounter : public Counter {
     public:
         DerivedCounter(TUnit::type type, DerivedCounterFunction counter_fn)
-                : Counter(type, 0), _counter_fn(std::move(counter_fn)) {}
+                : Counter(type, create_strategy(type), 0), _counter_fn(std::move(counter_fn)) {}
 
         int64_t value() const override { return _counter_fn(); }
 
@@ -254,7 +362,7 @@ public:
     // Create a runtime profile object with 'name'.
     explicit RuntimeProfile(std::string name, bool is_averaged_profile = false);
 
-    ~RuntimeProfile();
+    ~RuntimeProfile() = default;
 
     RuntimeProfile* parent() const { return _parent; }
 
@@ -308,8 +416,11 @@ public:
     // If parent_name is a non-empty string, the counter is added as a child of
     // parent_name.
     // If the counter already exists, the existing counter object is returned.
-    Counter* add_counter(const std::string& name, TUnit::type type, const std::string& parent_name);
-    Counter* add_counter(const std::string& name, TUnit::type type) { return add_counter(name, type, ROOT_COUNTER); }
+    Counter* add_child_counter(const std::string& name, TUnit::type type, const TCounterStrategy& strategy,
+                               const std::string& parent_name);
+    Counter* add_counter(const std::string& name, TUnit::type type, const TCounterStrategy& strategy) {
+        return add_child_counter(name, type, strategy, ROOT_COUNTER);
+    }
 
     // Add a derived counter with 'name'/'type'. The counter is owned by the
     // RuntimeProfile object.
@@ -325,6 +436,10 @@ public:
 
     // Gets the counter object with 'name'.  Returns NULL if there is no counter with
     // that name.
+    std::pair<Counter*, std::string> get_counter_pair(const std::string& name);
+
+    // Gets the counter object with 'name'.  Returns NULL if there is no counter with
+    // that name.
     Counter* get_counter(const std::string& name);
 
     // Adds all counters with 'name' that are registered either in this or
@@ -332,7 +447,7 @@ public:
     void get_counters(const std::string& name, std::vector<Counter*>* counters);
 
     // Copy all but the bucket counters from src profile
-    void copy_all_counters_from(RuntimeProfile* src_profile);
+    void copy_all_counters_from(RuntimeProfile* src_profile, const std::string& attached_counter_name = ROOT_COUNTER);
 
     // Remove the counter object with 'name', and it will remove all the child counters recursively
     void remove_counter(const std::string& name);
@@ -345,7 +460,7 @@ public:
 
     // Adds a string to the runtime profile.  If a value already exists for 'key',
     // the value will be updated.
-    void add_info_string(const std::string& key, const std::string& value);
+    void add_info_string(const std::string& key, const std::string& value = "");
 
     // Creates and returns a new EventSequence (owned by the runtime
     // profile) - unless a timer with the same 'key' already exists, in
@@ -412,49 +527,14 @@ public:
     // Note: this function should not block (or take a long time).
     typedef std::function<int64_t()> SampleFn;
 
-    // Add a rate counter to the current profile based on src_counter with name.
-    // The rate counter is updated periodically based on the src counter.
-    // The rate counter has units in src_counter unit per second.
-    Counter* add_rate_counter(const std::string& name, Counter* src_counter);
-
-    // Same as 'add_rate_counter' above except values are taken by calling fn.
-    // The resulting counter will be of 'type'.
-    Counter* add_rate_counter(const std::string& name, SampleFn fn, TUnit::type type);
-
-    // Add a sampling counter to the current profile based on src_counter with name.
-    // The sampling counter is updated periodically based on the src counter by averaging
-    // the samples taken from the src counter.
-    // The sampling counter has the same unit as src_counter unit.
-    Counter* add_sampling_counter(const std::string& name, Counter* src_counter);
-
-    // Same as 'add_sampling_counter' above except the samples are taken by calling fn.
-    Counter* add_sampling_counter(const std::string& name, SampleFn fn);
-
-    // Add a bucket of counters to store the sampled value of src_counter.
-    // The src_counter is sampled periodically and the buckets are updated.
-    void add_bucketing_counters(const std::string& name, const std::string& parent_name, Counter* src_counter,
-                                int max_buckets, std::vector<Counter*>* buckets);
-
     /// Adds a high water mark counter to the runtime profile. Otherwise, same behavior
     /// as AddCounter().
     HighWaterMarkCounter* AddHighWaterMarkCounter(const std::string& name, TUnit::type unit,
+                                                  const TCounterStrategy& strategy,
                                                   const std::string& parent_name = "");
 
-    // stops updating the value of 'rate_counter'. Rate counters are updated
-    // periodically so should be removed as soon as the underlying counter is
-    // no longer going to change.
-    void stop_rate_counters_updates(Counter* rate_counter);
-
-    // stops updating the value of 'sampling_counter'. Sampling counters are updated
-    // periodically so should be removed as soon as the underlying counter is
-    // no longer going to change.
-    void stop_sampling_counters_updates(Counter* sampling_counter);
-
-    // stops updating the bucket counter.
-    // If convert is true, convert the buckets from count to percentage.
-    // Sampling counters are updated periodically so should be removed as soon as the
-    // underlying counter is no longer going to change.
-    void stop_bucketing_counters_updates(std::vector<Counter*>* buckets, bool convert);
+    LowWaterMarkCounter* AddLowWaterMarkCounter(const std::string& name, TUnit::type unit,
+                                                const TCounterStrategy& strategy, const std::string& parent_name = "");
 
     // Recursively compute the fraction of the 'total_time' spent in this profile and
     // its children.
@@ -470,16 +550,14 @@ private:
     typedef std::vector<std::pair<RuntimeProfile*, bool>> ChildVector;
 
     void add_child_unlock(RuntimeProfile* child, bool indent, ChildVector::iterator pos);
-    Counter* add_counter_unlock(const std::string& name, TUnit::type type, const std::string& parent_name);
+    Counter* add_counter_unlock(const std::string& name, TUnit::type type, const TCounterStrategy& strategy,
+                                const std::string& parent_name);
 
     RuntimeProfile* _parent;
 
     // Pool for allocated counters. Usually owned by the creator of this
     // object, but occasionally allocated in the constructor.
     std::unique_ptr<ObjectPool> _pool;
-
-    // True if we have to delete the _pool on destruction.
-    bool _own_pool;
 
     // Name for this runtime profile.
     std::string _name;
@@ -535,65 +613,6 @@ private:
     // of the total time in the entire profile tree.
     double _local_time_percent;
 
-    enum PeriodicCounterType {
-        RATE_COUNTER = 0,
-        SAMPLING_COUNTER,
-    };
-
-    struct RateCounterInfo {
-        Counter* src_counter;
-        SampleFn sample_fn;
-        int64_t elapsed_ms;
-    };
-
-    struct SamplingCounterInfo {
-        Counter* src_counter; // the counter to be sampled
-        SampleFn sample_fn;
-        int64_t total_sampled_value; // sum of all sampled values;
-        int64_t num_sampled;         // number of samples taken
-    };
-
-    struct BucketCountersInfo {
-        Counter* src_counter; // the counter to be sampled
-        int64_t num_sampled;  // number of samples taken
-        // TODO: customize bucketing
-    };
-
-    // This is a static singleton object that is used to update all rate counters and
-    // sampling counters.
-    struct PeriodicCounterUpdateState {
-        PeriodicCounterUpdateState();
-
-        // Tears down the update thread.
-        ~PeriodicCounterUpdateState();
-
-        // Lock protecting state below
-        std::mutex lock;
-
-        // If true, tear down the update thread.
-        volatile bool _done{false};
-
-        // Thread performing asynchronous updates.
-        std::unique_ptr<std::thread> update_thread;
-
-        // A map of the dst (rate) counter to the src counter and elapsed time.
-        typedef std::map<Counter*, RateCounterInfo> RateCounterMap;
-        RateCounterMap rate_counters;
-
-        // A map of the dst (averages over samples) counter to the src counter (to be sampled)
-        // and number of samples taken.
-        typedef std::map<Counter*, SamplingCounterInfo> SamplingCounterMap;
-        SamplingCounterMap sampling_counters;
-
-        // Map from a bucket of counters to the src counter
-        typedef std::map<std::vector<Counter*>*, BucketCountersInfo> BucketCountersMap;
-        BucketCountersMap bucketing_counters;
-    };
-
-    // Singleton object that keeps track of all rate counters and the thread
-    // for updating them.
-    static PeriodicCounterUpdateState _s_periodic_counter_update_state; // NOLINT
-
     // update a subtree of profiles from nodes, rooted at *idx.
     // On return, *idx points to the node immediately following this subtree.
     void update(const std::vector<TRuntimeProfileNode>& nodes, int* idx);
@@ -602,18 +621,6 @@ private:
     // this profile and its children.
     // Called recusively.
     void compute_time_in_profile(int64_t total_time);
-
-    // Registers a periodic counter to be updated by the update thread.
-    // Either sample_fn or dst_counter must be non-NULL.  When the periodic counter
-    // is updated, it either gets the value from the dst_counter or calls the sample
-    // function to get the value.
-    // dst_counter/sample fn is assumed to be compatible types with src_counter.
-    static void register_periodic_counter(Counter* src_counter, SampleFn sample_fn, Counter* dst_counter,
-                                          PeriodicCounterType type);
-
-    // Loop for periodic counter update thread.  This thread wakes up once in a while
-    // and updates all the added rate counters and sampling counters.
-    static void periodic_counter_update_loop();
 
     // Print the child counters of the given counter name
     static void print_child_counters(const std::string& prefix, const std::string& counter_name,
@@ -624,22 +631,16 @@ public:
     // Merge all the isomorphic sub profiles and the caller must know for sure
     // that all the children are isomorphic, otherwise, the behavior is undefined
     // The merged result will be stored in the first profile
-    static void merge_isomorphic_profiles(std::vector<RuntimeProfile*>& profiles);
+    static RuntimeProfile* merge_isomorphic_profiles(ObjectPool* obj_pool, std::vector<RuntimeProfile*>& profiles,
+                                                     bool require_identical = true);
 
 private:
     static const std::unordered_set<std::string> NON_MERGE_COUNTER_NAMES;
     // Merge all the isomorphic counters
-    // The exact semantics of merge depends on TUnit::type
-    // sum:
-    //     UNIT / UNIT_PER_SECOND
-    //     BYTES / BYTES_PER_SECOND
-    //     DOUBLE_VALUE / NONE
-    // average:
-    //     CPU_TICKS / TIME_NS / TIME_MS / TIME_S
     typedef std::tuple<int64_t, int64_t, int64_t> MergedInfo;
-    static MergedInfo merge_isomorphic_counters(TUnit::type type, std::vector<Counter*>& counters);
+    static MergedInfo merge_isomorphic_counters(std::vector<Counter*>& counters);
 
-    static bool is_average_type(TUnit::type type) {
+    static bool is_time_type(TUnit::type type) {
         return TUnit::type::CPU_TICKS == type || TUnit::type::TIME_NS == type || TUnit::type::TIME_MS == type ||
                TUnit::type::TIME_S == type;
     }

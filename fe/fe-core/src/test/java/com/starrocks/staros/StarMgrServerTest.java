@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.staros;
 
@@ -27,12 +40,16 @@ public class StarMgrServerTest {
 
     @Before
     public void setUp() {
-        Config.starmgr_s3_bucket = "abc";
+        Config.aws_s3_path = "abc";
+        Config.aws_s3_access_key = "abc";
+        Config.aws_s3_secret_key = "abc";
     }
 
     @After
     public void tearDown() {
-        Config.starmgr_s3_bucket = "";
+        Config.aws_s3_path = "";
+        Config.aws_s3_access_key = "";
+        Config.aws_s3_secret_key = "";
     }
 
     @Test

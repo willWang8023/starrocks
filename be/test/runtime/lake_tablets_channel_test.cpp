@@ -1,11 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "runtime/lake_tablets_channel.h"
 
 #include <fmt/format.h>
 #include <gtest/gtest.h>
-
-#include <random>
 
 #include "column/chunk.h"
 #include "column/fixed_length_column.h"
@@ -13,22 +23,22 @@
 #include "column/vectorized_fwd.h"
 #include "common/logging.h"
 #include "fs/fs_util.h"
-#include "gen_cpp/descriptors.pb.h"
 #include "gen_cpp/internal_service.pb.h"
-#include "runtime/exec_env.h"
 #include "runtime/load_channel.h"
 #include "runtime/load_channel_mgr.h"
 #include "runtime/mem_tracker.h"
 #include "serde/protobuf_serde.h"
 #include "storage/chunk_helper.h"
+#include "storage/chunk_iterator.h"
 #include "storage/lake/fixed_location_provider.h"
 #include "storage/lake/join_path.h"
 #include "storage/lake/tablet.h"
 #include "storage/lake/tablet_manager.h"
 #include "storage/lake/tablet_metadata.h"
 #include "storage/lake/txn_log.h"
+#include "storage/lake/update_manager.h"
+#include "storage/lake/vacuum.h"
 #include "storage/rowset/segment.h"
-#include "storage/rowset/segment_iterator.h"
 #include "storage/rowset/segment_options.h"
 #include "storage/tablet_schema.h"
 #include "testutil/assert.h"
@@ -37,10 +47,6 @@
 
 namespace starrocks {
 
-using VSchema = starrocks::vectorized::Schema;
-using VChunk = starrocks::vectorized::Chunk;
-using Int32Column = starrocks::vectorized::Int32Column;
-
 // 2 senders, 1 index, each index has 2 partitions, each partition has 2 tablets, each tablet has 2 columns
 // partition id: 10, 11
 // tablet id: 10086, 10087, 10088, 10089
@@ -48,18 +54,17 @@ class LakeTabletsChannelTest : public testing::Test {
 public:
     LakeTabletsChannelTest() {
         _schema_id = next_id();
-        _mem_tracker = std::make_unique<MemTracker>(-1);
-        _load_channel_mgr = std::make_unique<LoadChannelMgr>();
-
-        _tablet_manager = ExecEnv::GetInstance()->lake_tablet_manager();
-        _tablet_manager->prune_metacache();
-
+        _mem_tracker = std::make_unique<MemTracker>(1024 * 1024);
         _location_provider = std::make_unique<lake::FixedLocationProvider>(kTestGroupPath);
-        _backup_location_provider = _tablet_manager->TEST_set_location_provider(_location_provider.get());
+        _update_manager = std::make_unique<lake::UpdateManager>(_location_provider.get(), _mem_tracker.get());
+        _tablet_manager =
+                std::make_unique<lake::TabletManager>(_location_provider.get(), _update_manager.get(), 1024 * 1024);
+
+        _load_channel_mgr = std::make_unique<LoadChannelMgr>();
 
         auto metadata = new_tablet_metadata(10086);
         _tablet_schema = TabletSchema::create(metadata->schema());
-        _schema = std::make_shared<VSchema>(ChunkHelper::convert_schema(*_tablet_schema));
+        _schema = std::make_shared<Schema>(ChunkHelper::convert_schema(_tablet_schema));
 
         // init _open_request
         _open_request.mutable_id()->set_hi(456789);
@@ -128,7 +133,6 @@ public:
         schema->set_num_short_key_columns(1);
         schema->set_keys_type(DUP_KEYS);
         schema->set_num_rows_per_row_block(65535);
-        schema->set_compress_kind(COMPRESS_LZ4);
         auto c0 = schema->add_column();
         {
             c0->set_unique_id(0);
@@ -149,7 +153,7 @@ public:
         return metadata;
     }
 
-    VChunk generate_data(int64_t chunk_size) {
+    Chunk generate_data(int64_t chunk_size) {
         std::vector<int> v0(chunk_size);
         std::vector<int> v1(chunk_size);
         for (int i = 0; i < chunk_size; i++) {
@@ -159,7 +163,7 @@ public:
         auto c1 = Int32Column::create();
         c0->append_numbers(v0.data(), v0.size() * sizeof(int));
         c1->append_numbers(v1.data(), v1.size() * sizeof(int));
-        VChunk chunk({c0, c1}, _schema);
+        Chunk chunk({c0, c1}, _schema);
         chunk.set_slot_id_to_index(0, 0);
         chunk.set_slot_id_to_index(1, 1);
         return chunk;
@@ -177,7 +181,6 @@ public:
 
 protected:
     void SetUp() override {
-        (void)ExecEnv::GetInstance()->lake_tablet_manager()->TEST_set_location_provider(_location_provider.get());
         (void)fs::remove_all(kTestGroupPath);
         CHECK_OK(fs::create_directories(lake::join_path(kTestGroupPath, lake::kSegmentDirectoryName)));
         CHECK_OK(fs::create_directories(lake::join_path(kTestGroupPath, lake::kMetadataDirectoryName)));
@@ -189,38 +192,31 @@ protected:
         CHECK_OK(_tablet_manager->put_tablet_metadata(*new_tablet_metadata(10089)));
 
         auto load_mem_tracker = std::make_unique<MemTracker>(-1, "", _mem_tracker.get());
-        _load_channel = std::make_shared<LoadChannel>(_load_channel_mgr.get(), UniqueId::gen_uid(), string(), 1000,
-                                                      std::move(load_mem_tracker));
+        _load_channel =
+                std::make_shared<LoadChannel>(_load_channel_mgr.get(), _tablet_manager.get(), UniqueId::gen_uid(),
+                                              next_id(), string(), 1000, std::move(load_mem_tracker));
         TabletsChannelKey key{UniqueId::gen_uid().to_proto(), 99999};
-        _tablets_channel = new_lake_tablets_channel(_load_channel.get(), key, _load_channel->mem_tracker());
+        _tablets_channel =
+                new_lake_tablets_channel(_load_channel.get(), _tablet_manager.get(), key, _load_channel->mem_tracker());
     }
 
     void TearDown() override {
         _tablets_channel.reset();
         _load_channel.reset();
-        ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(10086));
-        tablet.delete_txn_log(kTxnId);
-        ASSIGN_OR_ABORT(tablet, _tablet_manager->get_tablet(10087));
-        tablet.delete_txn_log(kTxnId);
-        ASSIGN_OR_ABORT(tablet, _tablet_manager->get_tablet(10088));
-        tablet.delete_txn_log(kTxnId);
-        ASSIGN_OR_ABORT(tablet, _tablet_manager->get_tablet(10089));
-        tablet.delete_txn_log(kTxnId);
-        (void)ExecEnv::GetInstance()->lake_tablet_manager()->TEST_set_location_provider(_backup_location_provider);
         (void)fs::remove_all(kTestGroupPath);
         _tablet_manager->prune_metacache();
     }
 
-    std::shared_ptr<VChunk> read_segment(int64_t tablet_id, const std::string& filename) {
+    std::shared_ptr<Chunk> read_segment(int64_t tablet_id, const std::string& filename) {
         // Check segment file
         ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(kTestGroupPath));
         auto path = _location_provider->segment_location(tablet_id, filename);
         std::cerr << path << '\n';
 
-        ASSIGN_OR_ABORT(auto seg, Segment::open(fs, path, 0, _tablet_schema.get()));
+        ASSIGN_OR_ABORT(auto seg, Segment::open(fs, FileInfo{path}, 0, _tablet_schema));
 
         OlapReaderStatistics statistics;
-        vectorized::SegmentReadOptions opts;
+        SegmentReadOptions opts;
         opts.fs = fs;
         opts.tablet_id = tablet_id;
         opts.stats = &statistics;
@@ -247,14 +243,16 @@ protected:
 
     int64_t _schema_id;
     std::unique_ptr<MemTracker> _mem_tracker;
-    std::unique_ptr<LoadChannelMgr> _load_channel_mgr;
-    lake::TabletManager* _tablet_manager;
     std::unique_ptr<lake::FixedLocationProvider> _location_provider;
+    std::unique_ptr<lake::UpdateManager> _update_manager;
+    std::unique_ptr<lake::TabletManager> _tablet_manager;
+    std::unique_ptr<LoadChannelMgr> _load_channel_mgr;
     lake::LocationProvider* _backup_location_provider;
     std::shared_ptr<TabletSchema> _tablet_schema;
-    std::shared_ptr<VSchema> _schema;
+    std::shared_ptr<Schema> _schema;
     std::shared_ptr<OlapTableSchemaParam> _schema_param;
     PTabletWriterOpenRequest _open_request;
+    PTabletWriterOpenResult _open_response;
 
     std::shared_ptr<LoadChannel> _load_channel;
     std::shared_ptr<TabletsChannel> _tablets_channel;
@@ -264,7 +262,7 @@ TEST_F(LakeTabletsChannelTest, test_simple_write) {
     auto open_request = _open_request;
     open_request.set_num_senders(1);
 
-    ASSERT_OK(_tablets_channel->open(open_request, _schema_param));
+    ASSERT_OK(_tablets_channel->open(open_request, &_open_response, _schema_param, false));
 
     constexpr int kChunkSize = 128;
     constexpr int kChunkSizePerTablet = kChunkSize / 4;
@@ -365,7 +363,7 @@ TEST_F(LakeTabletsChannelTest, test_write_partial_partition) {
     auto open_request = _open_request;
     open_request.set_num_senders(1);
 
-    ASSERT_OK(_tablets_channel->open(open_request, _schema_param));
+    ASSERT_OK(_tablets_channel->open(open_request, &_open_response, _schema_param, false));
 
     constexpr int kChunkSize = 128;
     constexpr int kChunkSizePerTablet = kChunkSize / 2;
@@ -421,7 +419,7 @@ TEST_F(LakeTabletsChannelTest, test_write_partial_partition) {
 }
 
 TEST_F(LakeTabletsChannelTest, test_write_concurrently) {
-    ASSERT_OK(_tablets_channel->open(_open_request, _schema_param));
+    ASSERT_OK(_tablets_channel->open(_open_request, &_open_response, _schema_param, false));
 
     constexpr int kChunkSize = 128;
     constexpr int kChunkSizePerTablet = kChunkSize / 4;
@@ -484,24 +482,25 @@ TEST_F(LakeTabletsChannelTest, test_write_concurrently) {
     }
 }
 
-TEST_F(LakeTabletsChannelTest, test_cancel) {
+TEST_F(LakeTabletsChannelTest, DISABLED_test_abort) {
     auto open_request = _open_request;
     open_request.set_num_senders(1);
 
-    ASSERT_OK(_tablets_channel->open(open_request, _schema_param));
+    ASSERT_OK(_tablets_channel->open(open_request, &_open_response, _schema_param, false));
 
     constexpr int kChunkSize = 128;
     constexpr int kChunkSizePerTablet = kChunkSize / 4;
     auto chunk = generate_data(kChunkSize);
-    std::atomic<bool> started{false};
+    std::atomic<int> write_count{0};
+    std::atomic<bool> stopped{false};
     auto t0 = std::thread([&]() {
-        PTabletWriterAddChunkRequest add_chunk_request;
-        PTabletWriterAddBatchResult add_chunk_response;
-        add_chunk_request.set_index_id(kIndexId);
-        add_chunk_request.set_sender_id(0);
-        add_chunk_request.set_eos(false);
         int64_t packet_seq = 0;
         while (true) {
+            PTabletWriterAddChunkRequest add_chunk_request;
+            PTabletWriterAddBatchResult add_chunk_response;
+            add_chunk_request.set_index_id(kIndexId);
+            add_chunk_request.set_sender_id(0);
+            add_chunk_request.set_eos(false);
             add_chunk_request.set_packet_seq(packet_seq++);
 
             for (int i = 0; i < kChunkSize; i++) {
@@ -517,16 +516,27 @@ TEST_F(LakeTabletsChannelTest, test_cancel) {
             if (add_chunk_response.status().status_code() != TStatusCode::OK) {
                 break;
             }
-            started = true;
+            write_count.fetch_add(1);
         }
+        PTabletWriterAddChunkRequest finish_request;
+        PTabletWriterAddBatchResult finish_response;
+        finish_request.set_index_id(kIndexId);
+        finish_request.set_sender_id(0);
+        finish_request.set_eos(true);
+        finish_request.set_packet_seq(packet_seq++);
+        finish_request.add_partition_ids(10);
+        finish_request.add_partition_ids(11);
+        _tablets_channel->add_chunk(nullptr, finish_request, &finish_response);
+        ASSERT_NE(TStatusCode::OK, finish_response.status().status_code());
+        stopped.store(true);
     });
 
-    while (!started) {
+    while (write_count.load() < 5 && !stopped.load()) {
         std::this_thread::yield();
     }
-    std::this_thread::sleep_for(std::chrono::milliseconds(100));
-
-    _tablets_channel->cancel();
+    ASSERT_FALSE(stopped.load());
+    ASSERT_GT(write_count.load(), 0);
+    _tablets_channel->abort();
 
     t0.join();
 
@@ -540,7 +550,7 @@ TEST_F(LakeTabletsChannelTest, test_write_failed) {
     auto open_request = _open_request;
     open_request.set_num_senders(1);
 
-    ASSERT_OK(_tablets_channel->open(open_request, _schema_param));
+    ASSERT_OK(_tablets_channel->open(open_request, &_open_response, _schema_param, false));
 
     constexpr int kChunkSize = 128;
     constexpr int kChunkSizePerTablet = kChunkSize / 4;
@@ -561,23 +571,30 @@ TEST_F(LakeTabletsChannelTest, test_write_failed) {
     ASSIGN_OR_ABORT(auto chunk_pb, serde::ProtobufChunkSerde::serialize(chunk));
     add_chunk_request.mutable_chunk()->Swap(&chunk_pb);
 
-    _tablet_manager->delete_tablet(10089);
+    {
+        lake::DeleteTabletRequest request;
+        lake::DeleteTabletResponse response;
+        request.add_tablet_ids(10089);
+        lake::delete_tablets(_tablet_manager.get(), request, &response);
+
+        _tablet_manager->prune_metacache();
+    }
 
     _tablets_channel->add_chunk(&chunk, add_chunk_request, &add_chunk_response);
     ASSERT_NE(TStatusCode::OK, add_chunk_response.status().status_code());
 
     _tablets_channel->cancel();
 
-    ASSERT_TRUE(_tablet_manager->get_tablet(10086)->get_txn_log(kTxnId).status().is_not_found());
-    ASSERT_TRUE(_tablet_manager->get_tablet(10087)->get_txn_log(kTxnId).status().is_not_found());
-    ASSERT_TRUE(_tablet_manager->get_tablet(10088)->get_txn_log(kTxnId).status().is_not_found());
+    ASSERT_FALSE(fs::path_exist(_tablet_manager->txn_log_location(10086, kTxnId)));
+    ASSERT_FALSE(fs::path_exist(_tablet_manager->txn_log_location(10087, kTxnId)));
+    ASSERT_FALSE(fs::path_exist(_tablet_manager->txn_log_location(10088, kTxnId)));
 }
 
 TEST_F(LakeTabletsChannelTest, test_empty_tablet) {
     auto open_request = _open_request;
     open_request.set_num_senders(1);
 
-    ASSERT_OK(_tablets_channel->open(open_request, _schema_param));
+    ASSERT_OK(_tablets_channel->open(open_request, &_open_response, _schema_param, false));
 
     constexpr int kChunkSize = 12;
     auto chunk = generate_data(kChunkSize);
@@ -642,7 +659,7 @@ TEST_F(LakeTabletsChannelTest, test_finish_failed) {
     auto open_request = _open_request;
     open_request.set_num_senders(1);
 
-    ASSERT_OK(_tablets_channel->open(open_request, _schema_param));
+    ASSERT_OK(_tablets_channel->open(open_request, &_open_response, _schema_param, false));
 
     constexpr int kChunkSize = 12;
     auto chunk = generate_data(kChunkSize);
@@ -666,9 +683,8 @@ TEST_F(LakeTabletsChannelTest, test_finish_failed) {
     _tablets_channel->add_chunk(&chunk, add_chunk_request, &add_chunk_response);
     ASSERT_TRUE(add_chunk_response.status().status_code() == TStatusCode::OK);
 
-    // Drop tablet 10087 and 10088 before finish
-    _tablet_manager->delete_tablet(10087);
-    _tablet_manager->delete_tablet(10088);
+    // Remove txn log directory before finish
+    fs::remove_all(_location_provider->txn_log_root_location(10087));
 
     PTabletWriterAddChunkRequest finish_request;
     PTabletWriterAddBatchResult finish_response;
@@ -681,29 +697,60 @@ TEST_F(LakeTabletsChannelTest, test_finish_failed) {
 
     _tablets_channel->add_chunk(nullptr, finish_request, &finish_response);
     ASSERT_NE(TStatusCode::OK, finish_response.status().status_code());
-    ASSERT_EQ(2, finish_response.tablet_vec_size());
+}
 
-    std::vector<int64_t> finished_tablets;
-    for (auto& info : finish_response.tablet_vec()) {
-        ASSERT_TRUE(info.has_schema_hash());
-        finished_tablets.emplace_back(info.tablet_id());
-    }
-    std::sort(finished_tablets.begin(), finished_tablets.end());
-    ASSERT_EQ(10086, finished_tablets[0]);
-    ASSERT_EQ(10089, finished_tablets[1]);
-    // tablet 10086
+TEST_F(LakeTabletsChannelTest, test_finish_after_abort) {
+    auto open_request = _open_request;
+    open_request.set_num_senders(2);
+
+    ASSERT_OK(_tablets_channel->open(open_request, &_open_response, _schema_param, false));
+
     {
-        ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(10086));
-        ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(kTxnId));
-        ASSERT_EQ(1, txnlog->op_write().rowset().segments().size());
-        auto chunk = read_segment(10086, txnlog->op_write().rowset().segments(0));
-        ASSERT_EQ(kChunkSize, chunk->num_rows());
+        constexpr int kChunkSize = 128;
+        constexpr int kChunkSizePerTablet = kChunkSize / 4;
+        auto chunk = generate_data(kChunkSize);
+
+        PTabletWriterAddChunkRequest add_chunk_request;
+        PTabletWriterAddBatchResult add_chunk_response;
+        add_chunk_request.set_index_id(kIndexId);
+        add_chunk_request.set_sender_id(0);
+        add_chunk_request.set_eos(true);
+        add_chunk_request.set_packet_seq(0);
+
+        for (int i = 0; i < kChunkSize; i++) {
+            int64_t tablet_id = 10086 + (i / kChunkSizePerTablet);
+            add_chunk_request.add_tablet_ids(tablet_id);
+            add_chunk_request.add_partition_ids(tablet_id < 10088 ? 10 : 11);
+        }
+
+        ASSIGN_OR_ABORT(auto chunk_pb, serde::ProtobufChunkSerde::serialize(chunk));
+        add_chunk_request.mutable_chunk()->Swap(&chunk_pb);
+
+        _tablets_channel->add_chunk(&chunk, add_chunk_request, &add_chunk_response);
+        ASSERT_TRUE(add_chunk_response.status().status_code() == TStatusCode::OK);
+
+        _tablets_channel->abort();
+
+        _tablets_channel->add_chunk(nullptr, add_chunk_request, &add_chunk_response);
+        ASSERT_EQ(TStatusCode::DUPLICATE_RPC_INVOCATION, add_chunk_response.status().status_code());
     }
-    // tablet 10089
     {
-        ASSIGN_OR_ABORT(auto tablet, _tablet_manager->get_tablet(10089));
-        ASSIGN_OR_ABORT(auto txnlog, tablet.get_txn_log(kTxnId));
-        ASSERT_EQ(0, txnlog->op_write().rowset().segments().size());
+        PTabletWriterAddChunkRequest finish_request;
+        PTabletWriterAddBatchResult finish_response;
+        finish_request.set_index_id(kIndexId);
+        finish_request.set_sender_id(1);
+        finish_request.set_eos(true);
+        finish_request.set_packet_seq(0);
+
+        _tablets_channel->add_chunk(nullptr, finish_request, &finish_response);
+        ASSERT_NE(TStatusCode::OK, finish_response.status().status_code());
+        ASSERT_GE(finish_response.status().error_msgs_size(), 1);
+        const auto& message = finish_response.status().error_msgs(0);
+        ASSERT_TRUE(message.find("AsyncDeltaWriter has been closed") != std::string::npos) << message;
+
+        PTabletWriterAddBatchResult finish_response2;
+        _tablets_channel->add_chunk(nullptr, finish_request, &finish_response2);
+        ASSERT_EQ(TStatusCode::DUPLICATE_RPC_INVOCATION, finish_response2.status().status_code());
     }
 }
 

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/load_channel.h
 
@@ -21,11 +34,7 @@
 
 #pragma once
 
-#include "common/compiler_util.h"
-DIAGNOSTIC_PUSH
-DIAGNOSTIC_IGNORE("-Wclass-memaccess")
 #include <bthread/mutex.h>
-DIAGNOSTIC_POP
 
 #include <memory>
 #include <ostream>
@@ -33,6 +42,7 @@ DIAGNOSTIC_POP
 #include <unordered_set>
 
 #include "column/chunk.h"
+#include "common/compiler_util.h"
 #include "common/status.h"
 #include "common/tracer.h"
 #include "gen_cpp/InternalService_types.h"
@@ -55,12 +65,18 @@ class LoadChannel;
 class LoadChannelMgr;
 class OlapTableSchemaParam;
 
+namespace lake {
+class TabletManager;
+}
+
 // A LoadChannel manages tablets channels for all indexes
 // corresponding to a certain load job
 class LoadChannel {
+    using LakeTabletManager = lake::TabletManager;
+
 public:
-    LoadChannel(LoadChannelMgr* mgr, const UniqueId& load_id, const std::string& txn_trace_parent, int64_t timeout_s,
-                std::unique_ptr<MemTracker> mem_tracker);
+    LoadChannel(LoadChannelMgr* mgr, LakeTabletManager* lake_tablet_mgr, const UniqueId& load_id, int64_t txn_id,
+                const std::string& txn_trace_parent, int64_t timeout_s, std::unique_ptr<MemTracker> mem_tracker);
 
     ~LoadChannel();
 
@@ -80,11 +96,15 @@ public:
 
     void cancel();
 
-    void cancel(int64_t index_id, int64_t tablet_id);
+    void abort();
+
+    void abort(int64_t index_id, const std::vector<int64_t>& tablet_ids, const std::string& reason);
 
     time_t last_updated_time() const { return _last_updated_time.load(std::memory_order_relaxed); }
 
     const UniqueId& load_id() const { return _load_id; }
+
+    int64_t txn_id() const { return _txn_id; }
 
     int64_t timeout() const { return _timeout_s; }
 
@@ -97,13 +117,14 @@ public:
     Span get_span() { return _span; }
 
 private:
-    void _add_chunk(vectorized::Chunk* chunk, const PTabletWriterAddChunkRequest& request,
-                    PTabletWriterAddBatchResult* response);
+    void _add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequest& request, PTabletWriterAddBatchResult* response);
     Status _build_chunk_meta(const ChunkPB& pb_chunk);
-    Status _deserialize_chunk(const ChunkPB& pchunk, vectorized::Chunk& chunk, faststring* uncompressed_buffer);
+    Status _deserialize_chunk(const ChunkPB& pchunk, Chunk& chunk, faststring* uncompressed_buffer);
 
     LoadChannelMgr* _load_mgr;
+    LakeTabletManager* _lake_tablet_mgr;
     UniqueId _load_id;
+    int64_t _txn_id;
     int64_t _timeout_s;
     std::atomic<bool> _has_chunk_meta;
     mutable bthread::Mutex _chunk_meta_lock;

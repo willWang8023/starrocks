@@ -1,8 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "array_reader.h"
 
-namespace starrocks::vectorized::csv {
+namespace starrocks::csv {
 
 std::unique_ptr<ArrayReader> ArrayReader::create_array_reader(const Converter::Options& options) {
     std::unique_ptr<ArrayReader> array_reader;
@@ -24,7 +36,8 @@ bool DefaultArrayReader::validate(const Slice& s) const {
     return true;
 }
 
-bool DefaultArrayReader::split_array_elements(Slice s, std::vector<Slice>* elements) const {
+bool DefaultArrayReader::split_array_elements(const Slice& tmp_s, std::vector<Slice>& elements) const {
+    Slice s = tmp_s;
     s.remove_prefix(1);
     s.remove_suffix(1);
     if (s.empty()) {
@@ -34,7 +47,7 @@ bool DefaultArrayReader::split_array_elements(Slice s, std::vector<Slice>* eleme
 
     bool in_quote = false;
     int array_nest_level = 0;
-    elements->push_back(s);
+    elements.push_back(s);
     for (size_t i = 0; i < s.size; i++) {
         char c = s[i];
         // TODO(zhuming): handle escaped double quotes
@@ -45,8 +58,8 @@ bool DefaultArrayReader::split_array_elements(Slice s, std::vector<Slice>* eleme
         } else if (!in_quote && c == ']') {
             array_nest_level--;
         } else if (!in_quote && array_nest_level == 0 && c == _array_delimiter) {
-            elements->back().remove_suffix(s.size - i);
-            elements->push_back(Slice(s.data + i + 1, s.size - i - 1));
+            elements.back().remove_suffix(s.size - i);
+            elements.emplace_back(s.data + i + 1, s.size - i - 1);
         }
     }
     if (array_nest_level != 0 || in_quote) {
@@ -65,7 +78,7 @@ bool HiveTextArrayReader::validate(const Slice& s) const {
     return true;
 }
 
-bool HiveTextArrayReader::split_array_elements(Slice s, std::vector<Slice>* elements) const {
+bool HiveTextArrayReader::split_array_elements(const Slice& s, std::vector<Slice>& elements) const {
     if (s.size == 0) {
         // consider empty array
         return true;
@@ -76,12 +89,12 @@ bool HiveTextArrayReader::split_array_elements(Slice s, std::vector<Slice>* elem
     for (/**/; right < s.size; right++) {
         char c = s[right];
         if (c == _array_delimiter) {
-            elements->push_back(Slice(s.data + left, right - left));
+            elements.emplace_back(s.data + left, right - left);
             left = right + 1;
         }
     }
     if (right > left) {
-        elements->push_back(Slice(s.data + left, right - left));
+        elements.emplace_back(s.data + left, right - left);
     }
 
     return true;
@@ -127,4 +140,4 @@ char HiveTextArrayReader::get_collection_delimiter(char collection_delimiter, ch
     return static_cast<char>(tmp);
 }
 
-} // namespace starrocks::vectorized::csv
+} // namespace starrocks::csv

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/proc/TabletSchedulerDetailProcDir.java
 
@@ -35,6 +48,7 @@ import java.util.List;
  * show proc "/tablet_scheduler/pending_tablets";
  * show proc "/tablet_scheduler/running_tablets";
  * show proc "/tablet_scheduler/history_tablets";
+ * show proc "/tablet_scheduler/all_tablets";
  */
 public class TabletSchedulerDetailProcDir implements ProcDirInterface {
     public static final ImmutableList<String> TITLE_NAMES = new ImmutableList.Builder<String>()
@@ -66,6 +80,12 @@ public class TabletSchedulerDetailProcDir implements ProcDirInterface {
             tabletInfos = tabletScheduler.getRunningTabletsInfo(1000);
         } else if (type.equals(ClusterBalanceProcDir.HISTORY_TABLETS)) {
             tabletInfos = tabletScheduler.getHistoryTabletsInfo(1000);
+        } else if (type.equals(ClusterBalanceProcDir.ALL_TABLETS)) {
+            ImmutableList<String> titleNames = new ImmutableList.Builder<String>()
+                    .add("TabletId")
+                    .build();
+            result.setNames(titleNames);
+            tabletInfos = tabletScheduler.getAllTabletsInfo();
         } else {
             throw new AnalysisException("invalid type: " + type);
         }
@@ -87,7 +107,7 @@ public class TabletSchedulerDetailProcDir implements ProcDirInterface {
             throw new AnalysisException("Invalid tablet id format: " + tabletIdStr);
         }
 
-        TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentInvertedIndex();
+        TabletInvertedIndex invertedIndex = GlobalStateMgr.getCurrentState().getTabletInvertedIndex();
         List<Replica> replicas = invertedIndex.getReplicasByTabletId(tabletId);
         return new ReplicasProcNode(tabletId, replicas);
     }

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.udf;
 
@@ -18,10 +30,17 @@ public class UDFClassLoader extends URLClassLoader {
 
     private Map<String, Class<?>> genClazzMap = new HashMap<>();
     private static final int SINGLE_BATCH_UPDATE = 1;
-    private static final int BATCH_EVALUATE = 2; 
+    private static final int BATCH_EVALUATE = 2;
 
     public UDFClassLoader(String udfPath) throws IOException {
         super(new URL[] {new URL("file://" + udfPath)});
+        if (System.getSecurityManager() == null && System.getProperties().get("java.security.policy") != null) {
+            synchronized (UDFClassLoader.class) {
+                if (System.getSecurityManager() == null) {
+                    System.setSecurityManager(new UDFSecurityManager(UDFClassLoader.class));
+                }
+            }
+        }
     }
 
     @Override
@@ -32,7 +51,6 @@ public class UDFClassLoader extends URLClassLoader {
         }
         return super.findClass(clazzName);
     }
-
 
     public Class<?> generateCallStubV(String name, Class<?> clazz, Method method, int genType) {
         String clazzName = name.replace("/", ".");

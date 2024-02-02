@@ -1,11 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "finish_task.h"
 
-#include "agent/client_cache.h"
 #include "agent/status.h"
 #include "agent/utils.h"
 #include "common/logging.h"
+#include "runtime/exec_env.h"
 #include "util/starrocks_metrics.h"
 
 namespace starrocks {
@@ -20,7 +32,7 @@ void finish_task(const TFinishTaskRequest& finish_task_request) {
     int32_t sleep_seconds = 1;
     int32_t max_retry_times = TASK_FINISH_MAX_RETRY;
 
-    MasterServerClient client(&g_frontend_service_client_cache);
+    MasterServerClient client(ExecEnv::GetInstance()->frontend_client_cache());
 
     while (try_time < max_retry_times) {
         StarRocksMetrics::instance()->finish_task_requests_total.increment(1);

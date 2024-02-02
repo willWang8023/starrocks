@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/DomainResolver.java
 
@@ -24,8 +37,8 @@ package com.starrocks.catalog;
 import com.google.common.base.Strings;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
-import com.starrocks.common.util.LeaderDaemon;
-import com.starrocks.mysql.privilege.Auth;
+import com.starrocks.authentication.AuthenticationMgr;
+import com.starrocks.common.util.FrontendDaemon;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -37,51 +50,72 @@ import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /*
  * DomainResolver resolve the domain name saved in user property to list of IPs,
  * and refresh password entries in user priv table, periodically.
  */
-public class DomainResolver extends LeaderDaemon {
+public class DomainResolver extends FrontendDaemon {
     private static final Logger LOG = LogManager.getLogger(DomainResolver.class);
     // this is only available in BAIDU, for resolving BNS
     private static final String BNS_RESOLVER_TOOLS_PATH = "/usr/bin/get_instance_by_service";
 
-    private Auth auth;
+    private AuthenticationMgr authenticationManager;
+    private final ReentrantReadWriteLock lock = new ReentrantReadWriteLock();
 
-    public DomainResolver(Auth auth) {
-        super("domain resolver", 10 * 1000);
-        this.auth = auth;
+    public DomainResolver(AuthenticationMgr authenticationManager) {
+        super("domain resolver", 10L * 1000);
+        this.authenticationManager = authenticationManager;
+    }
+
+    /**
+     * if a follower has just transfered to leader, or if it is replaying a AuthUpgrade journal.
+     * this function will be called to switch from using Auth to using AuthenticationManager.
+     */
+    public void setAuthenticationManager(AuthenticationMgr manager) {
+        lock.writeLock().lock();
+        try {
+            this.authenticationManager = manager;
+        } finally {
+            lock.writeLock().unlock();
+        }
     }
 
     // 'public' for test
     @Override
     public void runAfterCatalogReady() {
-        // domain names
-        Set<String> allDomains = Sets.newHashSet();
-        auth.getAllDomains(allDomains);
+        lock.readLock().lock();
+        try {
+            // domain names
+            Set<String> allDomains;
+            allDomains = authenticationManager.getAllHostnames();
 
-        // resolve domain name
-        Map<String, Set<String>> resolvedIPsMap = Maps.newHashMap();
-        for (String domain : allDomains) {
-            LOG.debug("begin to resolve domain: {}", domain);
-            Set<String> resolvedIPs = Sets.newHashSet();
-            if (!resolveWithBNS(domain, resolvedIPs) && !resolveWithDNS(domain, resolvedIPs)) {
-                continue;
+            // resolve domain name
+            Map<String, Set<String>> resolvedIPsMap = Maps.newHashMap();
+            for (String domain : allDomains) {
+                LOG.debug("begin to resolve domain: {}", domain);
+                Set<String> resolvedIPs = Sets.newHashSet();
+                if (!resolveWithBNS(domain, resolvedIPs) && !resolveWithDNS(domain, resolvedIPs)) {
+                    continue;
+                }
+                LOG.debug("get resolved ip of domain {}: {}", domain, resolvedIPs);
+
+                resolvedIPsMap.put(domain, resolvedIPs);
             }
-            LOG.debug("get resolved ip of domain {}: {}", domain, resolvedIPs);
 
-            resolvedIPsMap.put(domain, resolvedIPs);
+            // refresh user priv table by resolved IPs
+            authenticationManager.setHostnameToIpSet(resolvedIPsMap);
+        } finally {
+            lock.readLock().unlock();
         }
 
-        // refresh user priv table by resolved IPs
-        auth.refreshUserPrivEntriesByResovledIPs(resolvedIPsMap);
     }
 
     /**
      * Check if domain name is valid
      *
-     * @param host: currently is the user's whitelist bns or dns name
+     * @param domainName: currently is the user's whitelist bns or dns name
      * @return true of false
      */
     public boolean isValidDomain(String domainName) {

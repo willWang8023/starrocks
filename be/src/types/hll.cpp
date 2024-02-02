@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/hll.cpp
 
@@ -42,16 +55,15 @@ using std::stringstream;
 namespace starrocks {
 
 std::string HyperLogLog::empty() {
-    static HyperLogLog hll;
     std::string buf;
     buf.resize(HLL_EMPTY_SIZE);
-    hll.serialize((uint8_t*)buf.c_str());
+    (*(uint8_t*)buf.c_str()) = HLL_DATA_EMPTY;
     return buf;
 }
 
 HyperLogLog::HyperLogLog(const HyperLogLog& other) : _type(other._type), _hash_set(other._hash_set) {
     if (other._registers.data != nullptr) {
-        ChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
+        MemChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
         DCHECK_NE(_registers.data, nullptr);
         DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
         memcpy(_registers.data, other._registers.data, HLL_REGISTERS_COUNT);
@@ -64,12 +76,12 @@ HyperLogLog& HyperLogLog::operator=(const HyperLogLog& other) {
         this->_hash_set = other._hash_set;
 
         if (_registers.data != nullptr) {
-            ChunkAllocator::instance()->free(_registers);
+            MemChunkAllocator::instance()->free(_registers);
             _registers.data = nullptr;
         }
 
         if (other._registers.data != nullptr) {
-            ChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
+            MemChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
             DCHECK_NE(_registers.data, nullptr);
             DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
             memcpy(_registers.data, other._registers.data, HLL_REGISTERS_COUNT);
@@ -91,7 +103,7 @@ HyperLogLog& HyperLogLog::operator=(HyperLogLog&& other) noexcept {
         this->_hash_set = std::move(other._hash_set);
 
         if (_registers.data != nullptr) {
-            ChunkAllocator::instance()->free(_registers);
+            MemChunkAllocator::instance()->free(_registers);
         }
         _registers = other._registers;
 
@@ -115,7 +127,7 @@ HyperLogLog::HyperLogLog(const Slice& src) {
 HyperLogLog::~HyperLogLog() {
     if (_registers.data != nullptr) {
         DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
-        ChunkAllocator::instance()->free(_registers);
+        MemChunkAllocator::instance()->free(_registers);
     }
 }
 
@@ -124,7 +136,7 @@ HyperLogLog::~HyperLogLog() {
 void HyperLogLog::_convert_explicit_to_register() {
     DCHECK(_type == HLL_DATA_EXPLICIT) << "_type(" << _type << ") should be explicit(" << HLL_DATA_EXPLICIT << ")";
     DCHECK_EQ(_registers.data, nullptr);
-    ChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
+    MemChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
     DCHECK_NE(_registers.data, nullptr);
     DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
     memset(_registers.data, 0, HLL_REGISTERS_COUNT);
@@ -176,7 +188,7 @@ void HyperLogLog::merge(const HyperLogLog& other) {
         case HLL_DATA_SPARSE:
         case HLL_DATA_FULL:
             DCHECK_EQ(_registers.data, nullptr);
-            ChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
+            MemChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
             DCHECK_NE(_registers.data, nullptr);
             DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
             memcpy(_registers.data, other._registers.data, HLL_REGISTERS_COUNT);
@@ -373,7 +385,7 @@ bool HyperLogLog::deserialize(const Slice& slice) {
     }
     case HLL_DATA_SPARSE: {
         DCHECK_EQ(_registers.data, nullptr);
-        ChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
+        MemChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
         DCHECK_NE(_registers.data, nullptr);
         DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
         memset(_registers.data, 0, HLL_REGISTERS_COUNT);
@@ -392,7 +404,7 @@ bool HyperLogLog::deserialize(const Slice& slice) {
     }
     case HLL_DATA_FULL: {
         DCHECK_EQ(_registers.data, nullptr);
-        ChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
+        MemChunkAllocator::instance()->allocate(HLL_REGISTERS_COUNT, &_registers);
         DCHECK_NE(_registers.data, nullptr);
         DCHECK_EQ(_registers.size, HLL_REGISTERS_COUNT);
         // 2+ : hll register value
@@ -406,6 +418,74 @@ bool HyperLogLog::deserialize(const Slice& slice) {
     }
     return true;
 }
+
+static float harmomic_tables[65] = {
+        1.0f / static_cast<float>(1L << 0),
+        1.0f / static_cast<float>(1L << 1),
+        1.0f / static_cast<float>(1L << 2),
+        1.0f / static_cast<float>(1L << 3),
+        1.0f / static_cast<float>(1L << 4),
+        1.0f / static_cast<float>(1L << 5),
+        1.0f / static_cast<float>(1L << 6),
+        1.0f / static_cast<float>(1L << 7),
+        1.0f / static_cast<float>(1L << 8),
+        1.0f / static_cast<float>(1L << 9),
+        1.0f / static_cast<float>(1L << 10),
+        1.0f / static_cast<float>(1L << 11),
+        1.0f / static_cast<float>(1L << 12),
+        1.0f / static_cast<float>(1L << 13),
+        1.0f / static_cast<float>(1L << 14),
+        1.0f / static_cast<float>(1L << 15),
+        1.0f / static_cast<float>(1L << 16),
+        1.0f / static_cast<float>(1L << 17),
+        1.0f / static_cast<float>(1L << 18),
+        1.0f / static_cast<float>(1L << 19),
+        1.0f / static_cast<float>(1L << 20),
+        1.0f / static_cast<float>(1L << 21),
+        1.0f / static_cast<float>(1L << 22),
+        1.0f / static_cast<float>(1L << 23),
+        1.0f / static_cast<float>(1L << 24),
+        1.0f / static_cast<float>(1L << 25),
+        1.0f / static_cast<float>(1L << 26),
+        1.0f / static_cast<float>(1L << 27),
+        1.0f / static_cast<float>(1L << 28),
+        1.0f / static_cast<float>(1L << 29),
+        1.0f / static_cast<float>(1L << 30),
+        1.0f / static_cast<float>(1L << 31),
+        1.0f / static_cast<float>(1L << 32),
+        1.0f / static_cast<float>(1L << 33),
+        1.0f / static_cast<float>(1L << 34),
+        1.0f / static_cast<float>(1L << 35),
+        1.0f / static_cast<float>(1L << 36),
+        1.0f / static_cast<float>(1L << 37),
+        1.0f / static_cast<float>(1L << 38),
+        1.0f / static_cast<float>(1L << 39),
+        1.0f / static_cast<float>(1L << 40),
+        1.0f / static_cast<float>(1L << 41),
+        1.0f / static_cast<float>(1L << 42),
+        1.0f / static_cast<float>(1L << 43),
+        1.0f / static_cast<float>(1L << 44),
+        1.0f / static_cast<float>(1L << 45),
+        1.0f / static_cast<float>(1L << 46),
+        1.0f / static_cast<float>(1L << 47),
+        1.0f / static_cast<float>(1L << 48),
+        1.0f / static_cast<float>(1L << 49),
+        1.0f / static_cast<float>(1L << 50),
+        1.0f / static_cast<float>(1L << 51),
+        1.0f / static_cast<float>(1L << 52),
+        1.0f / static_cast<float>(1L << 53),
+        1.0f / static_cast<float>(1L << 54),
+        1.0f / static_cast<float>(1L << 55),
+        1.0f / static_cast<float>(1L << 56),
+        1.0f / static_cast<float>(1L << 57),
+        1.0f / static_cast<float>(1L << 58),
+        1.0f / static_cast<float>(1L << 59),
+        1.0f / static_cast<float>(1L << 60),
+        1.0f / static_cast<float>(1L << 61),
+        1.0f / static_cast<float>(1L << 62),
+        1.0f / static_cast<float>(1L << 63),
+        5.421010862427522e-20f,
+};
 
 int64_t HyperLogLog::estimate_cardinality() const {
     if (_type == HLL_DATA_EMPTY) {
@@ -433,7 +513,7 @@ int64_t HyperLogLog::estimate_cardinality() const {
     int num_zero_registers = 0;
 
     for (int i = 0; i < HLL_REGISTERS_COUNT; ++i) {
-        harmonic_mean += powf(2.0f, -_registers.data[i]);
+        harmonic_mean += harmomic_tables[_registers.data[i]];
 
         if (_registers.data[i] == 0) {
             ++num_zero_registers;

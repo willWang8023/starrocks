@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/gensrc/thrift/MasterService.thrift
 
@@ -27,11 +40,14 @@ include "InternalService.thrift"
 include "Types.thrift"
 include "Status.thrift"
 include "WorkGroup.thrift"
+include "ResourceUsage.thrift"
+include "DataCache.thrift"
 
 struct TTabletInfo {
     1: required Types.TTabletId tablet_id
     2: required Types.TSchemaHash schema_hash
     3: required Types.TVersion version
+    4: required Types.TVersionHash version_hash // Deprecated
     5: required Types.TCount row_count
     6: required Types.TSize data_size
     7: optional Types.TStorageMedium storage_medium
@@ -41,9 +57,15 @@ struct TTabletInfo {
     11: optional bool version_miss
     12: optional bool used
     13: optional Types.TPartitionId partition_id
-    14: optional bool is_in_memory
+    14: optional bool is_in_memory // Deprecated
     15: optional bool enable_persistent_index
     16: optional Types.TVersion min_readable_version
+    17: optional i64 binlog_config_version
+    18: optional bool is_error_state
+    19: optional Types.TVersion max_readable_version
+    20: optional i64 max_rowset_creation_time
+    21: optional i32 primary_index_cache_expire_sec
+    22: optional i32 tablet_schema_version
 }
 
 struct TTabletVersionPair {
@@ -69,6 +91,8 @@ struct TFinishTaskRequest {
     15: optional i64 copy_size
     16: optional i64 copy_time_ms
     17: optional list<TTabletVersionPair> tablet_versions;
+    18: optional list<TTabletVersionPair> tablet_publish_versions;
+    19: optional bool incremental_snapshot
 }
 
 struct TTablet {
@@ -92,7 +116,7 @@ struct TPluginInfo {
 
 struct TReportRequest {
     1: required Types.TBackend backend
-    2: optional i64 report_version
+    2: optional i64 report_version // Required
     3: optional map<Types.TTaskType, set<i64>> tasks // string signature
     4: optional map<Types.TTabletId, TTablet> tablets
     5: optional map<string, TDisk> disks // string root_path
@@ -103,6 +127,8 @@ struct TReportRequest {
     8: optional i64 tablet_max_compaction_score
     // active workgroup on this backend
     9: optional list<WorkGroup.TWorkGroup> active_workgroups
+    10: optional ResourceUsage.TResourceUsage resource_usage
+    11: optional DataCache.TDataCacheMetrics datacache_metrics
 }
 
 struct TMasterResult {

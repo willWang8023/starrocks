@@ -1,6 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
+
+#include <bthread/mutex.h>
 
 #include <algorithm>
 #include <future>
@@ -9,16 +23,12 @@
 #include <queue>
 #include <unordered_set>
 
-#include "common/compiler_util.h"
-DIAGNOSTIC_PUSH
-DIAGNOSTIC_IGNORE("-Wclass-memaccess")
-#include <bthread/mutex.h>
-DIAGNOSTIC_POP
-
 #include "column/chunk.h"
+#include "common/compiler_util.h"
 #include "exec/pipeline/fragment_context.h"
 #include "gen_cpp/BackendService.h"
 #include "runtime/current_thread.h"
+#include "runtime/query_statistics.h"
 #include "runtime/runtime_state.h"
 #include "util/brpc_stub_cache.h"
 #include "util/defer_op.h"
@@ -28,22 +38,22 @@ DIAGNOSTIC_POP
 namespace starrocks::pipeline {
 
 using PTransmitChunkParamsPtr = std::shared_ptr<PTransmitChunkParams>;
+struct ClosureContext {
+    TUniqueId instance_id;
+    int64_t sequence;
+    int64_t send_timestamp;
+};
 
 struct TransmitChunkInfo {
     // For BUCKET_SHUFFLE_HASH_PARTITIONED, multiple channels may be related to
     // a same exchange source fragment instance, so we should use fragment_instance_id
     // of the destination as the key of destination instead of channel_id.
     TUniqueId fragment_instance_id;
-    doris::PBackendService_Stub* brpc_stub;
+    PInternalService_Stub* brpc_stub;
     PTransmitChunkParamsPtr params;
     butil::IOBuf attachment;
     int64_t attachment_physical_bytes;
-};
-
-struct ClosureContext {
-    TUniqueId instance_id;
-    int64_t sequence;
-    int64_t send_timestamp;
+    const TNetworkAddress brpc_addr;
 };
 
 // TimeTrace is introduced to estimate time more accurately.
@@ -70,10 +80,10 @@ struct TimeTrace {
 class SinkBuffer {
 public:
     SinkBuffer(FragmentContext* fragment_ctx, const std::vector<TPlanFragmentDestination>& destinations,
-               bool is_dest_merge, size_t num_sinkers);
+               bool is_dest_merge);
     ~SinkBuffer();
 
-    void add_request(TransmitChunkInfo& request);
+    Status add_request(TransmitChunkInfo& request);
     bool is_full() const;
 
     void set_finishing();
@@ -84,13 +94,15 @@ public:
 
     // When all the ExchangeSinkOperator shared this SinkBuffer are cancelled,
     // the rest chunk request and EOS request needn't be sent anymore.
-    void cancel_one_sinker();
+    void cancel_one_sinker(RuntimeState* const state);
+
+    void incr_sinker(RuntimeState* state);
 
 private:
     using Mutex = bthread::Mutex;
 
     void _update_network_time(const TUniqueId& instance_id, const int64_t send_timestamp,
-                              const int64_t receive_timestamp);
+                              const int64_t receiver_post_process_time);
     // Update the discontinuous acked window, here are the invariants:
     // all acks received with sequence from [0, _max_continuous_acked_seqs[x]]
     // not all the acks received with sequence from [_max_continuous_acked_seqs[x]+1, _request_seqs[x]]
@@ -99,7 +111,10 @@ private:
 
     // Try to send rpc if buffer is not empty and channel is not busy
     // And we need to put this function and other extra works(pre_works) together as an atomic operation
-    void _try_to_send_rpc(const TUniqueId& instance_id, std::function<void()> pre_works);
+    [[nodiscard]] Status _try_to_send_rpc(const TUniqueId& instance_id, const std::function<void()>& pre_works);
+
+    // send by rpc or http
+    Status _send_rpc(DisposableClosure<PTransmitChunkResult, ClosureContext>* closure, const TransmitChunkInfo& req);
 
     // Roughly estimate network time which is defined as the time between sending a and receiving a packet,
     // and the processing time of both sides are excluded
@@ -130,7 +145,7 @@ private:
     phmap::flat_hash_map<int64_t, int64_t> _max_continuous_acked_seqs;
     phmap::flat_hash_map<int64_t, std::unordered_set<int64_t>> _discontinuous_acked_seqs;
     std::atomic<int32_t> _total_in_flight_rpc = 0;
-    std::atomic<int32_t> _num_uncancelled_sinkers;
+    std::atomic<int32_t> _num_uncancelled_sinkers = 0;
     std::atomic<int32_t> _num_remaining_eos = 0;
 
     // The request needs the reference to the allocated finst id,
@@ -141,6 +156,7 @@ private:
     phmap::flat_hash_map<int64_t, int32_t> _num_in_flight_rpcs;
     phmap::flat_hash_map<int64_t, TimeTrace> _network_times;
     phmap::flat_hash_map<int64_t, std::unique_ptr<Mutex>> _mutexes;
+    phmap::flat_hash_map<int64_t, TNetworkAddress> _dest_addrs;
 
     // True means that SinkBuffer needn't input chunk and send chunk anymore,
     // but there may be still in-flight RPC running.
@@ -155,8 +171,10 @@ private:
     std::atomic<bool> _is_finishing = false;
     std::atomic<int32_t> _num_sending_rpc = 0;
 
+    std::atomic<int64_t> _rpc_count = 0;
+    std::atomic<int64_t> _rpc_cumulative_time = 0;
+
     // RuntimeProfile counters
-    std::atomic_bool _is_profile_updated = false;
     std::atomic<int64_t> _bytes_enqueued = 0;
     std::atomic<int64_t> _request_enqueued = 0;
     std::atomic<int64_t> _bytes_sent = 0;
@@ -170,6 +188,11 @@ private:
     // Non-atomic type is enough because the concurrency inconsistency is acceptable
     int64_t _first_send_time = -1;
     int64_t _last_receive_time = -1;
-}; // namespace starrocks::pipeline
+    int64_t _rpc_http_min_size = 0;
+
+    std::atomic<int64_t> _request_sequence = 0;
+    int64_t _sent_audit_stats_frequency = 1;
+    int64_t _sent_audit_stats_frequency_upper_limit = 64;
+};
 
 } // namespace starrocks::pipeline

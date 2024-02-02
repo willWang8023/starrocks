@@ -1,12 +1,25 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
 #include "column/column.h"
 #include "column/datum.h"
+#include "column/vectorized_fwd.h"
 #include "common/logging.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 class ConstColumn final : public ColumnFactory<Column, ConstColumn> {
     friend class ColumnFactory<Column, ConstColumn>;
@@ -37,13 +50,14 @@ public:
 
     bool is_null(size_t index) const override { return _data->is_null(0); }
 
-    bool only_null() const override { return _data->is_null(0); }
+    bool only_null() const override {
+        DCHECK(_data->is_nullable() ? _size == 0 || _data->is_null(0) : true);
+        return _data->is_nullable();
+    }
 
     bool has_null() const override { return _data->has_null(); }
 
     bool is_constant() const override { return true; }
-
-    bool low_cardinality() const override { return false; }
 
     const uint8_t* raw_data() const override { return _data->raw_data(); }
 
@@ -64,7 +78,12 @@ public:
 
     void reserve(size_t n) override {}
 
-    void resize(size_t n) override { _size = n; }
+    void resize(size_t n) override {
+        if (_size == 0) {
+            _data->resize(1);
+        }
+        _size = n;
+    }
 
     // This method resize the underlying data column,
     // Because when sometimes(agg functions), we want to handle const column as normal data column
@@ -89,13 +108,16 @@ public:
 
     void append_value_multiple_times(const Column& src, uint32_t index, uint32_t size) override;
 
+    ColumnPtr replicate(const std::vector<uint32_t>& offsets) override;
+
     bool append_nulls(size_t count) override {
+        DCHECK_GT(count, 0);
         if (_data->is_nullable()) {
             bool ok = true;
             if (_size == 0) {
                 ok = _data->append_nulls(1);
             }
-            _size += ok;
+            _size += count;
             return ok;
         } else {
             return false;
@@ -112,13 +134,23 @@ public:
         }
     }
 
-    void append_default() override { _size++; }
+    void append_default() override {
+        if (_size == 0) {
+            _data->append_default(1);
+        }
+        _size++;
+    }
 
-    void append_default(size_t count) override { _size += count; }
+    void append_default(size_t count) override {
+        if (_size == 0) {
+            _data->append_default(1);
+        }
+        _size += count;
+    }
 
     void fill_default(const Filter& filter) override;
 
-    Status update_rows(const Column& src, const uint32_t* indexes) override;
+    void update_rows(const Column& src, const uint32_t* indexes) override;
 
     uint32_t serialize(size_t idx, uint8_t* pos) override { return _data->serialize(0, pos); }
 
@@ -158,9 +190,11 @@ public:
 
     MutableColumnPtr clone_empty() const override { return create_mutable(_data->clone_empty(), 0); }
 
-    size_t filter_range(const Column::Filter& filter, size_t from, size_t to) override;
+    size_t filter_range(const Filter& filter, size_t from, size_t to) override;
 
     int compare_at(size_t left, size_t right, const Column& rhs, int nan_direction_hint) const override;
+
+    int equals(size_t left, const Column& rhs, size_t right, bool safe_eq = true) const override;
 
     void fnv_hash(uint32_t* hash, uint32_t from, uint32_t to) const override;
 
@@ -182,11 +216,11 @@ public:
 
     size_t container_memory_usage() const override { return _data->container_memory_usage(); }
 
-    size_t element_memory_usage() const override { return _data->element_memory_usage(); }
+    size_t reference_memory_usage() const override { return _data->reference_memory_usage(); }
 
-    size_t element_memory_usage(size_t from, size_t size) const override {
+    size_t reference_memory_usage(size_t from, size_t size) const override {
         // const column has only one element
-        return element_memory_usage();
+        return size == 0 ? 0 : reference_memory_usage();
     }
 
     void swap_column(Column& rhs) override {
@@ -202,7 +236,7 @@ public:
         _size = 0;
     }
 
-    std::string debug_item(uint32_t idx) const override {
+    std::string debug_item(size_t idx) const override {
         std::stringstream ss;
         ss << "CONST: " << _data->debug_item(0);
         return ss.str();
@@ -238,4 +272,4 @@ private:
     uint64_t _size;
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

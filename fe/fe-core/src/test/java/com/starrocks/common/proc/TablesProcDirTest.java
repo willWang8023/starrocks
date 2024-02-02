@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.common.proc;
 
@@ -89,9 +102,9 @@ public class TablesProcDirTest {
             }
         };
 
-        db.createTable(tb1);
-        db.createTable(tb2);
-        db.createTable(tb3);
+        db.registerTableUnlocked(tb1);
+        db.registerTableUnlocked(tb2);
+        db.registerTableUnlocked(tb3);
     }
 
     @Test
@@ -115,7 +128,7 @@ public class TablesProcDirTest {
         // Type
         Assert.assertEquals("OLAP", list1.get(6));
         // LastConsistencyCheckTime
-        Assert.assertEquals(FeConstants.null_string, list1.get(7));
+        Assert.assertEquals(FeConstants.NULL_STRING, list1.get(7));
         // ReplicaCount
         Assert.assertEquals("2", list1.get(8));
         // PartitionType
@@ -138,7 +151,7 @@ public class TablesProcDirTest {
         // Type
         Assert.assertEquals("OLAP", list2.get(6));
         // LastConsistencyCheckTime
-        Assert.assertEquals(FeConstants.null_string, list2.get(7));
+        Assert.assertEquals(FeConstants.NULL_STRING, list2.get(7));
         // ReplicaCount
         Assert.assertEquals("2", list2.get(8));
         // PartitionType
@@ -151,17 +164,17 @@ public class TablesProcDirTest {
         // TableName
         Assert.assertEquals("tb3", list3.get(1));
         // IndexNum
-        Assert.assertEquals(FeConstants.null_string, list3.get(2));
+        Assert.assertEquals(FeConstants.NULL_STRING, list3.get(2));
         // PartitionColumnName
-        Assert.assertEquals(FeConstants.null_string, list3.get(3));
+        Assert.assertEquals(FeConstants.NULL_STRING, list3.get(3));
         // PartitionNum
         Assert.assertEquals("1", list3.get(4));
         // State
-        Assert.assertEquals(FeConstants.null_string, list3.get(5));
+        Assert.assertEquals(FeConstants.NULL_STRING, list3.get(5));
         // Type
         Assert.assertEquals("HUDI", list3.get(6));
         // LastConsistencyCheckTime
-        Assert.assertEquals(FeConstants.null_string, list3.get(7));
+        Assert.assertEquals(FeConstants.NULL_STRING, list3.get(7));
         // ReplicaCount
         Assert.assertEquals("0", list3.get(8));
         // PartitionType

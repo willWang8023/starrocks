@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/exec/exec_node.h
 
@@ -30,7 +43,7 @@
 #include "common/global_types.h"
 #include "common/status.h"
 #include "exec/pipeline/pipeline_fwd.h"
-#include "exprs/vectorized/runtime_filter_bank.h"
+#include "exprs/runtime_filter_bank.h"
 #include "gen_cpp/PlanNodes_types.h"
 #include "runtime/descriptors.h"
 #include "runtime/mem_pool.h"
@@ -68,7 +81,6 @@ using std::stringstream;
 using std::vector;
 using std::map;
 
-using vectorized::ChunkPtr;
 // Superclass of all executor nodes.
 // All subclasses need to make sure to check RuntimeState::is_cancelled()
 // periodically in order to ensure timely termination after the cancellation
@@ -84,7 +96,7 @@ public:
     /// Initializes this object from the thrift tnode desc. The subclass should
     /// do any initialization that can fail in Init() rather than the ctor.
     /// If overridden in subclass, must first call superclass's Init().
-    virtual Status init(const TPlanNode& tnode, RuntimeState* state);
+    [[nodiscard]] virtual Status init(const TPlanNode& tnode, RuntimeState* state);
 
     // Sets up internal structures, etc., without doing any actual work.
     // Must be called prior to open(). Will only be called once in this
@@ -93,19 +105,20 @@ public:
     // in prepare().  Retrieving the jit compiled function pointer must happen in
     // open().
     // If overridden in subclass, must first call superclass's prepare().
-    virtual Status prepare(RuntimeState* state);
+    [[nodiscard]] virtual Status prepare(RuntimeState* state);
 
     // Performs any preparatory work prior to calling get_next().
     // Can be called repeatedly (after calls to close()).
     // Caller must not be holding any io buffers. This will cause deadlock.
-    virtual Status open(RuntimeState* state);
+    [[nodiscard]] virtual Status open(RuntimeState* state);
 
-    virtual Status get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos);
+    [[nodiscard]] virtual Status get_next(RuntimeState* state, ChunkPtr* chunk, bool* eos);
 
     // Used by sub nodes to get big chunk.
     // specific_get_next is the subclass's implementation to get datas.
-    static Status get_next_big_chunk(RuntimeState*, ChunkPtr*, bool*, ChunkPtr& pre_output_chunk,
-                                     const std::function<Status(RuntimeState*, ChunkPtr*, bool*)>& specific_get_next);
+    [[nodiscard]] static Status get_next_big_chunk(
+            RuntimeState*, ChunkPtr*, bool*, ChunkPtr& pre_output_chunk,
+            const std::function<Status(RuntimeState*, ChunkPtr*, bool*)>& specific_get_next);
 
     // Resets the stream of row batches to be retrieved by subsequent GetNext() calls.
     // Clears all internal state, returning this node to the state it was in after calling
@@ -120,12 +133,12 @@ public:
     // implementation calls Reset() on children.
     // Note that this function may be called many times (proportional to the input data),
     // so should be fast.
-    virtual Status reset(RuntimeState* state);
+    [[nodiscard]] virtual Status reset(RuntimeState* state);
 
     // This should be called before close() and after get_next(), it is responsible for
     // collecting statistics sent with row batch, it can't be called when prepare() returns
     // error.
-    virtual Status collect_query_statistics(QueryStatistics* statistics);
+    [[nodiscard]] virtual Status collect_query_statistics(QueryStatistics* statistics);
 
     // close() will get called for every exec node, regardless of what else is called and
     // the status of these calls (i.e. prepare() may never have been called, or
@@ -137,13 +150,13 @@ public:
     // get_next(). The default implementation updates runtime profile counters and calls
     // close() on the children. To ensure that close() is called on the entire plan tree,
     // each implementation should start out by calling the default implementation.
-    virtual Status close(RuntimeState* state);
+    virtual void close(RuntimeState* state);
 
     // Creates exec node tree from list of nodes contained in plan via depth-first
     // traversal. All nodes are placed in pool.
     // Returns error if 'plan' is corrupted, otherwise success.
-    static Status create_tree(RuntimeState* state, ObjectPool* pool, const TPlan& plan, const DescriptorTbl& descs,
-                              ExecNode** root);
+    [[nodiscard]] static Status create_tree(RuntimeState* state, ObjectPool* pool, const TPlan& plan,
+                                            const DescriptorTbl& descs, ExecNode** root);
 
     // Collect all nodes of given 'node_type' that are part of this subtree, and return in
     // 'nodes'.
@@ -155,26 +168,25 @@ public:
     // evaluate exprs over chunk to get a filter
     // if filter_ptr is not null, save filter to filter_ptr.
     // then running filter on chunk.
-    static Status eval_conjuncts(const std::vector<ExprContext*>& ctxs, vectorized::Chunk* chunk,
-                                 vectorized::FilterPtr* filter_ptr = nullptr);
-    static StatusOr<size_t> eval_conjuncts_into_filter(const std::vector<ExprContext*>& ctxs, vectorized::Chunk* chunk,
-                                                       vectorized::Filter* filter);
+    [[nodiscard]] static Status eval_conjuncts(const std::vector<ExprContext*>& ctxs, Chunk* chunk,
+                                               FilterPtr* filter_ptr = nullptr, bool apply_filter = true);
+    [[nodiscard]] static StatusOr<size_t> eval_conjuncts_into_filter(const std::vector<ExprContext*>& ctxs,
+                                                                     Chunk* chunk, Filter* filter);
 
-    static void eval_filter_null_values(vectorized::Chunk* chunk, const std::vector<SlotId>& filter_null_value_columns);
+    static void eval_filter_null_values(Chunk* chunk, const std::vector<SlotId>& filter_null_value_columns);
 
-    Status init_join_runtime_filters(const TPlanNode& tnode, RuntimeState* state);
-    void register_runtime_filter_descriptor(RuntimeState* state, vectorized::RuntimeFilterProbeDescriptor* rf_desc);
-    void eval_join_runtime_filters(vectorized::Chunk* chunk);
-    void eval_join_runtime_filters(vectorized::ChunkPtr* chunk);
-    void eval_filter_null_values(vectorized::Chunk* chunk);
+    [[nodiscard]] Status init_join_runtime_filters(const TPlanNode& tnode, RuntimeState* state);
+    void register_runtime_filter_descriptor(RuntimeState* state, RuntimeFilterProbeDescriptor* rf_desc);
+    void eval_join_runtime_filters(Chunk* chunk);
+    void eval_join_runtime_filters(ChunkPtr* chunk);
+    void eval_filter_null_values(Chunk* chunk);
 
     // Returns a string representation in DFS order of the plan rooted at this.
     std::string debug_string() const;
 
     virtual void push_down_predicate(RuntimeState* state, std::list<ExprContext*>* expr_ctxs);
-    virtual void push_down_join_runtime_filter(RuntimeState* state, vectorized::RuntimeFilterProbeCollector* collector);
-    void push_down_join_runtime_filter_to_children(RuntimeState* state,
-                                                   vectorized::RuntimeFilterProbeCollector* collector);
+    virtual void push_down_join_runtime_filter(RuntimeState* state, RuntimeFilterProbeCollector* collector);
+    void push_down_join_runtime_filter_to_children(RuntimeState* state, RuntimeFilterProbeCollector* collector);
 
     void push_down_join_runtime_filter_recursively(RuntimeState* state) {
         push_down_join_runtime_filter(state, &_runtime_filter_collector);
@@ -214,9 +226,7 @@ public:
 
     MemTracker* mem_tracker() const { return _mem_tracker.get(); }
 
-    bool use_vectorized() { return _use_vectorized; }
-
-    vectorized::RuntimeFilterProbeCollector& runtime_filter_collector() { return _runtime_filter_collector; }
+    RuntimeFilterProbeCollector& runtime_filter_collector() { return _runtime_filter_collector; }
 
     // local runtime filters that are conducted on this ExecNode.
     const std::set<TPlanNodeId>& local_rf_waiting_set() const { return _local_rf_waiting_set; }
@@ -233,6 +243,13 @@ public:
     // Names of counters shared by all exec nodes
     static const std::string ROW_THROUGHPUT_COUNTER;
 
+    static void may_add_chunk_accumulate_operator(OpFactories& ops, pipeline::PipelineBuilderContext* context, int id);
+
+    void set_children(std::vector<ExecNode*>&& children) { _children = std::move(children); }
+
+    [[nodiscard]] static Status create_vectorized_node(RuntimeState* state, ObjectPool* pool, const TPlanNode& tnode,
+                                                       const DescriptorTbl& descs, ExecNode** node);
+
 protected:
     friend class DataSink;
 
@@ -243,7 +260,7 @@ protected:
     std::vector<ExprContext*> _conjunct_ctxs;
     std::vector<TupleId> _tuple_ids;
 
-    vectorized::RuntimeFilterProbeCollector _runtime_filter_collector;
+    RuntimeFilterProbeCollector _runtime_filter_collector;
     std::vector<SlotId> _filter_null_value_columns;
     std::set<TPlanNodeId> _local_rf_waiting_set;
 
@@ -271,8 +288,6 @@ protected:
     // Account for peak memory used by this node
     RuntimeProfile::Counter* _memory_used_counter;
 
-    bool _use_vectorized;
-
     // Mappings from input slot to output slot of ancestor nodes (include itself).
     // It is used for pipeline to rewrite runtime in filters.
     std::vector<TupleSlotMapping> _tuple_slot_mappings;
@@ -281,20 +296,13 @@ protected:
 
     bool is_closed() const { return _is_closed; }
 
-    // TODO(zc)
-    /// Pointer to the containing SubplanNode or NULL if not inside a subplan.
-    /// Set by SubplanNode::Init(). Not owned.
-    // SubplanNode* containing_subplan_;
-
     /// Returns true if this node is inside the right-hand side plan tree of a SubplanNode.
     /// Valid to call in or after Prepare().
     bool is_in_subplan() const { return false; }
 
-    static Status create_vectorized_node(RuntimeState* state, ObjectPool* pool, const TPlanNode& tnode,
-                                         const DescriptorTbl& descs, ExecNode** node);
-
-    static Status create_tree_helper(RuntimeState* state, ObjectPool* pool, const std::vector<TPlanNode>& tnodes,
-                                     const DescriptorTbl& descs, ExecNode* parent, int* node_idx, ExecNode** root);
+    [[nodiscard]] static Status create_tree_helper(RuntimeState* state, ObjectPool* pool,
+                                                   const std::vector<TPlanNode>& tnodes, const DescriptorTbl& descs,
+                                                   ExecNode* parent, int* node_idx, ExecNode** root);
 
     virtual bool is_scan_node() const { return false; }
 
@@ -305,7 +313,7 @@ protected:
 
     // Executes _debug_action if phase matches _debug_phase.
     // 'phase' must not be INVALID.
-    Status exec_debug_action(TExecNodePhase::type phase);
+    [[nodiscard]] Status exec_debug_action(TExecNodePhase::type phase);
 
 private:
     RuntimeState* _runtime_state;

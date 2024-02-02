@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -11,6 +23,7 @@
 
 #include "column/array_column.h"
 #include "column/binary_column.h"
+#include "column/column_helper.h"
 #include "column/datum.h"
 #include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
@@ -23,11 +36,10 @@
 #include "runtime/mem_pool.h"
 #include "runtime/memory/memory_resource.h"
 #include "thrift/protocol/TJSONProtocol.h"
-#include "udf/udf_internal.h"
 #include "util/phmap/phmap_dump.h"
 #include "util/slice.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 struct ComparePairFirst final {
     template <typename T1, typename T2>
@@ -36,10 +48,10 @@ struct ComparePairFirst final {
     }
 };
 
-enum FunnelMode : int { DEDUPLICATION = 1, FIXED = 2, DEDUPLICATION_FIXED = 3 };
+enum FunnelMode : int { DEDUPLICATION = 1, FIXED = 2, DEDUPLICATION_FIXED = 3, INCREASE = 4 };
 
 namespace InteralTypeOfFunnel {
-template <PrimitiveType primitive_type>
+template <LogicalType logical_type>
 struct TypeTraits {};
 
 template <>
@@ -66,24 +78,49 @@ struct TypeTraits<TYPE_DATETIME> {
 
 inline const constexpr int reserve_list_size = 4;
 
-template <PrimitiveType PT>
+template <LogicalType LT>
 struct WindowFunnelState {
     // Use to identify timestamp(datetime/date)
-    using TimeType = typename InteralTypeOfFunnel::TypeTraits<PT>::Type;
-    using TimeTypeColumn = typename RunTimeTypeTraits<PT>::ColumnType;
-    using TimestampType = typename InteralTypeOfFunnel::TypeTraits<PT>::ValueType;
+    using TimeType = typename InteralTypeOfFunnel::TypeTraits<LT>::Type;
+    using TimeTypeColumn = typename RunTimeTypeTraits<LT>::ColumnType;
+    using TimestampType = typename InteralTypeOfFunnel::TypeTraits<LT>::ValueType;
 
     // first args is timestamp, second is event position.
     using TimestampEvent = std::pair<TimestampType, uint8_t>;
-    using TimestampVector = std::vector<TimestampType>;
-    int64_t window_size;
-    int32_t mode = 0;
+    struct TimestampTypePair {
+        TimestampType start_timestamp = -1;
+        TimestampType last_timestamp = -1;
+    };
+    using TimestampVector = std::vector<TimestampTypePair>;
+
+    // `window_size` is guaranteed to be non-negative by the analyzer in FE,
+    // so use -1 to indicate `window_size` hasn't been initialized.
+    static constexpr int64_t ABSENT_WINDOW_SIZE = -1;
+
+    int64_t window_size = ABSENT_WINDOW_SIZE;
+    mutable int32_t mode = 0;
     uint8_t events_size;
     bool sorted = true;
     char buffer[reserve_list_size * sizeof(TimestampEvent)];
     stack_memory_resource mr;
     mutable std::pmr::vector<TimestampEvent> events_list;
+
     WindowFunnelState() : mr(buffer, sizeof(buffer)), events_list(&mr) { events_list.reserve(reserve_list_size); }
+
+    void init_once(FunctionContext* ctx) {
+        if (window_size != ABSENT_WINDOW_SIZE) {
+            return;
+        }
+
+        // `agg_expr_ctxs` is different between update and merge mode of the AggregationOperator.
+        // - update mode: [InitLiteral(BIGINT), SlotRef(DATE/DATETIME), IntLiteral(INT), SlotRef(Array<BOOLEAN>)]
+        // - merge mode: [SlotRef(ARRAY<BIGINT>), InitLiteral(BIGINT), IntLiteral(INT)]
+        // Therefore, the index of `window_size` is 0 or 1.
+        size_t window_size_col_index = ctx->get_constant_column(0) != nullptr ? 0 : 1;
+        window_size = ColumnHelper::get_const_value<TYPE_BIGINT>(ctx->get_constant_column(window_size_col_index));
+
+        mode = ColumnHelper::get_const_value<TYPE_INT>(ctx->get_constant_column(2));
+    }
 
     void sort() const { std::stable_sort(std::begin(events_list), std::end(events_list)); }
 
@@ -108,8 +145,6 @@ struct WindowFunnelState {
         }
 
         std::vector<TimestampEvent> other_list;
-        window_size = ColumnHelper::get_const_value<TYPE_BIGINT>(ctx->get_constant_column(1));
-        mode = ColumnHelper::get_const_value<TYPE_INT>(ctx->get_constant_column(2));
 
         events_size = (uint8_t)array[0];
         bool other_sorted = (uint8_t)array[1];
@@ -172,9 +207,11 @@ struct WindowFunnelState {
             sort();
         }
 
+        bool increase = (mode & INCREASE);
+        mode &= DEDUPLICATION_FIXED;
         auto const& ordered_events_list = events_list;
         if (!mode) {
-            TimestampVector events_timestamp(events_size, -1);
+            TimestampVector events_timestamp(events_size);
             auto begin = ordered_events_list.begin();
             while (begin != ordered_events_list.end()) {
                 TimestampType timestamp = (*begin).first;
@@ -187,19 +224,26 @@ struct WindowFunnelState {
 
                 event_idx -= 1;
                 if (event_idx == 0) {
-                    events_timestamp[0] = timestamp;
-                } else if (events_timestamp[event_idx - 1] >= 0 &&
-                           timestamp <= events_timestamp[event_idx - 1] + window_size) {
-                    events_timestamp[event_idx] = events_timestamp[event_idx - 1];
-                    if (event_idx + 1 == events_size) {
-                        return events_size;
+                    events_timestamp[0].start_timestamp = timestamp;
+                    events_timestamp[0].last_timestamp = timestamp;
+                } else if (events_timestamp[event_idx - 1].start_timestamp >= 0) {
+                    bool matched = timestamp <= events_timestamp[event_idx - 1].start_timestamp + window_size;
+                    if (increase) {
+                        matched = matched && events_timestamp[event_idx - 1].last_timestamp < timestamp;
+                    }
+                    if (matched) {
+                        events_timestamp[event_idx].start_timestamp = events_timestamp[event_idx - 1].start_timestamp;
+                        events_timestamp[event_idx].last_timestamp = timestamp;
+                        if (event_idx + 1 == events_size) {
+                            return events_size;
+                        }
                     }
                 }
                 ++begin;
             }
 
             for (size_t event = events_timestamp.size(); event > 0; --event) {
-                if (events_timestamp[event - 1] >= 0) {
+                if (events_timestamp[event - 1].start_timestamp >= 0) {
                     return event;
                 }
             }
@@ -215,7 +259,7 @@ struct WindowFunnelState {
         /*
          * EventTimestamp's element is the timestamp of event.
          */
-        TimestampVector events_timestamp(events_size, -1);
+        TimestampVector events_timestamp(events_size);
         auto begin = ordered_events_list.begin();
         switch (mode) {
         // mode: deduplication
@@ -232,12 +276,12 @@ struct WindowFunnelState {
                 event_idx -= 1;
                 // begin a new event chain.
                 if (event_idx == 0) {
-                    events_timestamp[0] = timestamp;
+                    events_timestamp[0].start_timestamp = timestamp;
                     if (event_idx > curr_event_level) {
                         curr_event_level = event_idx;
                     }
                     // encounter condition of deduplication: an existing event occurs.
-                } else if (events_timestamp[event_idx] >= 0) {
+                } else if (events_timestamp[event_idx].start_timestamp >= 0) {
                     if (curr_event_level > max_level) {
                         max_level = curr_event_level;
                     }
@@ -245,8 +289,8 @@ struct WindowFunnelState {
                     // Eliminate last event chain
                     eliminate_last_event_chains(&curr_event_level, &events_timestamp);
 
-                } else if (events_timestamp[event_idx - 1] >= 0) {
-                    if (promote_to_next_level(&events_timestamp, timestamp, event_idx, &curr_event_level)) {
+                } else if (events_timestamp[event_idx - 1].start_timestamp >= 0) {
+                    if (promote_to_next_level(&events_timestamp, timestamp, event_idx, &curr_event_level, increase)) {
                         return events_size;
                     }
                 }
@@ -267,13 +311,13 @@ struct WindowFunnelState {
 
                 event_idx -= 1;
                 if (event_idx == 0) {
-                    events_timestamp[0] = timestamp;
+                    events_timestamp[0].start_timestamp = timestamp;
                     if (event_idx > curr_event_level) {
                         curr_event_level = event_idx;
                     }
                     first_event = true;
                     // encounter condition of fixed: a leap event occurred.
-                } else if (first_event && events_timestamp[event_idx - 1] < 0) {
+                } else if (first_event && events_timestamp[event_idx - 1].start_timestamp < 0) {
                     if (curr_event_level >= 0) {
                         if (curr_event_level > max_level) {
                             max_level = curr_event_level;
@@ -282,8 +326,8 @@ struct WindowFunnelState {
                         // Eliminate last event chain
                         eliminate_last_event_chains(&curr_event_level, &events_timestamp);
                     }
-                } else if (events_timestamp[event_idx - 1] >= 0) {
-                    if (promote_to_next_level(&events_timestamp, timestamp, event_idx, &curr_event_level)) {
+                } else if (events_timestamp[event_idx - 1].start_timestamp >= 0) {
+                    if (promote_to_next_level(&events_timestamp, timestamp, event_idx, &curr_event_level, increase)) {
                         return events_size;
                     }
                 }
@@ -305,12 +349,12 @@ struct WindowFunnelState {
                 event_idx -= 1;
 
                 if (event_idx == 0) {
-                    events_timestamp[0] = timestamp;
+                    events_timestamp[0].start_timestamp = timestamp;
                     if (event_idx > curr_event_level) {
                         curr_event_level = event_idx;
                     }
                     first_event = true;
-                } else if (events_timestamp[event_idx] >= 0) {
+                } else if (events_timestamp[event_idx].start_timestamp >= 0) {
                     if (curr_event_level > max_level) {
                         max_level = curr_event_level;
                     }
@@ -318,7 +362,7 @@ struct WindowFunnelState {
                     // Eliminate last event chain
                     eliminate_last_event_chains(&curr_event_level, &events_timestamp);
 
-                } else if (first_event && events_timestamp[event_idx - 1] < 0) {
+                } else if (first_event && events_timestamp[event_idx - 1].start_timestamp < 0) {
                     if (curr_event_level >= 0) {
                         if (curr_event_level > max_level) {
                             max_level = curr_event_level;
@@ -327,8 +371,8 @@ struct WindowFunnelState {
                         // Eliminate last event chain
                         eliminate_last_event_chains(&curr_event_level, &events_timestamp);
                     }
-                } else if (events_timestamp[event_idx - 1] >= 0) {
-                    if (promote_to_next_level(&events_timestamp, timestamp, event_idx, &curr_event_level)) {
+                } else if (events_timestamp[event_idx - 1].start_timestamp >= 0) {
+                    if (promote_to_next_level(&events_timestamp, timestamp, event_idx, &curr_event_level, increase)) {
                         return events_size;
                     }
                 }
@@ -349,19 +393,22 @@ struct WindowFunnelState {
 
     static void eliminate_last_event_chains(int8_t* curr_event_level, TimestampVector* events_timestamp) {
         for (; (*curr_event_level) >= 0; --(*curr_event_level)) {
-            (*events_timestamp)[(*curr_event_level)] = -1;
+            (*events_timestamp)[(*curr_event_level)].start_timestamp = -1;
         }
     }
 
     bool promote_to_next_level(TimestampVector* events_timestamp, const TimestampType& timestamp,
-                               const int8_t event_idx, int8_t* curr_event_level) const {
-        auto first_timestamp = (*events_timestamp)[event_idx - 1];
+                               const int8_t event_idx, int8_t* curr_event_level, bool increase) const {
+        auto first_timestamp = (*events_timestamp)[event_idx - 1].start_timestamp;
         bool time_matched = (timestamp <= (first_timestamp + window_size));
+        if (increase) {
+            time_matched = time_matched && (*events_timestamp)[event_idx - 1].last_timestamp < timestamp;
+        }
 
         if (time_matched) {
             // use prev level event's event_chain_level to record with this event.
-            (*events_timestamp)[event_idx] = first_timestamp;
-
+            (*events_timestamp)[event_idx].start_timestamp = first_timestamp;
+            (*events_timestamp)[event_idx].last_timestamp = timestamp;
             // update curr_event_level to bigger one.
             if (event_idx > (*curr_event_level)) {
                 (*curr_event_level) = event_idx;
@@ -379,28 +426,28 @@ struct WindowFunnelState {
     static inline int8_t MODE_FLAGS[] = {1 << 0, 1 << 1};
 };
 
-template <PrimitiveType PT>
+template <LogicalType LT>
 class WindowFunnelAggregateFunction final
-        : public AggregateFunctionBatchHelper<WindowFunnelState<PT>, WindowFunnelAggregateFunction<PT>> {
-    using TimeTypeColumn = typename WindowFunnelState<PT>::TimeTypeColumn;
-    using TimeType = typename WindowFunnelState<PT>::TimeType;
-    using TimestampType = typename WindowFunnelState<PT>::TimestampType;
+        : public AggregateFunctionBatchHelper<WindowFunnelState<LT>, WindowFunnelAggregateFunction<LT>> {
+    using TimeTypeColumn = typename WindowFunnelState<LT>::TimeTypeColumn;
+    using TimeType = typename WindowFunnelState<LT>::TimeType;
+    using TimestampType = typename WindowFunnelState<LT>::TimestampType;
 
 public:
-    void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state, size_t row_num) const {
+    void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
+                size_t row_num) const override {
         DCHECK(columns[2]->is_constant());
 
-        this->data(state).window_size = down_cast<const Int64Column*>(columns[0])->get_data()[0];
-        this->data(state).mode = ColumnHelper::get_const_value<TYPE_INT>(columns[2]);
+        this->data(state).init_once(ctx);
 
         // get timestamp
         TimeType tv;
         if (!columns[1]->is_constant()) {
             const auto timestamp_column = down_cast<const TimeTypeColumn*>(columns[1]);
-            DCHECK(PT == TYPE_DATETIME || PT == TYPE_DATE || PT == TYPE_INT || PT == TYPE_BIGINT);
+            DCHECK(LT == TYPE_DATETIME || LT == TYPE_DATE || LT == TYPE_INT || LT == TYPE_BIGINT);
             tv = timestamp_column->get_data()[row_num];
         } else {
-            tv = ColumnHelper::get_const_value<PT>(columns[1]);
+            tv = ColumnHelper::get_const_value<LT>(columns[1]);
         }
 
         // get event
@@ -421,9 +468,9 @@ public:
                 auto ele_offset = offset + i;
                 if (!null_vector[ele_offset] && data_column->get_data()[ele_offset]) {
                     event_level = i + 1;
-                    if constexpr (PT == TYPE_DATETIME) {
+                    if constexpr (LT == TYPE_DATETIME) {
                         this->data(state).update(tv.to_unix_second(), event_level);
-                    } else if constexpr (PT == TYPE_DATE) {
+                    } else if constexpr (LT == TYPE_DATE) {
                         this->data(state).update(tv.julian(), event_level);
                     } else {
                         this->data(state).update(tv, event_level);
@@ -436,9 +483,9 @@ public:
                 auto ele_offset = offset + i;
                 if (data_column.get_data()[ele_offset]) {
                     event_level = i + 1;
-                    if constexpr (PT == TYPE_DATETIME) {
+                    if constexpr (LT == TYPE_DATETIME) {
                         this->data(state).update(tv.to_unix_second(), event_level);
-                    } else if constexpr (PT == TYPE_DATE) {
+                    } else if constexpr (LT == TYPE_DATE) {
                         this->data(state).update(tv.julian(), event_level);
                     } else {
                         this->data(state).update(tv, event_level);
@@ -452,6 +499,9 @@ public:
     void merge(FunctionContext* ctx, const Column* column, AggDataPtr __restrict state, size_t row_num) const override {
         DCHECK(column->is_array());
         DCHECK(!column->is_nullable());
+
+        this->data(state).init_once(ctx);
+
         const auto* input_column = down_cast<const ArrayColumn*>(column);
         const auto& offsets = input_column->offsets().get_data();
         const auto& elements = input_column->elements();
@@ -487,9 +537,9 @@ public:
         const auto* bool_array_column = down_cast<const ArrayColumn*>(src[3].get());
         for (int i = 0; i < chunk_size; i++) {
             TimestampType tv;
-            if constexpr (PT == TYPE_DATETIME) {
+            if constexpr (LT == TYPE_DATETIME) {
                 tv = timestamp_column->get_data()[i].to_unix_second();
-            } else if constexpr (PT == TYPE_DATE) {
+            } else if constexpr (LT == TYPE_DATE) {
                 tv = timestamp_column->get_data()[i].julian();
             } else {
                 tv = timestamp_column->get_data()[i];
@@ -512,11 +562,11 @@ public:
             buffer[1] = (int64_t)sorted;
             buffer[2] = (int64_t)tv;
             buffer[3] = (int64_t)event_level;
-            WindowFunnelState<PT>::serialize(buffer, 4, dst_column);
+            WindowFunnelState<LT>::serialize(buffer, 4, dst_column);
         }
     }
 
     std::string get_name() const override { return "window_funnel"; }
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

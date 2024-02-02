@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/qe/SetExecutor.java
 
@@ -25,24 +38,23 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.analysis.NullLiteral;
-import com.starrocks.analysis.SetNamesVar;
-import com.starrocks.analysis.SetPassVar;
-import com.starrocks.analysis.SetStmt;
-import com.starrocks.analysis.SetTransaction;
-import com.starrocks.analysis.SetType;
-import com.starrocks.analysis.SetVar;
 import com.starrocks.analysis.Subquery;
+import com.starrocks.authentication.UserAuthenticationInfo;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.Pair;
 import com.starrocks.common.Status;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.StatementPlanner;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.ast.SetListItem;
+import com.starrocks.sql.ast.SetPassVar;
+import com.starrocks.sql.ast.SetStmt;
+import com.starrocks.sql.ast.SystemVariable;
 import com.starrocks.sql.ast.UserVariable;
 import com.starrocks.sql.plan.ExecPlan;
-import com.starrocks.statistic.StatisticUtils;
 import com.starrocks.thrift.TResultBatch;
 import com.starrocks.thrift.TResultSinkType;
 import com.starrocks.thrift.TVariableData;
@@ -64,35 +76,29 @@ public class SetExecutor {
         this.stmt = stmt;
     }
 
-    private void setVariablesOfAllType(SetVar var) throws DdlException {
-        if (var instanceof SetPassVar) {
+    private void setVariablesOfAllType(SetListItem var) throws DdlException {
+        if (var instanceof SystemVariable) {
+            ctx.modifySystemVariable((SystemVariable) var, false);
+        } else if (var instanceof UserVariable) {
+            UserVariable userVariable = (UserVariable) var;
+            if (userVariable.getEvaluatedExpression() == null) {
+                deriveUserVariableExpressionResult(userVariable);
+            }
+
+            ctx.modifyUserVariable(userVariable);
+        } else if (var instanceof SetPassVar) {
             // Set password
             SetPassVar setPassVar = (SetPassVar) var;
-            ctx.getGlobalStateMgr().getAuth().setPassword(setPassVar);
-        } else if (var instanceof SetNamesVar) {
-            // do nothing
-            return;
-        } else if (var instanceof SetTransaction) {
-            // do nothing
-            return;
-        } else {
-            if (var.getType().equals(SetType.USER)) {
-                UserVariable userVariable = (UserVariable) var;
-                if (userVariable.getResolvedExpression() == null) {
-                    deriveExpressionResult(userVariable);
-                }
-
-                ctx.modifyUserVariable(userVariable);
-            } else {
-                ctx.modifySessionVariable(var, false);
+            UserAuthenticationInfo userAuthenticationInfo = GlobalStateMgr.getCurrentState()
+                    .getAuthenticationMgr()
+                    .getUserAuthenticationInfoByUserIdentity(setPassVar.getUserIdent());
+            if (null == userAuthenticationInfo) {
+                throw new DdlException("authentication info for user " + setPassVar.getUserIdent() + " not found");
             }
+            userAuthenticationInfo.setPassword(setPassVar.getPassword());
+            GlobalStateMgr.getCurrentState().getAuthenticationMgr()
+                    .alterUser(setPassVar.getUserIdent(), userAuthenticationInfo);
         }
-    }
-
-    private boolean isSessionVar(SetVar var) {
-        return !(var instanceof SetPassVar
-                || var instanceof SetNamesVar
-                || var instanceof SetTransaction);
     }
 
     /**
@@ -101,31 +107,17 @@ public class SetExecutor {
      * @throws DdlException
      */
     public void execute() throws DdlException {
-        for (SetVar var : stmt.getSetVars()) {
+        for (SetListItem var : stmt.getSetListItems()) {
             setVariablesOfAllType(var);
         }
     }
 
-    /**
-     * This method is only called after a set statement is forward to the leader.
-     * In this case, the follower should change this session variable as well.
-     */
-    public void setSessionVars() throws DdlException {
-        for (SetVar var : stmt.getSetVars()) {
-            if (isSessionVar(var)) {
-                VariableMgr.setVar(ctx.getSessionVariable(), var, true);
-            }
-        }
-    }
-
-    private void deriveExpressionResult(UserVariable userVariable) {
-        ConnectContext context = StatisticUtils.buildConnectContext();
-
-        QueryStatement queryStatement = ((Subquery) userVariable.getExpression()).getQueryStatement();
+    private void deriveUserVariableExpressionResult(UserVariable userVariable) {
+        QueryStatement queryStatement = ((Subquery) userVariable.getUnevaluatedExpression()).getQueryStatement();
         ExecPlan execPlan = StatementPlanner.plan(queryStatement,
-                ConnectContext.get(), true, TResultSinkType.VARIABLE);
-        StmtExecutor executor = new StmtExecutor(context, queryStatement);
-        Pair<List<TResultBatch>, Status> sqlResult = executor.executeStmtWithExecPlan(context, execPlan);
+                ConnectContext.get(), TResultSinkType.VARIABLE);
+        StmtExecutor executor = new StmtExecutor(ctx, queryStatement);
+        Pair<List<TResultBatch>, Status> sqlResult = executor.executeStmtWithExecPlan(ctx, execPlan);
         if (!sqlResult.second.ok()) {
             throw new SemanticException(sqlResult.second.getErrorMsg());
         } else {
@@ -139,7 +131,7 @@ public class SetExecutor {
                     if (result.get(0).isIsNull()) {
                         resultExpr = new NullLiteral();
                     } else {
-                        Type userVariableType = userVariable.getExpression().getType();
+                        Type userVariableType = userVariable.getUnevaluatedExpression().getType();
                         //JSON type will be stored as string type
                         if (userVariableType.isJsonType()) {
                             userVariableType = Type.VARCHAR;
@@ -148,14 +140,14 @@ public class SetExecutor {
                                 StandardCharsets.UTF_8.decode(result.get(0).result).toString(), userVariableType);
                     }
                 }
-                userVariable.setResolvedExpression(resultExpr);
+                userVariable.setEvaluatedExpression(resultExpr);
             } catch (TException | AnalysisException e) {
                 throw new SemanticException(e.getMessage());
             }
         }
 
-        if (context.getState().getStateType() == QueryState.MysqlStateType.ERR) {
-            throw new SemanticException(context.getState().getErrorMessage());
+        if (ctx.getState().getStateType() == QueryState.MysqlStateType.ERR) {
+            throw new SemanticException(ctx.getState().getErrorMessage());
         }
     }
 

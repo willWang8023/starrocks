@@ -21,14 +21,6 @@ if [[ -z ${STARROCKS_HOME} ]]; then
     exit 1
 fi
 
-# check OS type
-if [[ ! -z "$OSTYPE" ]]; then
-    if [[ "$OSTYPE" != "linux-gnu" ]]; then
-        echo "Error: Unsupported OS type: $OSTYPE"
-        exit 1
-    fi
-fi
-
 # include custom environment variables
 if [[ -f ${STARROCKS_HOME}/custom_env.sh ]]; then
     . ${STARROCKS_HOME}/custom_env.sh
@@ -37,6 +29,11 @@ fi
 # set STARROCKS_THIRDPARTY
 if [[ -z ${STARROCKS_THIRDPARTY} ]]; then
     export STARROCKS_THIRDPARTY=${STARROCKS_HOME}/thirdparty
+fi
+
+# set cachelib dir
+if [[ -z ${CACHELIB_DIR} ]]; then
+    export CACHELIB_DIR=${STARROCKS_THIRDPARTY}/installed/cachelib
 fi
 
 # check python
@@ -71,17 +68,30 @@ fi
 export CLANG_COMPATIBLE_FLAGS=`echo | ${STARROCKS_GCC_HOME}/bin/gcc -Wp,-v -xc++ - -fsyntax-only 2>&1 \
                 | grep -E '^\s+/' | awk '{print "-I" $1}' | tr '\n' ' '`
 
-# check java home
+if [[ -z ${JAVA_HOME} ]]; then
+    export JAVA_HOME="$(dirname $(dirname $(readlink -f $(which javac))))"
+    echo "Infered JAVA_HOME=$JAVA_HOME"
+fi
+
 if [[ -z ${JAVA_HOME} ]]; then
     echo "Error: JAVA_HOME is not set"
     exit 1
 fi
 
+if ! command -v $JAVA_HOME/bin/java &> /dev/null; then
+    echo "Error: JAVA not found, JAVA_HOME may be set wrong"
+    exit 1
+fi
+
 # check java version
 export JAVA=${JAVA_HOME}/bin/java
-JAVA_VER=$(${JAVA} -version 2>&1 | sed 's/.* version "\(.*\)\.\(.*\)\..*"/\1\2/; 1q' | cut -f1 -d " ")
-if [[ $JAVA_VER -lt 18 ]]; then
-    echo "Error: require JAVA with JDK version at least 1.8"
+# Some examples of different variant of jdk output for `java -version`
+# - Oracle JDK: java version "1.8.0_202"
+# - OpenJDK: openjdk version "1.8.0_362"
+# - OpenJDK: openjdk version "11.0.20.1" 2023-08-24
+JAVA_VER=$(${JAVA} -version 2>&1 | awk -F'"' '{print $2}' | awk -F. '{if ($1 == 1) {print $2;} else {print $1;}}')
+if [[ $JAVA_VER -lt 11 ]]; then
+    echo "Error: require JAVA with JDK version at least 11, but got $JAVA_VER"
     exit 1
 fi
 
@@ -99,10 +109,6 @@ export MVN_CMD
 CMAKE_CMD=cmake
 if [[ ! -z ${CUSTOM_CMAKE} ]]; then
     CMAKE_CMD=${CUSTOM_CMAKE}
-fi
-if ! ${CMAKE_CMD} --version; then
-    echo "Error: cmake is not found"
-    exit 1
 fi
 export CMAKE_CMD
 

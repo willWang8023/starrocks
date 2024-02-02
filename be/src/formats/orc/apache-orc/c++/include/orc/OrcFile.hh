@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/orc/tree/main/c++/include/orc/OrcFile.hh
 
@@ -42,11 +55,9 @@ public:
     struct IORange {
         uint64_t offset;
         uint64_t size;
+        bool is_active;
     };
-    enum class PrepareCacheScope {
-        READ_FULL_FILE,
-        READ_FULL_STRIPE,
-    };
+    enum class PrepareCacheScope { READ_FULL_FILE, READ_FULL_STRIPE, READ_FULL_ROW_INDEX };
 
     virtual ~InputStream();
 
@@ -83,9 +94,10 @@ public:
 
     virtual void prepareCache(PrepareCacheScope scope, uint64_t offset, uint64_t length);
 
-    virtual bool isIORangesEnabled() const;
+    virtual bool isIOCoalesceEnabled() const;
+    virtual bool isIOAdaptiveCoalesceEnabled() const;
     virtual void clearIORanges();
-    virtual void setIORanges(std::vector<InputStream::IORange>& io_ranges);
+    virtual void setIORanges(std::vector<InputStream::IORange>& io_ranges, const bool is_from_stripe);
 };
 
 /**

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/PartitionInfo.java
 
@@ -23,30 +36,31 @@ package com.starrocks.catalog;
 
 import com.google.common.base.Preconditions;
 import com.google.gson.annotations.SerializedName;
-import com.starrocks.common.FeMetaVersion;
-import com.starrocks.common.NotImplementedException;
+import com.starrocks.common.DdlException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
-import com.starrocks.lake.StorageCacheInfo;
+import com.starrocks.lake.DataCacheInfo;
 import com.starrocks.persist.gson.GsonPostProcessable;
 import com.starrocks.persist.gson.GsonPreProcessable;
-import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TStorageMedium;
 import com.starrocks.thrift.TTabletType;
+import com.starrocks.thrift.TWriteQuorumType;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import javax.validation.constraints.NotNull;
 
 /*
  * Repository of a partition's related infos
  */
-public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProcessable {
+public class PartitionInfo implements Cloneable, Writable, GsonPreProcessable, GsonPostProcessable {
     private static final Logger LOG = LogManager.getLogger(PartitionInfo.class);
 
     @SerializedName(value = "type")
@@ -70,9 +84,9 @@ public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProc
     protected Map<Long, TTabletType> idToTabletType;
 
     // for lake table
-    // storage cache, ttl and allow_async_write_back
+    // storage cache, ttl and enable_async_write_back
     @SerializedName(value = "idToStorageCacheInfo")
-    protected Map<Long, StorageCacheInfo> idToStorageCacheInfo;
+    protected Map<Long, DataCacheInfo> idToStorageCacheInfo;
 
 
     public PartitionInfo() {
@@ -96,6 +110,18 @@ public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProc
         return type;
     }
 
+    public boolean isRangePartition() {
+        return type == PartitionType.RANGE || type == PartitionType.EXPR_RANGE || type == PartitionType.EXPR_RANGE_V2;
+    }
+
+    public boolean isListPartition() {
+        return type == PartitionType.LIST;
+    }
+
+    public boolean isPartitioned() {
+        return type != PartitionType.UNPARTITIONED;
+    }
+
     public DataProperty getDataProperty(long partitionId) {
         return idToDataProperty.get(partitionId);
     }
@@ -104,8 +130,14 @@ public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProc
         idToDataProperty.put(partitionId, newDataProperty);
     }
 
-    public int getQuorumNum(long partitionId) {
-        return getReplicationNum(partitionId) / 2 + 1;
+    public int getQuorumNum(long partitionId, TWriteQuorumType writeQuorum) {
+        if (writeQuorum == TWriteQuorumType.ALL) {
+            return getReplicationNum(partitionId);
+        } else if (writeQuorum == TWriteQuorumType.ONE) {
+            return 1;
+        } else {
+            return getReplicationNum(partitionId) / 2 + 1;
+        }
     }
 
     public short getReplicationNum(long partitionId) {
@@ -114,6 +146,10 @@ public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProc
             return (short) -1;
         }
         return idToReplicationNum.get(partitionId);
+    }
+
+    public short getMinReplicationNum() {
+        return idToReplicationNum.values().stream().min(Short::compareTo).orElse((short) 1);
     }
 
     public void setReplicationNum(long partitionId, short replicationNum) {
@@ -142,18 +178,21 @@ public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProc
         idToTabletType.put(partitionId, tabletType);
     }
 
-    public StorageCacheInfo getStorageCacheInfo(long partitionId) {
+    public DataCacheInfo getDataCacheInfo(long partitionId) {
         return idToStorageCacheInfo.get(partitionId);
     }
 
-    public void setStorageCacheInfo(long partitionId, StorageCacheInfo storageCacheInfo) {
-        idToStorageCacheInfo.put(partitionId, storageCacheInfo);
+    public void setDataCacheInfo(long partitionId, DataCacheInfo dataCacheInfo) {
+        idToStorageCacheInfo.put(partitionId, dataCacheInfo);
     }
 
     public void dropPartition(long partitionId) {
         idToDataProperty.remove(partitionId);
         idToReplicationNum.remove(partitionId);
         idToInMemory.remove(partitionId);
+    }
+
+    public void moveRangeFromTempToFormal(long tempPartitionId) {
     }
 
     public void addPartition(long partitionId, DataProperty dataProperty,
@@ -167,10 +206,10 @@ public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProc
     public void addPartition(long partitionId, DataProperty dataProperty,
                              short replicationNum,
                              boolean isInMemory,
-                             StorageCacheInfo storageCacheInfo) {
+                             DataCacheInfo dataCacheInfo) {
         this.addPartition(partitionId, dataProperty, replicationNum, isInMemory);
-        if (storageCacheInfo != null) {
-            idToStorageCacheInfo.put(partitionId, storageCacheInfo);
+        if (dataCacheInfo != null) {
+            idToStorageCacheInfo.put(partitionId, dataCacheInfo);
         }
     }
 
@@ -188,8 +227,9 @@ public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProc
         return "";
     }
 
-    public List<Column> getPartitionColumns() throws NotImplementedException {
-        throw new NotImplementedException("method not implemented yet");
+    @NotNull
+    public List<Column> getPartitionColumns() {
+        return Collections.emptyList();
     }
 
     @Override
@@ -228,12 +268,7 @@ public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProc
 
             short replicationNum = in.readShort();
             idToReplicationNum.put(partitionId, replicationNum);
-            if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_72) {
-                idToInMemory.put(partitionId, in.readBoolean());
-            } else {
-                // for compatibility, default is false
-                idToInMemory.put(partitionId, false);
-            }
+            idToInMemory.put(partitionId, in.readBoolean());
         }
     }
 
@@ -251,17 +286,41 @@ public class PartitionInfo implements Writable, GsonPreProcessable, GsonPostProc
         buff.append("type: ").append(type.typeString).append("; ");
 
         for (Map.Entry<Long, DataProperty> entry : idToDataProperty.entrySet()) {
-            buff.append(entry.getKey()).append("is HDD: ");
+            buff.append(entry.getKey()).append(" is HDD: ");
             if (entry.getValue().equals(new DataProperty(TStorageMedium.HDD))) {
                 buff.append(true);
             } else {
                 buff.append(false);
             }
-            buff.append("data_property: ").append(entry.getValue().toString());
-            buff.append("replica number: ").append(idToReplicationNum.get(entry.getKey()));
-            buff.append("in memory: ").append(idToInMemory.get(entry.getKey()));
+            buff.append(" data_property: ").append(entry.getValue().toString());
+            buff.append(" replica number: ").append(idToReplicationNum.get(entry.getKey()));
+            buff.append(" in memory: ").append(idToInMemory.get(entry.getKey()));
         }
 
         return buff.toString();
+    }
+
+    public void createAutomaticShadowPartition(long partitionId, String replicateNum) throws DdlException {
+    }
+
+    public boolean isAutomaticPartition() {
+        return false;
+    }
+
+    protected Object clone()  {
+        try {
+            // shallow clone on base partition info
+            PartitionInfo p = (PartitionInfo) super.clone();
+            p.type = this.type;
+            p.idToDataProperty = this.idToDataProperty;
+            p.idToReplicationNum = this.idToReplicationNum;
+            p.isMultiColumnPartition = this.isMultiColumnPartition;
+            p.idToInMemory = this.idToInMemory;
+            p.idToTabletType = this.idToTabletType;
+            p.idToStorageCacheInfo = this.idToStorageCacheInfo;
+            return p;
+        } catch (CloneNotSupportedException e) {
+            throw new RuntimeException(e);
+        }
     }
 }

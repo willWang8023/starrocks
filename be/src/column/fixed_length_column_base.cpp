@@ -1,10 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <gutil/strings/fastmem.h>
 
 #include "column/column_helper.h"
 #include "column/fixed_length_column.h"
-#include "exec/vectorized/sorting/sort_helper.h"
+#include "column/vectorized_fwd.h"
+#include "exec/sorting/sort_helper.h"
 #include "gutil/casts.h"
 #include "runtime/large_int_value.h"
 #include "storage/decimal12.h"
@@ -12,7 +25,7 @@
 #include "util/mysql_row_buffer.h"
 #include "util/value_generator.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 template <typename T>
 StatusOr<ColumnPtr> FixedLengthColumnBase<T>::upgrade_if_overflow() {
@@ -50,6 +63,21 @@ void FixedLengthColumnBase<T>::append_value_multiple_times(const Column& src, ui
     }
 }
 
+//TODO(fzh): optimize copy using SIMD
+template <typename T>
+ColumnPtr FixedLengthColumnBase<T>::replicate(const std::vector<uint32_t>& offsets) {
+    auto dest = this->clone_empty();
+    auto& dest_data = down_cast<FixedLengthColumnBase<T>&>(*dest);
+    dest_data._data.resize(offsets.back());
+    size_t orig_size = offsets.size() - 1; // this->size() may be large than offsets->size() -1
+    for (auto i = 0; i < orig_size; ++i) {
+        for (auto j = offsets[i]; j < offsets[i + 1]; ++j) {
+            dest_data._data[j] = _data[i];
+        }
+    }
+    return dest;
+}
+
 template <typename T>
 void FixedLengthColumnBase<T>::fill_default(const Filter& filter) {
     T val = DefaultValueGenerator<T>::next_value();
@@ -61,18 +89,32 @@ void FixedLengthColumnBase<T>::fill_default(const Filter& filter) {
 }
 
 template <typename T>
-Status FixedLengthColumnBase<T>::update_rows(const Column& src, const uint32_t* indexes) {
+Status FixedLengthColumnBase<T>::fill_range(const Buffer<T>& ids, const std::vector<uint8_t>& filter) {
+    DCHECK_EQ(filter.size(), _data.size());
+    size_t j = 0;
+    for (size_t i = 0; i < _data.size(); ++i) {
+        if (filter[i] == 1) {
+            _data[i] = ids[j];
+            ++j;
+        }
+    }
+    DCHECK_EQ(j, ids.size());
+
+    return Status::OK();
+}
+
+template <typename T>
+void FixedLengthColumnBase<T>::update_rows(const Column& src, const uint32_t* indexes) {
     const T* src_data = reinterpret_cast<const T*>(src.raw_data());
     size_t replace_num = src.size();
     for (uint32_t i = 0; i < replace_num; ++i) {
         DCHECK_LT(indexes[i], _data.size());
         _data[indexes[i]] = src_data[i];
     }
-    return Status::OK();
 }
 
 template <typename T>
-size_t FixedLengthColumnBase<T>::filter_range(const Column::Filter& filter, size_t from, size_t to) {
+size_t FixedLengthColumnBase<T>::filter_range(const Filter& filter, size_t from, size_t to) {
     auto size = ColumnHelper::filter_range<T>(filter, _data.data(), from, to);
     this->resize(size);
     return size;
@@ -141,7 +183,7 @@ void FixedLengthColumnBase<T>::serialize_batch_with_null_masks(uint8_t* __restri
         }
 
         for (size_t i = 0; i < chunk_size; ++i) {
-            sizes[i] += sizeof(bool) + (1 - null_masks[i]) * sizeof(T);
+            sizes[i] += static_cast<uint32_t>(sizeof(bool) + (1 - null_masks[i]) * sizeof(T));
         }
     }
 }
@@ -189,7 +231,7 @@ void FixedLengthColumnBase<T>::crc32_hash(uint32_t* hash, uint32_t from, uint32_
     for (uint32_t i = from; i < to; ++i) {
         if constexpr (IsDate<T> || IsTimestamp<T>) {
             std::string str = _data[i].to_string();
-            hash[i] = HashUtil::zlib_crc_hash(str.data(), str.size(), hash[i]);
+            hash[i] = HashUtil::zlib_crc_hash(str.data(), static_cast<int32_t>(str.size()), hash[i]);
         } else if constexpr (IsDecimal<T>) {
             int64_t int_val = _data[i].int_value();
             int32_t frac_val = _data[i].frac_value();
@@ -221,8 +263,8 @@ int64_t FixedLengthColumnBase<T>::xor_checksum(uint32_t from, uint32_t to) const
         const T* src = reinterpret_cast<const T*>(_data.data());
         for (size_t i = from; i < to; ++i) {
             if constexpr (std::is_same_v<T, int128_t>) {
-                xor_checksum ^= (src[i] >> 64);
-                xor_checksum ^= (src[i] & ULLONG_MAX);
+                xor_checksum ^= static_cast<int64_t>(src[i] >> 64);
+                xor_checksum ^= static_cast<int64_t>(src[i] & ULLONG_MAX);
             } else {
                 xor_checksum ^= src[i];
             }
@@ -253,7 +295,7 @@ void FixedLengthColumnBase<T>::remove_first_n_values(size_t count) {
 }
 
 template <typename T>
-std::string FixedLengthColumnBase<T>::debug_item(uint32_t idx) const {
+std::string FixedLengthColumnBase<T>::debug_item(size_t idx) const {
     std::stringstream ss;
     if constexpr (sizeof(T) == 1) {
         // for bool, int8_t
@@ -265,7 +307,7 @@ std::string FixedLengthColumnBase<T>::debug_item(uint32_t idx) const {
 }
 
 template <>
-std::string FixedLengthColumnBase<int128_t>::debug_item(uint32_t idx) const {
+std::string FixedLengthColumnBase<int128_t>::debug_item(size_t idx) const {
     std::stringstream ss;
     starrocks::operator<<(ss, _data[idx]);
     return ss.str();
@@ -276,7 +318,7 @@ std::string FixedLengthColumnBase<T>::debug_string() const {
     std::stringstream ss;
     ss << "[";
     size_t size = this->size();
-    for (int i = 0; i < size - 1; ++i) {
+    for (size_t i = 0; i + 1 < size; ++i) {
         ss << debug_item(i) << ", ";
     }
     if (size > 0) {
@@ -325,4 +367,4 @@ template class FixedLengthColumnBase<DateValue>;
 template class FixedLengthColumnBase<DecimalV2Value>;
 template class FixedLengthColumnBase<TimestampValue>;
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

@@ -1,13 +1,26 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.ast;
 
-import com.starrocks.analysis.DdlStmt;
 import com.starrocks.analysis.Predicate;
 import com.starrocks.catalog.ResourceGroup;
 import com.starrocks.catalog.ResourceGroupClassifier;
 import com.starrocks.sql.analyzer.ResourceGroupAnalyzer;
 import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TWorkGroupType;
 
 import java.util.ArrayList;
@@ -31,6 +44,13 @@ public class CreateResourceGroupStmt extends DdlStmt {
 
     public CreateResourceGroupStmt(String name, boolean ifNotExists, boolean replaceIfExists,
                                    List<List<Predicate>> classifiers, Map<String, String> proeprties) {
+        this(name, ifNotExists, replaceIfExists, classifiers, proeprties, NodePosition.ZERO);
+    }
+
+    public CreateResourceGroupStmt(String name, boolean ifNotExists, boolean replaceIfExists,
+                                   List<List<Predicate>> classifiers, Map<String, String> proeprties,
+                                   NodePosition pos) {
+        super(pos);
         this.name = name;
         this.ifNotExists = ifNotExists;
         this.replaceIfExists = replaceIfExists;
@@ -83,10 +103,5 @@ public class CreateResourceGroupStmt extends DdlStmt {
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitCreateResourceGroupStatement(this, context);
-    }
-
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
     }
 }

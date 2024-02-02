@@ -1,13 +1,24 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.load;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-import com.starrocks.analysis.AccessTestUtil;
-import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.BinaryPredicate;
-import com.starrocks.analysis.DeleteStmt;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.IntLiteral;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableName;
@@ -20,15 +31,15 @@ import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.FeConstants;
-import com.starrocks.common.MarkedCountDownLatch;
 import com.starrocks.common.UserException;
 import com.starrocks.common.jmockit.Deencapsulation;
+import com.starrocks.common.util.concurrent.MarkedCountDownLatch;
 import com.starrocks.load.DeleteJob.DeleteState;
-import com.starrocks.mysql.privilege.Auth;
 import com.starrocks.persist.EditLog;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.QueryStateException;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.sql.ast.PartitionNames;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.task.AgentBatchTask;
@@ -37,6 +48,7 @@ import com.starrocks.task.AgentTaskExecutor;
 import com.starrocks.task.AgentTaskQueue;
 import com.starrocks.transaction.GlobalTransactionMgr;
 import com.starrocks.transaction.TabletCommitInfo;
+import com.starrocks.transaction.TabletFailInfo;
 import com.starrocks.transaction.TransactionState;
 import com.starrocks.transaction.TransactionStatus;
 import com.starrocks.transaction.TxnCommitAttachment;
@@ -57,7 +69,7 @@ import java.util.concurrent.TimeUnit;
 
 public class DeleteHandlerTest {
 
-    private DeleteHandler deleteHandler;
+    private DeleteMgr deleteHandler;
 
     private static final long BACKEND_ID_1 = 10000L;
     private static final long BACKEND_ID_2 = 10001L;
@@ -80,9 +92,6 @@ public class DeleteHandlerTest {
     private AgentTaskExecutor executor;
 
     private Database db;
-    private Auth auth;
-
-    Analyzer analyzer;
 
     private GlobalTransactionMgr globalTransactionMgr;
     private TabletInvertedIndex invertedIndex = new TabletInvertedIndex();
@@ -93,10 +102,8 @@ public class DeleteHandlerTest {
         FeConstants.runningUnitTest = true;
 
         globalTransactionMgr = new GlobalTransactionMgr(globalStateMgr);
-        globalTransactionMgr.setEditLog(editLog);
-        deleteHandler = new DeleteHandler();
-        auth = AccessTestUtil.fetchAdminAccess();
-        analyzer = AccessTestUtil.fetchAdminAnalyzer();
+        connectContext.setGlobalStateMgr(globalStateMgr);
+        deleteHandler = new DeleteMgr();
         try {
             db = CatalogMocker.mockDb();
         } catch (AnalysisException e) {
@@ -133,10 +140,6 @@ public class DeleteHandlerTest {
                 minTimes = 0;
                 result = editLog;
 
-                globalStateMgr.getAuth();
-                minTimes = 0;
-                result = auth;
-
                 globalStateMgr.getNextId();
                 minTimes = 0;
                 result = 10L;
@@ -159,11 +162,11 @@ public class DeleteHandlerTest {
                 minTimes = 0;
                 result = globalStateMgr;
 
-                GlobalStateMgr.getCurrentInvertedIndex();
+                GlobalStateMgr.getCurrentState().getTabletInvertedIndex();
                 minTimes = 0;
                 result = invertedIndex;
 
-                GlobalStateMgr.getCurrentGlobalTransactionMgr();
+                GlobalStateMgr.getCurrentState().getGlobalTransactionMgr();
                 minTimes = 0;
                 result = globalTransactionMgr;
 
@@ -173,21 +176,13 @@ public class DeleteHandlerTest {
                 AgentTaskQueue.addTask((AgentTask) any);
                 minTimes = 0;
                 result = true;
-
-                GlobalStateMgr.getCurrentSystemInfo();
-                minTimes = 0;
-                result = systemInfoService;
-
-                systemInfoService.getBackendIds(true);
-                minTimes = 0;
-                result = Lists.newArrayList();
             }
         };
     }
 
     @Test(expected = DdlException.class)
     public void testUnQuorumTimeout() throws DdlException, QueryStateException {
-        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryPredicate.Operator.GT, new SlotRef(null, "k1"),
+        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryType.GT, new SlotRef(null, "k1"),
                 new IntLiteral(3));
 
         DeleteStmt deleteStmt = new DeleteStmt(new TableName("test_db", "test_tbl"),
@@ -203,8 +198,8 @@ public class DeleteHandlerTest {
             }
         };
         try {
-            deleteStmt.analyze(analyzer);
-        } catch (UserException e) {
+            com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
+        } catch (Exception e) {
             Assert.fail();
         }
         deleteHandler.process(deleteStmt);
@@ -213,7 +208,7 @@ public class DeleteHandlerTest {
 
     @Test
     public void testQuorumTimeout() throws DdlException, QueryStateException {
-        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryPredicate.Operator.GT, new SlotRef(null, "k1"),
+        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryType.GT, new SlotRef(null, "k1"),
                 new IntLiteral(3));
 
         DeleteStmt deleteStmt = new DeleteStmt(new TableName("test_db", "test_tbl"),
@@ -241,16 +236,9 @@ public class DeleteHandlerTest {
             }
         };
 
-        new Expectations() {
-            {
-                GlobalStateMgr.getCurrentAnalyzeMgr().updateLoadRows((TransactionState) any);
-                minTimes = 0;
-            }
-        };
-
         try {
-            deleteStmt.analyze(analyzer);
-        } catch (UserException e) {
+            com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
+        } catch (Exception e) {
             Assert.fail();
         }
         try {
@@ -268,7 +256,7 @@ public class DeleteHandlerTest {
 
     @Test
     public void testNormalTimeout() throws DdlException, QueryStateException {
-        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryPredicate.Operator.GT, new SlotRef(null, "k1"),
+        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryType.GT, new SlotRef(null, "k1"),
                 new IntLiteral(3));
 
         DeleteStmt deleteStmt = new DeleteStmt(new TableName("test_db", "test_tbl"),
@@ -297,16 +285,9 @@ public class DeleteHandlerTest {
             }
         };
 
-        new Expectations() {
-            {
-                GlobalStateMgr.getCurrentAnalyzeMgr().updateLoadRows((TransactionState) any);
-                minTimes = 0;
-            }
-        };
-
         try {
-            deleteStmt.analyze(analyzer);
-        } catch (UserException e) {
+            com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
+        } catch (Exception e) {
             Assert.fail();
         }
 
@@ -325,7 +306,7 @@ public class DeleteHandlerTest {
 
     @Test(expected = DdlException.class)
     public void testCommitFail(@Mocked MarkedCountDownLatch countDownLatch) throws DdlException, QueryStateException {
-        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryPredicate.Operator.GT, new SlotRef(null, "k1"),
+        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryType.GT, new SlotRef(null, "k1"),
                 new IntLiteral(3));
 
         DeleteStmt deleteStmt = new DeleteStmt(new TableName("test_db", "test_tbl"),
@@ -359,6 +340,7 @@ public class DeleteHandlerTest {
             {
                 try {
                     globalTransactionMgr.commitTransaction(anyLong, anyLong, (List<TabletCommitInfo>) any,
+                            (List<TabletFailInfo>) any,
                             (TxnCommitAttachment) any);
                 } catch (UserException e) {
                 }
@@ -367,8 +349,8 @@ public class DeleteHandlerTest {
         };
 
         try {
-            deleteStmt.analyze(analyzer);
-        } catch (UserException e) {
+            com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
+        } catch (Exception e) {
             Assert.fail();
         }
         try {
@@ -389,7 +371,7 @@ public class DeleteHandlerTest {
     @Test
     public void testPublishFail(@Mocked MarkedCountDownLatch countDownLatch, @Mocked AgentTaskExecutor taskExecutor)
             throws DdlException, QueryStateException {
-        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryPredicate.Operator.GT, new SlotRef(null, "k1"),
+        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryType.GT, new SlotRef(null, "k1"),
                 new IntLiteral(3));
 
         DeleteStmt deleteStmt = new DeleteStmt(new TableName("test_db", "test_tbl"),
@@ -421,21 +403,14 @@ public class DeleteHandlerTest {
 
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentAnalyzeMgr().updateLoadRows((TransactionState) any);
-                minTimes = 0;
-            }
-        };
-
-        new Expectations() {
-            {
                 AgentTaskExecutor.submit((AgentBatchTask) any);
                 minTimes = 0;
             }
         };
 
         try {
-            deleteStmt.analyze(analyzer);
-        } catch (UserException e) {
+            com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
+        } catch (Exception e) {
             Assert.fail();
         }
         try {
@@ -453,7 +428,7 @@ public class DeleteHandlerTest {
 
     @Test
     public void testNormal(@Mocked MarkedCountDownLatch countDownLatch) throws DdlException, QueryStateException {
-        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryPredicate.Operator.GT, new SlotRef(null, "k1"),
+        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryType.GT, new SlotRef(null, "k1"),
                 new IntLiteral(3));
 
         DeleteStmt deleteStmt = new DeleteStmt(new TableName("test_db", "test_tbl"),
@@ -475,21 +450,14 @@ public class DeleteHandlerTest {
 
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentAnalyzeMgr().updateLoadRows((TransactionState) any);
-                minTimes = 0;
-            }
-        };
-
-        new Expectations() {
-            {
                 AgentTaskExecutor.submit((AgentBatchTask) any);
                 minTimes = 0;
             }
         };
 
         try {
-            deleteStmt.analyze(analyzer);
-        } catch (UserException e) {
+            com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
+        } catch (Exception e) {
             Assert.fail();
         }
         try {

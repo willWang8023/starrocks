@@ -1,18 +1,41 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.pseudocluster;
 
-import com.clearspring.analytics.util.Lists;
-import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.ibm.icu.impl.Assert;
+import com.staros.proto.FileCacheInfo;
+import com.staros.proto.FilePathInfo;
+import com.staros.proto.FileStoreInfo;
+import com.staros.proto.FileStoreType;
+import com.staros.proto.ReplicaInfo;
+import com.staros.proto.ReplicaRole;
+import com.staros.proto.S3FileStoreInfo;
+import com.staros.proto.ShardInfo;
+import com.staros.proto.WorkerInfo;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Tablet;
 import com.starrocks.common.ClientPool;
 import com.starrocks.common.Config;
+import com.starrocks.common.DdlException;
+import com.starrocks.common.UserException;
+import com.starrocks.lake.StarOSAgent;
 import com.starrocks.rpc.BrpcProxy;
 import com.starrocks.rpc.LakeService;
 import com.starrocks.rpc.PBackendService;
@@ -21,6 +44,7 @@ import com.starrocks.thrift.BackendService;
 import com.starrocks.thrift.HeartbeatService;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.utframe.UtFrameUtils;
+import junit.framework.Assert;
 import org.apache.commons.dbcp2.BasicDataSource;
 import org.apache.commons.io.FileUtils;
 import org.apache.logging.log4j.LogManager;
@@ -32,12 +56,17 @@ import java.io.File;
 import java.io.IOException;
 import java.sql.Connection;
 import java.sql.SQLException;
-import java.sql.SQLSyntaxErrorException;
 import java.sql.Statement;
+import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Collection;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Objects;
+import java.util.Optional;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 public class PseudoCluster {
@@ -61,12 +90,20 @@ public class PseudoCluster {
 
     private BasicDataSource dataSource;
 
+    private static long backendIdStart = 10001;
+    private static int backendPortStart = 12100;
+    private static int backendHostStart = 10;
+
     static {
         try {
-            Class.forName("com.mysql.cj.jdbc.Driver").newInstance();
+            Class.forName("org.mariadb.jdbc.Driver").newInstance();
         } catch (Exception ex) {
             ex.printStackTrace();
         }
+    }
+
+    public void setServerPrepareStatement() {
+        dataSource.setConnectionProperties("useServerPrepStmts=true");
     }
 
     public void setQueryTimeout(int timeout) {
@@ -104,9 +141,123 @@ public class PseudoCluster {
 
         @Override
         protected LakeService getLakeServiceImpl(TNetworkAddress address) {
-            Preconditions.checkNotNull(getBackendByHost(address.getHostname()));
-            Preconditions.checkState(false, "not implemented");
-            return null;
+            return getBackendByHost(address.getHostname()).pLakeService;
+        }
+    }
+
+    private static class PseudoStarOSAgent extends StarOSAgent {
+        private class Worker {
+            long backendId;
+            long workerId;
+            String hostAndPort;
+
+            Worker(long backendId, long workerId, String hostAndPort) {
+                this.backendId = backendId;
+                this.workerId = workerId;
+                this.hostAndPort = hostAndPort;
+            }
+        }
+
+        private long nextId = 65535;
+        private final List<Worker> workers = new ArrayList<>();
+        private final List<ShardInfo> shardInfos = new ArrayList<>();
+
+        @Override
+        public boolean registerAndBootstrapService() {
+            return true;
+        }
+
+        @Override
+        public FilePathInfo allocateFilePath(long dbId, long tableId) throws DdlException {
+            FilePathInfo.Builder builder = FilePathInfo.newBuilder();
+            FileStoreInfo.Builder fsBuilder = builder.getFsInfoBuilder();
+
+            S3FileStoreInfo.Builder s3FsBuilder = fsBuilder.getS3FsInfoBuilder();
+            s3FsBuilder.setBucket("test-bucket");
+            s3FsBuilder.setRegion("test-region");
+            S3FileStoreInfo s3FsInfo = s3FsBuilder.build();
+
+            fsBuilder.setFsType(FileStoreType.S3);
+            fsBuilder.setFsKey("test-bucket");
+            fsBuilder.setS3FsInfo(s3FsInfo);
+            FileStoreInfo fsInfo = fsBuilder.build();
+
+            builder.setFsInfo(fsInfo);
+            builder.setFullPath("s3://test-bucket/1/");
+            return builder.build();
+        }
+
+        @Override
+        public void addWorker(long backendId, String hostAndPort, long workerGroupId) {
+            workers.add(new Worker(backendId, nextId++, hostAndPort));
+        }
+
+        @Override
+        public void removeWorker(String hostAndPort) throws DdlException {
+            workers.removeIf(w -> Objects.equals(w.hostAndPort, hostAndPort));
+        }
+
+        @Override
+        public long getWorkerIdByBackendId(long backendId) {
+            Optional<Worker> worker = workers.stream().filter(w -> w.backendId == backendId).findFirst();
+            return worker.map(value -> value.workerId).orElse(-1L);
+        }
+
+        @Override
+        public long createShardGroup(long dbId, long tableId, long partitionId) throws DdlException {
+            return partitionId;
+        }
+
+        @Override
+        public List<Long> createShards(int numShards, FilePathInfo pathInfo, FileCacheInfo cacheInfo,
+                                       long groupId, List<Long> matchShardIds, Map<String, String> properties)
+                throws DdlException {
+            List<Long> shardIds = new ArrayList<>();
+            for (int i = 0; i < numShards; i++) {
+                long id = nextId++;
+                shardIds.add(id);
+                List<ReplicaInfo> replicas = new ArrayList<>();
+                if (!workers.isEmpty()) {
+                    int availableReplicas = 1;
+                    int workerIndex = (int) (id % workers.size());
+                    for (int j = 0; j < availableReplicas; ++j) {
+                        replicas.add(ReplicaInfo.newBuilder()
+                                .setReplicaRole(ReplicaRole.PRIMARY)
+                                .setWorkerInfo(WorkerInfo.newBuilder()
+                                        .setWorkerId(workers.get(workerIndex).workerId)
+                                        .build())
+                                .build());
+                        workerIndex = (workerIndex + 1) % workers.size();
+                    }
+                }
+                ShardInfo shardInfo = ShardInfo.newBuilder().setFileCache(cacheInfo)
+                        .addAllReplicaInfo(replicas)
+                        .setFilePath(pathInfo)
+                        .setShardId(id)
+                        .build();
+                shardInfos.add(shardInfo);
+            }
+            return shardIds;
+        }
+
+        @Override
+        public void deleteShardGroup(List<Long> groupIds) {
+        }
+
+        @Override
+        public long getPrimaryComputeNodeIdByShard(long shardId) throws UserException {
+            return workers.isEmpty() ? -1 : workers.get((int) (shardId % workers.size())).backendId;
+        }
+
+        @Override
+        public Set<Long> getBackendIdsByShard(long shardId, long workerGroupId) throws UserException {
+            Set<Long> results = new HashSet<>();
+            shardInfos.stream().filter(x -> x.getShardId() == shardId).forEach(y -> {
+                for (ReplicaInfo info : y.getReplicaInfoList()) {
+                    results.add(info.getWorkerInfo().getWorkerId());
+                }
+            });
+            return results;
         }
     }
 
@@ -120,6 +271,10 @@ public class PseudoCluster {
             return null;
         }
         return backends.get(host);
+    }
+
+    public Collection<PseudoBackend> getBackends() {
+        return backends.values();
     }
 
     public PseudoBackend getBackendByHost(String host) {
@@ -147,7 +302,7 @@ public class PseudoCluster {
             }
             OlapTable olapTable = (OlapTable) table;
             List<Long> ret = Lists.newArrayList();
-            for (Partition partition : olapTable.getPartitions()) {
+            for (PhysicalPartition partition : olapTable.getPhysicalPartitions()) {
                 for (MaterializedIndex index : partition.getMaterializedIndices(
                         MaterializedIndex.IndexExtState.ALL)) {
                     for (Tablet tablet : index.getTablets()) {
@@ -171,8 +326,8 @@ public class PseudoCluster {
                     System.out.printf("runSql(%.3fs): %s\n", (end - start) / 1e9, sql);
                 }
                 break;
-            } catch (SQLSyntaxErrorException e) {
-                if (e.getMessage().startsWith("rpc failed, host")) {
+            } catch (SQLException e) {
+                if (e.getMessage().contains("rpc failed, host")) {
                     try {
                         Thread.sleep(1000);
                     } catch (InterruptedException ie) {
@@ -180,6 +335,7 @@ public class PseudoCluster {
                     System.out.println("retry execute " + sql);
                     continue;
                 }
+                LOG.error(e);
                 throw e;
             }
         }
@@ -232,9 +388,13 @@ public class PseudoCluster {
             try {
                 FileUtils.forceDelete(new File(getRunDir()));
             } catch (IOException e) {
-                Assert.fail(e);
+                Assert.fail("shutdown failed " + e);
             }
         }
+    }
+
+    public void shutdown() {
+        shutdown(true);
     }
 
     /**
@@ -253,7 +413,7 @@ public class PseudoCluster {
 
         BasicDataSource dataSource = new BasicDataSource();
         dataSource.setUrl(
-                "jdbc:mysql://127.0.0.1:" + queryPort + "/?permitMysqlScheme" +
+                "jdbc:mariadb://127.0.0.1:" + queryPort + "/?permitMysqlScheme" +
                         "&usePipelineAuth=false&useBatchMultiSend=false&" +
                         "autoReconnect=true&failOverReadOnly=false&maxReconnects=10");
         dataSource.setUsername("root");
@@ -262,9 +422,11 @@ public class PseudoCluster {
         dataSource.setMaxIdle(40);
         cluster.dataSource = dataSource;
 
-        ClientPool.heartbeatPool = cluster.heartBeatPool;
+        ClientPool.beHeartbeatPool = cluster.heartBeatPool;
         ClientPool.backendPool = cluster.backendThriftPool;
         BrpcProxy.setInstance(cluster.brpcProxy);
+
+        GlobalStateMgr.getCurrentState().setStarOSAgent(new PseudoStarOSAgent());
 
         // statistics affects table read times counter, so disable it
         Config.enable_statistic_collect = false;
@@ -282,26 +444,65 @@ public class PseudoCluster {
 
         LOG.info("start create and start backends");
         cluster.backends = Maps.newConcurrentMap();
-        long backendIdStart = 10001;
-        int port = 12100;
         for (int i = 0; i < numBackends; i++) {
-            String host = String.format("127.0.0.%d", i + 10);
-            long beId = backendIdStart + i;
+            String host = genBackendHost();
+            long beId = backendIdStart++;
             String beRunPath = runDir + "/be" + beId;
-            PseudoBackend backend = new PseudoBackend(cluster, beRunPath, beId, host, port++, port++, port++, port++,
+            PseudoBackend backend = new PseudoBackend(cluster, beRunPath, beId, host,
+                    backendPortStart++, backendPortStart++, backendPortStart++, backendPortStart++,
                     cluster.frontend.getFrontendService());
             cluster.backends.put(backend.getHost(), backend);
             cluster.backendIdToHost.put(beId, backend.getHost());
-            GlobalStateMgr.getCurrentSystemInfo().addBackend(backend.be);
+            GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addBackend(backend.be);
+            GlobalStateMgr.getCurrentState().getStarOSAgent()
+                    .addWorker(beId, String.format("%s:%d", backend.getHost(), backendPortStart - 1), 0);
             LOG.info("add PseudoBackend {} {}", beId, host);
         }
         int retry = 0;
-        while (GlobalStateMgr.getCurrentSystemInfo().getBackend(10001).getBePort() == -1 &&
+        while (GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackend(10001).getBePort() == -1 &&
                 retry++ < 600) {
             Thread.sleep(100);
         }
         Thread.sleep(2000);
         return cluster;
+    }
+
+    public List<Long> addBackends(int numBackends) {
+        List<Long> beIds = new ArrayList<>();
+        for (int i = 0; i < numBackends; i++) {
+            String host = genBackendHost();
+            long beId = backendIdStart++;
+            String beRunPath = runDir + "/be" + beId;
+            PseudoBackend backend = new PseudoBackend(this, beRunPath, beId, host,
+                    backendPortStart++, backendPortStart++, backendPortStart++, backendPortStart++,
+                    this.frontend.getFrontendService());
+            this.backends.put(backend.getHost(), backend);
+            this.backendIdToHost.put(beId, backend.getHost());
+            GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().addBackend(backend.be);
+            GlobalStateMgr.getCurrentState().getStarOSAgent()
+                    .addWorker(beId, String.format("%s:%d", backend.getHost(), backendPortStart - 1), 0);
+            LOG.info("add PseudoBackend {} {}", beId, host);
+            beIds.add(beId);
+        }
+        int retry = 0;
+        while (GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackend(beIds.get(0)).getBePort() == -1 &&
+                retry++ < 600) {
+            try {
+                Thread.sleep(100);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+            }
+        }
+
+        return beIds;
+    }
+
+    private static String genBackendHost() {
+        int i = backendHostStart % 128;
+        int j = (backendHostStart >> 7) % 128;
+        int k = (backendHostStart >> 14) % 128;
+        backendHostStart++;
+        return String.format("127.%d.%d.%d", k, j, i);
     }
 
     private static void logAddConsoleAppender() {
@@ -338,6 +539,8 @@ public class PseudoCluster {
         private String tableName = "test_table";
         private int buckets = 3;
         private int replication = 3;
+        private String quorum = "MAJORITY";
+        private String colocateGroup = "";
 
         private boolean ssd = true;
 
@@ -361,12 +564,28 @@ public class PseudoCluster {
             return this;
         }
 
+        public CreateTableSqlBuilder setWriteQuorum(String quorum) {
+            this.quorum = quorum;
+            return this;
+        }
+
+        public CreateTableSqlBuilder setColocateGroup(String colocateGroup) {
+            this.colocateGroup = colocateGroup;
+            return this;
+        }
+
         public String build() {
             return String.format("create table %s (id bigint not null, name varchar(64) not null, age int null) " +
                             "primary KEY (id) DISTRIBUTED BY HASH(id) BUCKETS %d " +
-                            "PROPERTIES(\"replication_num\" = \"%d\", \"storage_medium\" = \"%s\")", tableName,
-                    buckets, replication,
-                    ssd ? "SSD" : "HDD");
+                            "PROPERTIES(" +
+                                "\"write_quorum\" = \"%s\", " +
+                                "\"replication_num\" = \"%d\", " +
+                                "\"storage_medium\" = \"%s\", " +
+                                "\"colocate_with\" = \"%s\")",
+                    tableName,
+                    buckets, quorum, replication,
+                    ssd ? "SSD" : "HDD",
+                    colocateGroup);
         }
     }
 
@@ -381,7 +600,7 @@ public class PseudoCluster {
     public static void main(String[] args) throws Exception {
         PseudoCluster.getOrCreate("pseudo_cluster", false, 9030, 4);
         for (int i = 0; i < 4; i++) {
-            System.out.println(GlobalStateMgr.getCurrentSystemInfo().getBackend(10001 + i).getBePort());
+            System.out.println(GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackend(10001 + i).getBePort());
         }
         while (true) {
             Thread.sleep(1000);

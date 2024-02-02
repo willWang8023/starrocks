@@ -1,35 +1,3 @@
-[sql]
-select
-    c_custkey,
-    c_name,
-    sum(l_extendedprice * (1 - l_discount)) as revenue,
-    c_acctbal,
-    n_name,
-    c_address,
-    c_phone,
-    c_comment
-from
-    customer,
-    orders,
-    lineitem,
-    nation
-where
-        c_custkey = o_custkey
-  and l_orderkey = o_orderkey
-  and o_orderdate >= date '1994-05-01'
-  and o_orderdate < date '1994-08-01'
-  and l_returnflag = 'R'
-  and c_nationkey = n_nationkey
-group by
-    c_custkey,
-    c_name,
-    c_acctbal,
-    c_phone,
-    n_name,
-    c_address,
-    c_comment
-order by
-    revenue desc limit 20;
 [fragment statistics]
 PLAN FRAGMENT 0(F07)
 Output Exprs:1: C_CUSTKEY | 2: C_NAME | 43: sum | 6: C_ACCTBAL | 38: N_NAME | 3: C_ADDRESS | 5: C_PHONE | 8: C_COMMENT
@@ -37,6 +5,7 @@ Input Partition: UNPARTITIONED
 RESULT SINK
 
 17:MERGING-EXCHANGE
+distribution type: GATHER
 limit: 20
 cardinality: 20
 column statistics:
@@ -127,6 +96,7 @@ OutPut Exchange Id: 17
 |  * expr-->[810.9, 104949.5, 0.0, 8.0, 932377.0] ESTIMATE
 |
 |----12:EXCHANGE
+|       distribution type: BROADCAST
 |       cardinality: 25
 |
 10:Project
@@ -172,6 +142,8 @@ OutPut Exchange Id: 17
 |  * L_DISCOUNT-->[0.0, 0.1, 0.0, 8.0, 11.0] ESTIMATE
 |
 |----8:EXCHANGE
+|       distribution type: SHUFFLE
+|       partition exprs: [11: O_CUSTKEY, INT, false]
 |       cardinality: 5644405
 |
 0:OlapScanNode
@@ -240,6 +212,8 @@ OutPut Exchange Id: 08
 |  * L_DISCOUNT-->[0.0, 0.1, 0.0, 8.0, 11.0] ESTIMATE
 |
 |----5:EXCHANGE
+|       distribution type: SHUFFLE
+|       partition exprs: [10: O_ORDERKEY, INT, false]
 |       cardinality: 5644405
 |
 2:Project

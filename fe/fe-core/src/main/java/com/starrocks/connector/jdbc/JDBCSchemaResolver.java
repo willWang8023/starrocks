@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.connector.jdbc;
 
@@ -9,6 +22,7 @@ import com.starrocks.catalog.JDBCTable;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.DdlException;
+import com.starrocks.connector.exception.StarRocksConnectorException;
 
 import java.sql.Connection;
 import java.sql.ResultSet;
@@ -19,7 +33,9 @@ import java.util.Map;
 
 public abstract class JDBCSchemaResolver {
 
-    public Collection<String> listSchemas(Connection connection) throws DdlException {
+    boolean supportPartitionInformation = false;
+
+    public Collection<String> listSchemas(Connection connection) {
         try (ResultSet resultSet = connection.getMetaData().getSchemas()) {
             ImmutableSet.Builder<String> schemaNames = ImmutableSet.builder();
             while (resultSet.next()) {
@@ -31,7 +47,7 @@ public abstract class JDBCSchemaResolver {
             }
             return schemaNames.build();
         } catch (SQLException e) {
-            throw new DdlException(e.getMessage());
+            throw new StarRocksConnectorException(e.getMessage());
         }
     }
 
@@ -45,8 +61,25 @@ public abstract class JDBCSchemaResolver {
     }
 
     public Table getTable(long id, String name, List<Column> schema, String dbName,
-                          Map<String, String> properties) throws DdlException {
-        return new JDBCTable(id, name, schema, dbName, properties);
+                          String catalogName, Map<String, String> properties) throws DdlException {
+        return new JDBCTable(id, name, schema, dbName, catalogName, properties);
+    }
+
+    public Table getTable(long id, String name, List<Column> schema, List<Column> partitionColumns, String dbName,
+                          String catalogName, Map<String, String> properties) throws DdlException {
+        return new JDBCTable(id, name, schema, partitionColumns, dbName, catalogName, properties);
+    }
+
+    public List<String> listPartitionNames(Connection connection, String databaseName, String tableName) {
+        return Lists.newArrayList();
+    }
+
+    public List<String> listPartitionColumns(Connection connection, String databaseName, String tableName) {
+        return Lists.newArrayList();
+    }
+
+    public List<Partition> getPartitions(Connection connection, Table table) {
+        return Lists.newArrayList();
     }
 
     public List<Column> convertToSRTable(ResultSet columnSet) throws SQLException {
@@ -65,4 +98,14 @@ public abstract class JDBCSchemaResolver {
     public Type convertColumnType(int dataType, String typeName, int columnSize, int digits) throws SQLException {
         throw new SQLException("should not arrival here");
     }
+
+    public boolean checkAndSetSupportPartitionInformation(Connection connection) {
+        return false;
+
+    }
+
+    public boolean isSupportPartitionInformation() {
+        return supportPartitionInformation;
+    }
+
 }

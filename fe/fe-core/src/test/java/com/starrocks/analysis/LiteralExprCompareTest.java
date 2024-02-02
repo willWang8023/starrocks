@@ -54,16 +54,14 @@ public class LiteralExprCompareTest {
         Assert.assertTrue(0 == boolTrue1.compareLiteral(boolTrue1));
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test
     public void dateFormat1Test() throws AnalysisException {
         LiteralExpr date = new DateLiteral("2015-02-15 12:12:12", ScalarType.DATE);
-        Assert.fail();
     }
 
-    @Test(expected = AnalysisException.class)
+    @Test
     public void dateFormat2Test() throws AnalysisException {
         LiteralExpr datetime = new DateLiteral("2015-02-15", ScalarType.DATETIME);
-        Assert.fail();
     }
 
     @Test
@@ -85,7 +83,7 @@ public class LiteralExprCompareTest {
         LiteralExpr minDatetime1 = new DateLiteral(ScalarType.DATETIME, false);
         LiteralExpr minDatetime1Same = new DateLiteral(ScalarType.DATETIME, false);
         LiteralExpr date8 = new DateLiteral("9999-12-31", ScalarType.DATE);
-        LiteralExpr date9 = new DateLiteral("9999-12-31 23:59:59", ScalarType.DATETIME);
+        LiteralExpr date9 = new DateLiteral("9999-12-31 23:59:59.999999", ScalarType.DATETIME);
         LiteralExpr date10 = new DateLiteral("0000-01-01", ScalarType.DATE);
         LiteralExpr date11 = new DateLiteral("0000-01-01 00:00:00", ScalarType.DATETIME);
 

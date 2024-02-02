@@ -1,15 +1,27 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.analysis;
 
-import java.util.Arrays;
-
+import com.starrocks.alter.AlterOpType;
 import com.starrocks.sql.ast.PartitionNames;
 import com.starrocks.sql.ast.TruncatePartitionClause;
 import org.junit.Assert;
 import org.junit.Test;
 
-import com.starrocks.alter.AlterOpType;
+import java.util.Arrays;
 
 public class TruncatePartitionClauseTest {
     
@@ -22,7 +34,5 @@ public class TruncatePartitionClauseTest {
         PartitionNames partitionNames = new PartitionNames(true, Arrays.asList("p1"));
         TruncatePartitionClause clause2 = new TruncatePartitionClause(partitionNames);
         Assert.assertEquals("p1", clause2.getPartitionNames().getPartitionNames().get(0));
-
-        Assert.assertTrue(clause2.isSupportNewPlanner());
     }
 }

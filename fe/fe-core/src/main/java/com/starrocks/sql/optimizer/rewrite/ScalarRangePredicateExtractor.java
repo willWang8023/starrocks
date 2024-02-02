@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.optimizer.rewrite;
 
 import com.google.common.base.Preconditions;
@@ -7,6 +20,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Range;
 import com.google.common.collect.Sets;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.sql.optimizer.Utils;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
@@ -24,8 +38,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.stream.Collectors;
-
-import static com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator.BinaryType;
 
 /**
  * Derive a expression's value range. such as:
@@ -47,7 +59,7 @@ public class ScalarRangePredicateExtractor {
     }
 
     private ScalarOperator rewrite(ScalarOperator predicate, boolean onlyExtractColumnRef) {
-        if (predicate.getOpType() != OperatorType.COMPOUND) {
+        if (predicate == null || predicate.getOpType() != OperatorType.COMPOUND) {
             return predicate;
         }
 
@@ -80,7 +92,7 @@ public class ScalarRangePredicateExtractor {
 
         predicate = Utils.compoundAnd(Lists.newArrayList(conjuncts));
         if (isOnlyOrCompound(predicate)) {
-            Set<ColumnRefOperator> c = new HashSet<>(Utils.extractColumnRef(predicate));
+            Set<ColumnRefOperator> c = Sets.newHashSet(Utils.extractColumnRef(predicate));
             if (c.size() == extractMap.size() &&
                     extractMap.values().stream().allMatch(v -> v instanceof MultiValuesDescriptor)) {
                 return extractExpr;
@@ -93,11 +105,19 @@ public class ScalarRangePredicateExtractor {
 
             if (extractMap.values().stream().allMatch(valueDescriptor -> valueDescriptor.sourceCount == cs.size())
                     && extractMap.size() == cf.size()) {
-                return extractExpr;
+                if (result.size() == conjuncts.size()) {
+                    // to keep the isPushdown/isRedundant of predicate
+                    return predicate;
+                } else {
+                    return extractExpr;
+                }
             }
         }
 
-        if (!conjuncts.contains(extractExpr)) {
+        if (!conjuncts.containsAll(result)) {
+            // remove duplicates
+            result.removeAll(conjuncts);
+            extractExpr = Utils.compoundAnd(Lists.newArrayList(result));
             result.forEach(f -> f.setFromPredicateRangeDerive(true));
             result.stream().filter(predicateOperator -> !checkStatisticsEstimateValid(predicateOperator))
                     .forEach(f -> f.setNotEvalEstimate(true));
@@ -107,6 +127,9 @@ public class ScalarRangePredicateExtractor {
             if (!checkStatisticsEstimateValid(extractExpr)) {
                 extractExpr.setNotEvalEstimate(true);
             }
+            // TODO: merge `setFromPredicateRangeDerive` into `setRedundant`
+            result.forEach(f -> f.setRedundant(true));
+            extractExpr.setRedundant(true);
             return Utils.compoundAnd(predicate, extractExpr);
         }
 
@@ -400,7 +423,9 @@ public class ScalarRangePredicateExtractor {
                     // empty range
                     return new MultiValuesDescriptor(this, other);
                 }
-
+                if (result.range.isEmpty()) {
+                    return new MultiValuesDescriptor(this, other);
+                }
                 return result;
             }
 
@@ -428,7 +453,7 @@ public class ScalarRangePredicateExtractor {
     private static boolean isOnlyAndCompound(ScalarOperator predicate) {
         if (predicate instanceof CompoundPredicateOperator) {
             CompoundPredicateOperator compoundPredicateOperator = (CompoundPredicateOperator) predicate;
-            if (compoundPredicateOperator.isOr() || compoundPredicateOperator.isNot()) {
+            if (!compoundPredicateOperator.isAnd()) {
                 return false;
             }
 
@@ -442,7 +467,7 @@ public class ScalarRangePredicateExtractor {
     private static boolean isOnlyOrCompound(ScalarOperator predicate) {
         if (predicate instanceof CompoundPredicateOperator) {
             CompoundPredicateOperator compoundPredicateOperator = (CompoundPredicateOperator) predicate;
-            if (compoundPredicateOperator.isAnd() || compoundPredicateOperator.isNot()) {
+            if (!compoundPredicateOperator.isOr()) {
                 return false;
             }
 

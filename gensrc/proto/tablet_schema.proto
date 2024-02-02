@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/gensrc/proto/olap_file.proto
 
@@ -25,7 +38,6 @@ syntax="proto2";
 package starrocks;
 option java_package = "com.starrocks.proto";
 
-import "olap_common.proto";
 import "types.proto";
 
 // Please keep the defined value less than 256, bacause this enum will be casted to uint8_t
@@ -55,19 +67,38 @@ message ColumnPB {
     optional bool has_bitmap_index = 15 [default=false];
     optional bool visible = 16 [default=true];
     repeated ColumnPB children_columns = 17;
+    optional bool is_auto_increment = 18;
 }
 
 message TabletSchemaPB {
-    optional KeysType keys_type = 1;    // OLAPHeaderMessage.keys_type
-    repeated ColumnPB column = 2;   // OLAPHeaderMessage.column
-    optional int32 num_short_key_columns = 3;   // OLAPHeaderMessage.num_short_key_fields
-    optional int32 num_rows_per_row_block = 4;  // OLAPHeaderMessage.num_rows_per_data_block
-    optional CompressKind compress_kind = 5; // OLAPHeaderMessage.compress_kind
-    optional double bf_fpp = 6; // OLAPHeaderMessage.bf_fpp
-    optional uint32 next_column_unique_id = 7; // OLAPHeaderMessage.next_column_unique_id
+    optional KeysType keys_type = 1;   
+    repeated ColumnPB column = 2;
+    optional int32 num_short_key_columns = 3;
+    optional int32 num_rows_per_row_block = 4;
+    // optional CompressKind compress_kind = 5; 
+    optional double bf_fpp = 6;
+    optional uint32 next_column_unique_id = 7;
     optional bool DEPRECATED_is_in_memory = 8 [default=false];
     optional int64 deprecated_id = 9; // deprecated
     optional CompressionTypePB compression_type = 10 [default=LZ4_FRAME];
+    repeated uint32 sort_key_idxes = 11;
+    optional int32 schema_version = 12;
+    repeated uint32 sort_key_unique_ids = 13;
+    repeated TabletIndexPB table_indices = 14;
     optional int64 id = 50;
+}
+
+enum IndexType {
+    BITMAP = 0;
+    GIN = 1;
+    INDEX_UNKNOWN = 2;
+}
+
+message TabletIndexPB {
+    optional int64 index_id = 1;
+    optional string index_name = 2;
+    optional IndexType index_type = 3; // inverted, vector, other index
+    repeated int32 col_unique_id = 4; // support multi-columns index
+    optional string index_properties = 5; // index meta
 }
 

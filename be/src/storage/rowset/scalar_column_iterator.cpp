@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/segment_v2/column_reader.cpp
 
@@ -21,10 +34,13 @@
 
 #include "storage/rowset/scalar_column_iterator.h"
 
+#include "storage/column_predicate.h"
 #include "storage/rowset/binary_dict_page.h"
+#include "storage/rowset/bitshuffle_page.h"
 #include "storage/rowset/column_reader.h"
+#include "storage/rowset/dict_page.h"
 #include "storage/rowset/encoding_info.h"
-#include "storage/vectorized_column_predicate.h"
+#include "util/bitmap.h"
 
 namespace starrocks {
 
@@ -34,27 +50,75 @@ ScalarColumnIterator::~ScalarColumnIterator() = default;
 
 Status ScalarColumnIterator::init(const ColumnIteratorOptions& opts) {
     _opts = opts;
-    RETURN_IF_ERROR(_reader->load_ordinal_index());
+
+    IndexReadOptions index_opts;
+    index_opts.use_page_cache = config::enable_ordinal_index_memory_page_cache || !config::disable_storage_page_cache;
+    index_opts.kept_in_memory = config::enable_ordinal_index_memory_page_cache;
+    index_opts.lake_io_opts = opts.lake_io_opts;
+    index_opts.read_file = _opts.read_file;
+    index_opts.stats = _opts.stats;
+    RETURN_IF_ERROR(_reader->load_ordinal_index(index_opts));
     _opts.stats->total_columns_data_page_count += _reader->num_data_pages();
 
     if (_reader->encoding_info()->encoding() != DICT_ENCODING) {
         return Status::OK();
     }
-
-    if (_reader->column_type() == OLAP_FIELD_TYPE_CHAR) {
-        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<OLAP_FIELD_TYPE_CHAR>;
-    } else if (_reader->column_type() == OLAP_FIELD_TYPE_VARCHAR) {
-        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<OLAP_FIELD_TYPE_VARCHAR>;
-    } else {
-        return Status::NotSupported("dict encoding with unsupported field type");
+    LogicalType column_type = delegate_type(_reader->column_type());
+    DCHECK(supports_dict_encoding(column_type))
+            << strings::Substitute("dict encoding with unsupported $0 field type", column_type);
+    switch (column_type) {
+    case TYPE_CHAR:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_CHAR>;
+        break;
+    case TYPE_VARCHAR:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_VARCHAR>;
+        break;
+    case TYPE_SMALLINT:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_SMALLINT>;
+        break;
+    case TYPE_INT:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_INT>;
+        break;
+    case TYPE_BIGINT:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_BIGINT>;
+        break;
+    case TYPE_LARGEINT:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_LARGEINT>;
+        break;
+    case TYPE_FLOAT:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_FLOAT>;
+        break;
+    case TYPE_DOUBLE:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_DOUBLE>;
+        break;
+    case TYPE_DATE:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_DATE>;
+        break;
+    case TYPE_DATETIME:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_DATETIME>;
+        break;
+    case TYPE_DECIMALV2:
+        _init_dict_decoder_func = &ScalarColumnIterator::_do_init_dict_decoder<TYPE_DECIMALV2>;
+        break;
+    default:
+        return Status::NotSupported(strings::Substitute("dict encoding with unsupported $0 field type", column_type));
     }
 
+    // TODO: The following logic is primarily used for optimizing queries for VARCHAR/CHAR types during
+    // dictionary encoding. Can we also optimize queries for non-TYPE_VARCHAR types?
+    if (column_type != TYPE_VARCHAR && column_type != TYPE_CHAR) {
+        return Status::OK();
+    }
     if (opts.check_dict_encoding) {
         if (_reader->has_all_dict_encoded()) {
             _all_dict_encoded = _reader->all_dict_encoded();
             // if _all_dict_encoded is true, load dictionary page into memory for `dict_lookup`.
             RETURN_IF(!_all_dict_encoded, Status::OK());
-            RETURN_IF_ERROR(_load_dict_page());
+            if (column_type == TYPE_VARCHAR) {
+                RETURN_IF_ERROR(_load_dict_page<TYPE_VARCHAR>());
+            } else {
+                RETURN_IF_ERROR(_load_dict_page<TYPE_CHAR>());
+            }
         } else if (_reader->num_rows() > 0) {
             // old version segment file dost not have `all_dict_encoded`, in order to check
             // whether all data pages are using dict encoding, must load the last data page
@@ -65,18 +129,18 @@ Status ScalarColumnIterator::init(const ColumnIteratorOptions& opts) {
         }
     }
 
-    if (_all_dict_encoded && _reader->column_type() == OLAP_FIELD_TYPE_CHAR) {
-        _decode_dict_codes_func = &ScalarColumnIterator::_do_decode_dict_codes<OLAP_FIELD_TYPE_CHAR>;
-        _dict_lookup_func = &ScalarColumnIterator::_do_dict_lookup<OLAP_FIELD_TYPE_CHAR>;
-        _next_dict_codes_func = &ScalarColumnIterator::_do_next_dict_codes<OLAP_FIELD_TYPE_CHAR>;
-        _next_batch_dict_codes_func = &ScalarColumnIterator::_do_next_batch_dict_codes<OLAP_FIELD_TYPE_CHAR>;
-        _fetch_all_dict_words_func = &ScalarColumnIterator::_fetch_all_dict_words<OLAP_FIELD_TYPE_CHAR>;
-    } else if (_all_dict_encoded && _reader->column_type() == OLAP_FIELD_TYPE_VARCHAR) {
-        _decode_dict_codes_func = &ScalarColumnIterator::_do_decode_dict_codes<OLAP_FIELD_TYPE_VARCHAR>;
-        _dict_lookup_func = &ScalarColumnIterator::_do_dict_lookup<OLAP_FIELD_TYPE_VARCHAR>;
-        _next_dict_codes_func = &ScalarColumnIterator::_do_next_dict_codes<OLAP_FIELD_TYPE_VARCHAR>;
-        _next_batch_dict_codes_func = &ScalarColumnIterator::_do_next_batch_dict_codes<OLAP_FIELD_TYPE_VARCHAR>;
-        _fetch_all_dict_words_func = &ScalarColumnIterator::_fetch_all_dict_words<OLAP_FIELD_TYPE_VARCHAR>;
+    if (_all_dict_encoded && column_type == TYPE_CHAR) {
+        _decode_dict_codes_func = &ScalarColumnIterator::_do_decode_dict_codes<TYPE_CHAR>;
+        _dict_lookup_func = &ScalarColumnIterator::_do_dict_lookup<TYPE_CHAR>;
+        _next_dict_codes_func = &ScalarColumnIterator::_do_next_dict_codes<TYPE_CHAR>;
+        _next_batch_dict_codes_func = &ScalarColumnIterator::_do_next_batch_dict_codes<TYPE_CHAR>;
+        _fetch_all_dict_words_func = &ScalarColumnIterator::_fetch_all_dict_words<TYPE_CHAR>;
+    } else if (_all_dict_encoded && column_type == TYPE_VARCHAR) {
+        _decode_dict_codes_func = &ScalarColumnIterator::_do_decode_dict_codes<TYPE_VARCHAR>;
+        _dict_lookup_func = &ScalarColumnIterator::_do_dict_lookup<TYPE_VARCHAR>;
+        _next_dict_codes_func = &ScalarColumnIterator::_do_next_dict_codes<TYPE_VARCHAR>;
+        _next_batch_dict_codes_func = &ScalarColumnIterator::_do_next_batch_dict_codes<TYPE_VARCHAR>;
+        _fetch_all_dict_words_func = &ScalarColumnIterator::_fetch_all_dict_words<TYPE_VARCHAR>;
     }
     return Status::OK();
 }
@@ -89,7 +153,7 @@ Status ScalarColumnIterator::seek_to_first() {
     RETURN_IF_ERROR(_reader->seek_to_first(&_page_iter));
     RETURN_IF_ERROR(_read_data_page(_page_iter));
 
-    _seek_to_pos_in_page(_page.get(), 0);
+    RETURN_IF_ERROR(_seek_to_pos_in_page(_page.get(), 0));
     _current_ordinal = 0;
     return Status::OK();
 }
@@ -100,7 +164,7 @@ Status ScalarColumnIterator::seek_to_ordinal(ordinal_t ord) {
         RETURN_IF_ERROR(_reader->seek_at_or_before(ord, &_page_iter));
         RETURN_IF_ERROR(_read_data_page(_page_iter));
     }
-    _seek_to_pos_in_page(_page.get(), ord - _page->first_ordinal());
+    RETURN_IF_ERROR(_seek_to_pos_in_page(_page.get(), ord - _page->first_ordinal()));
     _current_ordinal = ord;
     return Status::OK();
 }
@@ -114,7 +178,7 @@ Status ScalarColumnIterator::seek_to_ordinal_and_calc_element_ordinal(ordinal_t 
     _array_size.resize(0);
     _element_ordinal = static_cast<int64_t>(_page->corresponding_element_ordinal());
     _current_ordinal = _page->first_ordinal();
-    _seek_to_pos_in_page(_page.get(), 0);
+    RETURN_IF_ERROR(_seek_to_pos_in_page(_page.get(), 0));
     size_t size_to_read = ord - _current_ordinal;
     RETURN_IF_ERROR(_page->read(&_array_size, &size_to_read));
     _current_ordinal += size_to_read;
@@ -125,43 +189,15 @@ Status ScalarColumnIterator::seek_to_ordinal_and_calc_element_ordinal(ordinal_t 
     return Status::OK();
 }
 
-void ScalarColumnIterator::_seek_to_pos_in_page(ParsedPage* page, ordinal_t offset_in_page) {
+Status ScalarColumnIterator::_seek_to_pos_in_page(ParsedPage* page, ordinal_t offset_in_page) {
     if (page->offset() == offset_in_page) {
         // fast path, do nothing
-        return;
+        return Status::OK();
     }
-    page->seek(offset_in_page);
+    return page->seek(offset_in_page);
 }
 
-Status ScalarColumnIterator::next_batch(size_t* n, ColumnBlockView* dst, bool* has_null) {
-    size_t remaining = *n;
-    bool contain_deleted_row = false;
-    while (remaining > 0) {
-        if (_page->remaining() == 0) {
-            bool eos = false;
-            RETURN_IF_ERROR(_load_next_page(&eos));
-            if (eos) {
-                break;
-            }
-        }
-
-        contain_deleted_row |= _delete_partial_satisfied_pages.count(_page->page_index());
-        // number of rows to be read from this page
-        size_t nread = remaining;
-        RETURN_IF_ERROR(_page->read(dst, &nread));
-        _current_ordinal += nread;
-        remaining -= nread;
-    }
-    dst->column_block()->set_delete_state(contain_deleted_row ? DEL_PARTIAL_SATISFIED : DEL_NOT_SATISFIED);
-
-    *n -= remaining;
-    // TODO(hkp): for string type, the bytes_read should be passed to page decoder
-    // bytes_read = data size + null bitmap size
-    _opts.stats->bytes_read += static_cast<int64_t>(*n * dst->type_info()->size() + BitmapSize(*n));
-    return Status::OK();
-}
-
-Status ScalarColumnIterator::next_batch(size_t* n, vectorized::Column* dst) {
+Status ScalarColumnIterator::next_batch(size_t* n, Column* dst) {
     size_t remaining = *n;
     size_t prev_bytes = dst->byte_size();
     bool contain_deleted_row = (dst->delete_state() != DEL_NOT_SATISFIED);
@@ -187,12 +223,12 @@ Status ScalarColumnIterator::next_batch(size_t* n, vectorized::Column* dst) {
     return Status::OK();
 }
 
-Status ScalarColumnIterator::next_batch(const vectorized::SparseRange& range, vectorized::Column* dst) {
+Status ScalarColumnIterator::next_batch(const SparseRange<>& range, Column* dst) {
     size_t prev_bytes = dst->byte_size();
-    vectorized::SparseRangeIterator iter = range.new_iterator();
+    SparseRangeIterator<> iter = range.new_iterator();
     size_t end_ord = _page->first_ordinal() + _page->num_rows();
     bool contain_deleted_row = (dst->delete_state() != DEL_NOT_SATISFIED);
-    vectorized::SparseRange read_range;
+    SparseRange<> read_range;
     // range is empty should only occur when array column is nullable
     DCHECK(range.empty() || (range.begin() == _current_ordinal));
 
@@ -222,8 +258,8 @@ Status ScalarColumnIterator::next_batch(const vectorized::SparseRange& range, ve
         if (end_ord > _current_ordinal) {
             // the data of current_range is in current page
             // add current_range into read_range
-            vectorized::Range r = iter.next(end_ord - _current_ordinal);
-            read_range.add(vectorized::Range(r.begin() - _page->first_ordinal(), r.end() - _page->first_ordinal()));
+            Range<> r = iter.next(end_ord - _current_ordinal);
+            read_range.add(Range<>(r.begin() - _page->first_ordinal(), r.end() - _page->first_ordinal()));
             _current_ordinal += r.span_size();
         }
 
@@ -257,11 +293,12 @@ Status ScalarColumnIterator::_load_next_page(bool* eos) {
     }
 
     RETURN_IF_ERROR(_read_data_page(_page_iter));
-    _seek_to_pos_in_page(_page.get(), 0);
+    RETURN_IF_ERROR(_seek_to_pos_in_page(_page.get(), 0));
     *eos = false;
     return Status::OK();
 }
 
+template <LogicalType Type>
 Status ScalarColumnIterator::_load_dict_page() {
     DCHECK(_dict_decoder == nullptr);
     // read dictionary page
@@ -271,23 +308,32 @@ Status ScalarColumnIterator::_load_dict_page() {
             _reader->read_page(_opts, _reader->get_dict_page_pointer(), &_dict_page_handle, &dict_data, &dict_footer));
     // ignore dict_footer.dict_page_footer().encoding() due to only
     // PLAIN_ENCODING is supported for dict page right now
-    if (_reader->column_type() == OLAP_FIELD_TYPE_CHAR) {
-        _dict_decoder = std::make_unique<BinaryPlainPageDecoder<OLAP_FIELD_TYPE_CHAR>>(dict_data);
+    if constexpr (Type == TYPE_CHAR || Type == TYPE_VARCHAR) {
+        _dict_decoder = std::make_unique<BinaryPlainPageDecoder<Type>>(dict_data);
     } else {
-        _dict_decoder = std::make_unique<BinaryPlainPageDecoder<OLAP_FIELD_TYPE_VARCHAR>>(dict_data);
+        _dict_decoder = std::make_unique<BitShufflePageDecoder<Type>>(dict_data);
     }
     return _dict_decoder->init();
 }
 
-template <FieldType Type>
+template <LogicalType Type>
 Status ScalarColumnIterator::_do_init_dict_decoder() {
-    static_assert(Type == OLAP_FIELD_TYPE_CHAR || Type == OLAP_FIELD_TYPE_VARCHAR);
-    auto dict_page_decoder = down_cast<BinaryDictPageDecoder<Type>*>(_page->data_decoder());
-    if (dict_page_decoder->encoding_type() == DICT_ENCODING) {
-        if (_dict_decoder == nullptr) {
-            RETURN_IF_ERROR(_load_dict_page());
+    if constexpr (Type == TYPE_CHAR || Type == TYPE_VARCHAR) {
+        auto dict_page_decoder = down_cast<BinaryDictPageDecoder<Type>*>(_page->data_decoder());
+        if (dict_page_decoder->encoding_type() == DICT_ENCODING) {
+            if (_dict_decoder == nullptr) {
+                RETURN_IF_ERROR(_load_dict_page<Type>());
+            }
+            dict_page_decoder->set_dict_decoder(_dict_decoder.get());
         }
-        dict_page_decoder->set_dict_decoder(_dict_decoder.get());
+    } else {
+        auto dict_page_decoder = down_cast<DictPageDecoder<Type>*>(_page->data_decoder());
+        if (dict_page_decoder->encoding_type() == DICT_ENCODING) {
+            if (_dict_decoder == nullptr) {
+                RETURN_IF_ERROR(_load_dict_page<Type>());
+            }
+            dict_page_decoder->set_dict_decoder(_dict_decoder.get());
+        }
     }
     return Status::OK();
 }
@@ -311,28 +357,41 @@ Status ScalarColumnIterator::_read_data_page(const OrdinalPageIndexIterator& ite
     return Status::OK();
 }
 
-Status ScalarColumnIterator::get_row_ranges_by_zone_map(
-        const std::vector<const vectorized::ColumnPredicate*>& predicates,
-        const vectorized::ColumnPredicate* del_predicate, vectorized::SparseRange* row_ranges) {
+Status ScalarColumnIterator::get_row_ranges_by_zone_map(const std::vector<const ColumnPredicate*>& predicates,
+                                                        const ColumnPredicate* del_predicate,
+                                                        SparseRange<>* row_ranges) {
     DCHECK(row_ranges->empty());
     if (_reader->has_zone_map()) {
-        RETURN_IF_ERROR(
-                _reader->zone_map_filter(predicates, del_predicate, &_delete_partial_satisfied_pages, row_ranges));
+        IndexReadOptions opts;
+        opts.use_page_cache = config::enable_zonemap_index_memory_page_cache || !config::disable_storage_page_cache;
+        opts.kept_in_memory = config::enable_zonemap_index_memory_page_cache;
+        opts.lake_io_opts = _opts.lake_io_opts;
+        opts.read_file = _opts.read_file;
+        opts.stats = _opts.stats;
+        RETURN_IF_ERROR(_reader->zone_map_filter(predicates, del_predicate, &_delete_partial_satisfied_pages,
+                                                 row_ranges, opts));
     } else {
         row_ranges->add({0, static_cast<rowid_t>(_reader->num_rows())});
     }
     return Status::OK();
 }
 
-Status ScalarColumnIterator::get_row_ranges_by_bloom_filter(
-        const std::vector<const vectorized::ColumnPredicate*>& predicates, vectorized::SparseRange* row_ranges) {
+Status ScalarColumnIterator::get_row_ranges_by_bloom_filter(const std::vector<const ColumnPredicate*>& predicates,
+                                                            SparseRange<>* row_ranges) {
     RETURN_IF(!_reader->has_bloom_filter_index(), Status::OK());
     bool support = false;
     for (const auto* pred : predicates) {
         support = support | pred->support_bloom_filter();
     }
     RETURN_IF(!support, Status::OK());
-    RETURN_IF_ERROR(_reader->bloom_filter(predicates, row_ranges));
+
+    IndexReadOptions opts;
+    opts.use_page_cache = !config::disable_storage_page_cache;
+    opts.kept_in_memory = false;
+    opts.lake_io_opts = _opts.lake_io_opts;
+    opts.read_file = _opts.read_file;
+    opts.stats = _opts.stats;
+    RETURN_IF_ERROR(_reader->bloom_filter(predicates, row_ranges, opts));
     return Status::OK();
 }
 
@@ -341,17 +400,17 @@ int ScalarColumnIterator::dict_lookup(const Slice& word) {
     return (this->*_dict_lookup_func)(word);
 }
 
-Status ScalarColumnIterator::next_dict_codes(size_t* n, vectorized::Column* dst) {
+Status ScalarColumnIterator::next_dict_codes(size_t* n, Column* dst) {
     DCHECK(all_page_dict_encoded());
     return (this->*_next_dict_codes_func)(n, dst);
 }
 
-Status ScalarColumnIterator::next_dict_codes(const vectorized::SparseRange& range, vectorized::Column* dst) {
+Status ScalarColumnIterator::next_dict_codes(const SparseRange<>& range, Column* dst) {
     DCHECK(all_page_dict_encoded());
     return (this->*_next_batch_dict_codes_func)(range, dst);
 }
 
-Status ScalarColumnIterator::decode_dict_codes(const int32_t* codes, size_t size, vectorized::Column* words) {
+Status ScalarColumnIterator::decode_dict_codes(const int32_t* codes, size_t size, Column* words) {
     DCHECK(all_page_dict_encoded());
     return (this->*_decode_dict_codes_func)(codes, size, words);
 }
@@ -361,13 +420,13 @@ Status ScalarColumnIterator::fetch_all_dict_words(std::vector<Slice>* words) con
     return (this->*_fetch_all_dict_words_func)(words);
 }
 
-template <FieldType Type>
+template <LogicalType Type>
 Status ScalarColumnIterator::_fetch_all_dict_words(std::vector<Slice>* words) const {
     auto dict = down_cast<BinaryPlainPageDecoder<Type>*>(_dict_decoder.get());
-    size_t words_count = dict->count();
+    uint32_t words_count = dict->count();
     words->reserve(words_count);
-    for (size_t i = 0; i < words_count; i++) {
-        if constexpr (Type != OLAP_FIELD_TYPE_CHAR) {
+    for (uint32_t i = 0; i < words_count; i++) {
+        if constexpr (Type != TYPE_CHAR) {
             words->emplace_back(dict->string_at_index(i));
         } else {
             Slice s = dict->string_at_index(i);
@@ -378,14 +437,14 @@ Status ScalarColumnIterator::_fetch_all_dict_words(std::vector<Slice>* words) co
     return Status::OK();
 }
 
-template <FieldType Type>
+template <LogicalType Type>
 int ScalarColumnIterator::_do_dict_lookup(const Slice& word) {
     auto dict = down_cast<BinaryPlainPageDecoder<Type>*>(_dict_decoder.get());
     return dict->find(word);
 }
 
-template <FieldType Type>
-Status ScalarColumnIterator::_do_next_dict_codes(size_t* n, vectorized::Column* dst) {
+template <LogicalType Type>
+Status ScalarColumnIterator::_do_next_dict_codes(size_t* n, Column* dst) {
     size_t remaining = *n;
     bool contain_delted_row = false;
     while (remaining > 0) {
@@ -411,14 +470,14 @@ Status ScalarColumnIterator::_do_next_dict_codes(size_t* n, vectorized::Column* 
     return Status::OK();
 }
 
-template <FieldType Type>
-Status ScalarColumnIterator::_do_next_batch_dict_codes(const vectorized::SparseRange& range, vectorized::Column* dst) {
+template <LogicalType Type>
+Status ScalarColumnIterator::_do_next_batch_dict_codes(const SparseRange<>& range, Column* dst) {
     bool contain_deleted_row = false;
-    vectorized::SparseRangeIterator iter = range.new_iterator();
+    SparseRangeIterator<> iter = range.new_iterator();
     size_t end_ord = _page->first_ordinal() + _page->num_rows();
-    vectorized::SparseRange read_range;
+    SparseRange<> read_range;
 
-    DCHECK_EQ(range.begin(), _current_ordinal);
+    DCHECK(range.empty() || range.begin() == _current_ordinal);
     // similar to ScalarColumnIterator::next_batch
     while (iter.has_more()) {
         if (_page->remaining() == 0 && iter.begin() == end_ord) {
@@ -437,8 +496,8 @@ Status ScalarColumnIterator::_do_next_batch_dict_codes(const vectorized::SparseR
 
         _current_ordinal = iter.begin();
         if (end_ord > _current_ordinal) {
-            vectorized::Range r = iter.next(end_ord - _current_ordinal);
-            read_range.add(vectorized::Range(r.begin() - _page->first_ordinal(), r.end() - _page->first_ordinal()));
+            Range<> r = iter.next(end_ord - _current_ordinal);
+            read_range.add(Range<>(r.begin() - _page->first_ordinal(), r.end() - _page->first_ordinal()));
             _current_ordinal += r.span_size();
         }
 
@@ -459,14 +518,14 @@ Status ScalarColumnIterator::_do_next_batch_dict_codes(const vectorized::SparseR
     return Status::OK();
 }
 
-template <FieldType Type>
-Status ScalarColumnIterator::_do_decode_dict_codes(const int32_t* codes, size_t size, vectorized::Column* words) {
+template <LogicalType Type>
+Status ScalarColumnIterator::_do_decode_dict_codes(const int32_t* codes, size_t size, Column* words) {
     auto dict = down_cast<BinaryPlainPageDecoder<Type>*>(_dict_decoder.get());
     std::vector<Slice> slices;
     slices.reserve(size);
     for (size_t i = 0; i < size; i++) {
         if (codes[i] >= 0) {
-            if constexpr (Type != OLAP_FIELD_TYPE_CHAR) {
+            if constexpr (Type != TYPE_CHAR) {
                 slices.emplace_back(dict->string_at_index(codes[i]));
             } else {
                 Slice s = dict->string_at_index(codes[i]);
@@ -484,7 +543,7 @@ Status ScalarColumnIterator::_do_decode_dict_codes(const int32_t* codes, size_t 
 }
 
 template <typename PageParseFunc>
-Status ScalarColumnIterator::_fetch_by_rowid(const rowid_t* rowids, size_t size, vectorized::Column* values,
+Status ScalarColumnIterator::_fetch_by_rowid(const rowid_t* rowids, size_t size, Column* values,
                                              PageParseFunc&& page_parse) {
     DCHECK(std::is_sorted(rowids, rowids + size));
     RETURN_IF(size == 0, Status::OK());
@@ -500,7 +559,7 @@ Status ScalarColumnIterator::_fetch_by_rowid(const rowid_t* rowids, size_t size,
             DCHECK_EQ(_current_ordinal, _page->first_ordinal() + _page->offset());
             rowid_t curr = *rowids;
             _current_ordinal = implicit_cast<ordinal_t>(curr);
-            _page->seek(curr - _page->first_ordinal());
+            RETURN_IF_ERROR(_page->seek(curr - _page->first_ordinal()));
             const rowid_t* p = rowids + 1;
             while ((next_page_rowid != p) && (*p == curr + 1)) {
                 curr = *p++;
@@ -518,22 +577,22 @@ Status ScalarColumnIterator::_fetch_by_rowid(const rowid_t* rowids, size_t size,
     return Status::OK();
 }
 
-Status ScalarColumnIterator::fetch_values_by_rowid(const rowid_t* rowids, size_t size, vectorized::Column* values) {
-    auto page_parse = [&](vectorized::Column* column, size_t* count) { return _page->read(column, count); };
+Status ScalarColumnIterator::fetch_values_by_rowid(const rowid_t* rowids, size_t size, Column* values) {
+    auto page_parse = [&](Column* column, size_t* count) { return _page->read(column, count); };
     return _fetch_by_rowid(rowids, size, values, page_parse);
 }
 
-Status ScalarColumnIterator::fetch_dict_codes_by_rowid(const rowid_t* rowids, size_t size, vectorized::Column* values) {
-    auto page_parse = [&](vectorized::Column* column, size_t* count) { return _page->read_dict_codes(column, count); };
+Status ScalarColumnIterator::fetch_dict_codes_by_rowid(const rowid_t* rowids, size_t size, Column* values) {
+    auto page_parse = [&](Column* column, size_t* count) { return _page->read_dict_codes(column, count); };
     return _fetch_by_rowid(rowids, size, values, page_parse);
 }
 
 int ScalarColumnIterator::dict_size() {
-    if (_reader->column_type() == OLAP_FIELD_TYPE_CHAR) {
-        auto dict = down_cast<BinaryPlainPageDecoder<OLAP_FIELD_TYPE_CHAR>*>(_dict_decoder.get());
+    if (_reader->column_type() == TYPE_CHAR) {
+        auto dict = down_cast<BinaryPlainPageDecoder<TYPE_CHAR>*>(_dict_decoder.get());
         return static_cast<int>(dict->dict_size());
-    } else if (_reader->column_type() == OLAP_FIELD_TYPE_VARCHAR) {
-        auto dict = down_cast<BinaryPlainPageDecoder<OLAP_FIELD_TYPE_VARCHAR>*>(_dict_decoder.get());
+    } else if (_reader->column_type() == TYPE_VARCHAR) {
+        auto dict = down_cast<BinaryPlainPageDecoder<TYPE_VARCHAR>*>(_dict_decoder.get());
         return static_cast<int>(dict->dict_size());
     }
     __builtin_unreachable();

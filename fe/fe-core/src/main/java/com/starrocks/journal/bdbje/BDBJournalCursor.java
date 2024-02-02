@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/journal/bdbje/BDBJournalCursor.java
 
@@ -38,7 +51,6 @@ import org.apache.logging.log4j.Logger;
 
 import java.io.ByteArrayInputStream;
 import java.io.DataInputStream;
-import java.io.IOException;
 import java.util.List;
 
 public class BDBJournalCursor implements JournalCursor {
@@ -46,20 +58,19 @@ public class BDBJournalCursor implements JournalCursor {
     private static final int RETRY_TIME = 3;
     private static final long SLEEP_INTERVAL_SEC = 3;
 
-    private long toKey;
+    private final long toKey;
     private long nextKey;
-    private BDBEnvironment environment;
-    // names of all local databases, will set on initialization, and will update every time `prelong()` is called
+    private final BDBEnvironment environment;
+    // names of all local databases, will set on initialization, and will update every time `refresh()` is called
     protected List<Long> localDBNames = null;
     // index of next db to be opened
     protected int nextDbPositionIndex = -1;
     // the database of current log
     protected CloseSafeDatabase database = null;
-    private String prefix;
+    private final String prefix;
 
     /**
      * handle DatabaseException carefully
-     *
      * 1. wrap as JournalException and return if it's a normal DatabaseException.
      * 2. RestartRequiredException is a fatal error since we're replaying as a follower, we must exit by raising an
      * JournalInconsistentException. Same with EnvironmentFailureException when replicated environment is invalid.
@@ -99,13 +110,13 @@ public class BDBJournalCursor implements JournalCursor {
 
     /**
      * init journal cursor
-     * if toKey = -1(CUROSR_END_KEY), it will automatically search the end.
+     * if toKey = -1(CURSOR_END_KEY), it will automatically search the end.
      */
     public static BDBJournalCursor getJournalCursor(BDBEnvironment env, String prefix, long fromKey, long toKey)
             throws JournalException, JournalInconsistentException, InterruptedException {
         if (fromKey < 0  // fromKey must be a positive number
                 || (toKey > 0 && toKey < fromKey)  // if toKey is a positive number, it must be smaller than fromKey
-                || (toKey <= 0 && toKey != JournalCursor.CUROSR_END_KEY)  // if toKey is a negative number, it must be END
+                || (toKey <= 0 && toKey != JournalCursor.CURSOR_END_KEY)  // if toKey is a negative number, it must be END
             ) {
             throw new JournalException(String.format("Invalid key range! fromKey %s toKey %s", fromKey, toKey));
         }
@@ -116,7 +127,6 @@ public class BDBJournalCursor implements JournalCursor {
 
     /**
      * calculate the index of next db to be opened
-     *
      * there are two cases:
      * 1. if this is the first time, we're actually looking for the db of nextKey
      * 2. otherwise, we've already opened a db for previous key. Now we're looking for the next db of the previous key
@@ -182,7 +192,7 @@ public class BDBJournalCursor implements JournalCursor {
         }
 
         // 3. update db index
-        LOG.info("update dbnames {} -> {}", localDBNames, dbNames);
+        LOG.info("update dbNames {} -> {}", localDBNames, dbNames);
         localDBNames = dbNames;
         calculateNextDbIndex();
     }
@@ -207,12 +217,12 @@ public class BDBJournalCursor implements JournalCursor {
             database = null;
         }
 
-        String dbName = prefix + Long.toString(localDBNames.get(nextDbPositionIndex));
+        String dbName = prefix + localDBNames.get(nextDbPositionIndex);
         JournalException exception = null;
         for (int i = 0; i < RETRY_TIME; ++ i) {
             try {
                 if (i != 0) {
-                    Thread.sleep(SLEEP_INTERVAL_SEC * 1000);
+                    Thread.sleep(SLEEP_INTERVAL_SEC * 1000L);
                 }
 
                 database = environment.openDatabase(dbName);
@@ -226,7 +236,9 @@ public class BDBJournalCursor implements JournalCursor {
         }
 
         // failed after retry
-        throw exception;
+        if (exception != null) {
+            throw exception;
+        }
     }
 
     protected JournalEntity deserializeData(DatabaseEntry data) throws JournalException {
@@ -234,13 +246,13 @@ public class BDBJournalCursor implements JournalCursor {
         JournalEntity ret = new JournalEntity();
         try {
             ret.readFields(in);
-        } catch (IOException e) {
+        } catch (Throwable t) {
             // bad data, will not retry
             String errMsg = String.format("fail to read journal entity key=%s, data=%s",
                     nextKey, data);
-            LOG.error(errMsg, e);
-            JournalException exception = new JournalException(errMsg);
-            exception.initCause(e);
+            LOG.error(errMsg, t);
+            JournalException exception = new JournalException(ret.getOpCode(), errMsg);
+            exception.initCause(t);
             throw exception;
         }
         return ret;
@@ -268,7 +280,7 @@ public class BDBJournalCursor implements JournalCursor {
         for (int i = 0; i < RETRY_TIME; i++) {
             // 1. sleep after retry
             if (i != 0) {
-                Thread.sleep(SLEEP_INTERVAL_SEC * 1000);
+                Thread.sleep(SLEEP_INTERVAL_SEC * 1000L);
             }
 
             // 2. read from bdb & error handling
@@ -282,7 +294,7 @@ public class BDBJournalCursor implements JournalCursor {
                     return entity;
                 } else if (operationStatus == OperationStatus.NOTFOUND) {
                     // read until there is no more log exists, return
-                    if (toKey == JournalCursor.CUROSR_END_KEY) {
+                    if (toKey == JournalCursor.CURSOR_END_KEY) {
                         return null;
                     }
                     // In the case:
@@ -293,8 +305,8 @@ public class BDBJournalCursor implements JournalCursor {
                     // and try to replay it. We will first get LockTimeoutException (because the transaction
                     // is hanging and waiting to be aborted after timeout). and after this log abort,
                     // we will get NOTFOUND.
-                    // So we simply throw a exception and let the replayer get the max id again.
-                    LOG.warn("canot find journal {} in db {}, maybe because master switched, will try again.",
+                    // So we simply throw an exception and let the replayer get the max id again.
+                    LOG.warn("cannot find journal {} in db {}, maybe because master switched, will try again.",
                             key, database);
                     return null;
                 } else {

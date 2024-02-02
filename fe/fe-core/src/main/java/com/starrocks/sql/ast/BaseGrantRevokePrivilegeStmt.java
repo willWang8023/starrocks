@@ -1,62 +1,89 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.ast;
 
-import com.starrocks.analysis.DdlStmt;
-import com.starrocks.analysis.ResourcePattern;
-import com.starrocks.analysis.TablePattern;
-import com.starrocks.analysis.UserIdentity;
-import com.starrocks.mysql.privilege.PrivBitSet;
+import com.starrocks.analysis.FunctionName;
+import com.starrocks.common.Pair;
+import com.starrocks.privilege.ObjectType;
+import com.starrocks.privilege.PEntryObject;
+import com.starrocks.privilege.PrivilegeType;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.util.List;
 
 public class BaseGrantRevokePrivilegeStmt extends DdlStmt {
+    protected GrantRevokeClause clause;
+    protected GrantRevokePrivilegeObjects objectsUnResolved;
+    private boolean isGrantOnAll = false;
+
     protected String role;
-    protected UserIdentity userIdentity;
-    protected String privType;
-    protected List<String> privList;
+    protected String objectTypeUnResolved;
+    protected List<String> privilegeTypeUnResolved;
 
-    private List<String> privilegeObjectNameTokenList = null;
-    private TablePattern tblPattern = null;
-    private ResourcePattern resourcePattern = null;
-    private UserIdentity userPrivilegeObject = null;
-    // the following fields is set by analyzer
-    private PrivBitSet privBitSet = null;
+    // the following fields is set by analyzer, for new RBAC privilege framework
+    private ObjectType objectType;
+    private List<PrivilegeType> privilegeTypes;
+    private List<PEntryObject> objectList;
 
-    public BaseGrantRevokePrivilegeStmt(List<String> privList, String privType, UserIdentity userIdentity) {
-        this.privList = privList;
-        this.privType = privType;
-        this.userIdentity = userIdentity;
-        this.role = null;
+    public BaseGrantRevokePrivilegeStmt(
+            List<String> privilegeTypeUnResolved,
+            String objectTypeUnResolved,
+            GrantRevokeClause clause,
+            GrantRevokePrivilegeObjects objects) {
+        this(privilegeTypeUnResolved, objectTypeUnResolved, clause, objects, NodePosition.ZERO);
     }
 
-    public BaseGrantRevokePrivilegeStmt(List<String> privList, String privType, String roleName) {
-        this.privList = privList;
-        this.privType = privType;
-        this.userIdentity = null;
-        this.role = roleName;
+    public BaseGrantRevokePrivilegeStmt(
+            List<String> privilegeTypeUnResolved,
+            String objectTypeUnResolved,
+            GrantRevokeClause clause,
+            GrantRevokePrivilegeObjects objectsUnResolved, NodePosition pos) {
+        super(pos);
+        this.privilegeTypeUnResolved = privilegeTypeUnResolved;
+        this.objectTypeUnResolved = objectTypeUnResolved;
+        this.clause = clause;
+        this.objectsUnResolved = objectsUnResolved;
+        this.role = clause.getRoleName();
     }
 
-    public void setAnalysedTable(PrivBitSet privBitSet, TablePattern tablePattern) {
-        this.privBitSet = privBitSet;
-        this.tblPattern = tablePattern;
+    /**
+     * old privilege framework only support grant/revoke on one single object
+     */
+    public UserIdentity getUserPrivilegeObject() {
+        return objectsUnResolved.getUserPrivilegeObjectList().get(0);
     }
 
-    public void setAnalysedResource(PrivBitSet privBitSet, ResourcePattern resourcePattern) {
-        this.privBitSet = privBitSet;
-        this.resourcePattern = resourcePattern;
+    public List<List<String>> getPrivilegeObjectNameTokensList() {
+        return objectsUnResolved.getPrivilegeObjectNameTokensList();
     }
 
-    public void setUserPrivilegeObject(UserIdentity userPrivilegeObject) {
-        this.userPrivilegeObject = userPrivilegeObject;
+    public List<UserIdentity> getUserPrivilegeObjectList() {
+        return objectsUnResolved.getUserPrivilegeObjectList();
     }
 
-    public void setPrivilegeObjectNameTokenList(List<String> privilegeObjectNameTokenList) {
-        this.privilegeObjectNameTokenList = privilegeObjectNameTokenList;
+    public List<Pair<FunctionName, FunctionArgsDef>> getFunctions() {
+        return objectsUnResolved.getFunctions();
     }
 
-    public void setPrivBitSet(PrivBitSet privBitSet) {
-        this.privBitSet = privBitSet;
+    public boolean isGrantOnALL() {
+        return isGrantOnAll;
+    }
+
+    public void setGrantOnAll() {
+        isGrantOnAll = true;
     }
 
     public void setRole(String role) {
@@ -68,44 +95,43 @@ public class BaseGrantRevokePrivilegeStmt extends DdlStmt {
     }
 
     public UserIdentity getUserIdentity() {
-        return userIdentity;
+        return clause.getUserIdentity();
     }
 
-    public String getPrivType() {
-        return privType;
+    public String getObjectTypeUnResolved() {
+        return objectTypeUnResolved;
     }
 
-    public List<String> getPrivList() {
-        return privList;
+    public List<String> getPrivilegeTypeUnResolved() {
+        return privilegeTypeUnResolved;
     }
 
-    public TablePattern getTblPattern() {
-        return tblPattern;
+    public ObjectType getObjectType() {
+        return objectType;
     }
 
-    public ResourcePattern getResourcePattern() {
-        return resourcePattern;
+    public void setObjectType(ObjectType objectType) {
+        this.objectType = objectType;
     }
 
-    public List<String> getPrivilegeObjectNameTokenList() {
-        return privilegeObjectNameTokenList;
+    public List<PrivilegeType> getPrivilegeTypes() {
+        return privilegeTypes;
     }
 
-    public UserIdentity getUserPrivilegeObject() {
-        return userPrivilegeObject;
+    public void setPrivilegeTypes(List<PrivilegeType> privilegeTypes) {
+        this.privilegeTypes = privilegeTypes;
     }
 
-    public PrivBitSet getPrivBitSet() {
-        return privBitSet;
+    public List<PEntryObject> getObjectList() {
+        return objectList;
+    }
+
+    public void setObjectList(List<PEntryObject> objectList) {
+        this.objectList = objectList;
     }
 
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitGrantRevokePrivilegeStatement(this, context);
-    }
-
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
     }
 }

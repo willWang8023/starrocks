@@ -1,12 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.ast;
 
-import com.google.common.collect.Maps;
-import com.starrocks.analysis.DdlStmt;
 import com.starrocks.analysis.RedirectStatus;
-
-import java.util.Map;
+import com.starrocks.sql.parser.NodePosition;
 
 // admin set frontend config ("key" = "value");
 public class AdminSetConfigStmt extends DdlStmt {
@@ -17,22 +27,20 @@ public class AdminSetConfigStmt extends DdlStmt {
     }
 
     private final ConfigType type;
-    private Map<String, String> configs;
+    private Property config;
 
-    public AdminSetConfigStmt(ConfigType type, Map<String, String> configs) {
+    public AdminSetConfigStmt(ConfigType type, Property config, NodePosition pos) {
+        super(pos);
         this.type = type;
-        this.configs = configs;
-        if (this.configs == null) {
-            this.configs = Maps.newHashMap();
-        }
+        this.config = config;
     }
 
     public ConfigType getType() {
         return type;
     }
 
-    public Map<String, String> getConfigs() {
-        return configs;
+    public Property getConfig() {
+        return config;
     }
 
     @Override
@@ -43,10 +51,5 @@ public class AdminSetConfigStmt extends DdlStmt {
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitAdminSetConfigStatement(this, context);
-    }
-
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
     }
 }

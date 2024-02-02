@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "fs/fs_starlet.h"
 
@@ -18,32 +30,55 @@ namespace starrocks {
 
 class StarletFileSystemTest : public ::testing::TestWithParam<std::string> {
 public:
-    StarletFileSystemTest() { srand(time(NULL)); }
+    StarletFileSystemTest() { srand(time(nullptr)); }
     ~StarletFileSystemTest() override = default;
+
     void SetUp() override {
+        if (config::object_storage_access_key_id.empty()) {
+            _is_skipped = true;
+            GTEST_SKIP() << "Need set object_storage_access_key_id in be_test.conf";
+        }
+        if (config::object_storage_secret_access_key.empty()) {
+            _is_skipped = true;
+            GTEST_SKIP() << "Need set object_storage_secret_access_key in be_test.conf";
+        }
+        if (config::object_storage_endpoint.empty()) {
+            _is_skipped = true;
+            GTEST_SKIP() << "Need set object_storage_endpoint in be_test.conf";
+        }
+        if (config::object_storage_bucket.empty()) {
+            _is_skipped = true;
+            GTEST_SKIP() << "Need set object_storage_bucket in be_test.conf";
+        }
+
         std::string test_type = GetParam();
 
         staros::starlet::fslib::register_builtin_filesystems();
         staros::starlet::ShardInfo shard_info;
         shard_info.id = 10086;
-        shard_info.obj_store_info.s3_obj_store.uri =
-                fmt::format("s3://starrocks-test-bucket/{}.{}/", time(NULL), rand());
-        shard_info.obj_store_info.s3_obj_store.access_key = "5LXNPOQY3KB1LH4X4UQ6";
-        shard_info.obj_store_info.s3_obj_store.access_key_secret = "EhniJDQcMAFQwpulH1jLomfu1b+VaJboCJO+Cytb";
-        shard_info.obj_store_info.s3_obj_store.endpoint = "172.26.92.205:39000";
-        shard_info.obj_store_info.s3_obj_store.region = "us-east-1";
+        auto fs_info = shard_info.path_info.mutable_fs_info();
+        fs_info->set_fs_type(staros::FileStoreType::S3);
+        auto s3_fs_info = fs_info->mutable_s3_fs_info();
+        s3_fs_info->set_bucket(config::object_storage_bucket);
+        s3_fs_info->set_endpoint(config::object_storage_endpoint);
+        s3_fs_info->set_region("us-east-1");
+        auto credential = s3_fs_info->mutable_credential();
+        auto simple_credential = credential->mutable_simple_credential();
+        simple_credential->set_access_key(config::object_storage_access_key_id);
+        simple_credential->set_access_key_secret(config::object_storage_secret_access_key);
+        // set full path
+        shard_info.path_info.set_full_path(absl::StrFormat("s3://%s/%d/", s3_fs_info->bucket(), time(NULL)));
 
         // cache settings
-        shard_info.cache_setting.enable_cache = false;
-        shard_info.cache_setting.cache_entry_ttl_sec = 10;
-        shard_info.cache_setting.allow_async_write_back = false;
+        shard_info.cache_info.set_enable_cache(false);
+        shard_info.cache_info.set_async_write_back(false);
 
         shard_info.properties["storageGroup"] = "10010";
 
         if (test_type == "cachefs") {
-            shard_info.cache_setting.enable_cache = true;
+            shard_info.cache_info.set_enable_cache(true);
             std::string tmpl("/tmp/sr_starlet_ut_XXXXXX");
-            EXPECT_TRUE(::mkdtemp(tmpl.data()) != NULL);
+            EXPECT_TRUE(::mkdtemp(tmpl.data()) != nullptr);
             config::starlet_cache_dir = tmpl;
         }
 
@@ -55,6 +90,9 @@ public:
         fs->delete_dir_recursive(StarletPath("/"));
     }
     void TearDown() override {
+        if (_is_skipped) {
+            return;
+        }
         (void)g_worker->remove_shard(10086);
         g_worker.reset();
         std::string test_type = GetParam();
@@ -75,6 +113,9 @@ public:
             EXPECT_EQ(expected_is_dir, status_or.value());
         }
     }
+
+public:
+    bool _is_skipped = false;
 };
 
 TEST_P(StarletFileSystemTest, test_build_and_parse_uri) {
@@ -124,7 +165,8 @@ TEST_P(StarletFileSystemTest, test_write_and_read) {
     EXPECT_EQ("lo world!", std::string_view(buf, nr));
 
     EXPECT_OK(fs->delete_file(uri));
-    EXPECT_TRUE(fs->new_random_access_file(uri).status().is_not_found());
+    ASSIGN_OR_ABORT(rf, fs->new_random_access_file(uri));
+    EXPECT_TRUE(rf->read_at(0, buf, sizeof(buf)).status().is_not_found());
 }
 
 TEST_P(StarletFileSystemTest, test_directory) {
@@ -293,6 +335,67 @@ TEST_P(StarletFileSystemTest, test_delete_dir_recursive) {
 TEST_P(StarletFileSystemTest, test_delete_nonexist_file) {
     ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(StarletPath("/")));
     ASSERT_OK(fs->delete_file(StarletPath("/nonexist.dat")));
+}
+
+TEST_P(StarletFileSystemTest, test_delete_files) {
+    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateSharedFromString(StarletPath("/")));
+
+    auto uri1 = StarletPath("/f1");
+    ASSIGN_OR_ABORT(auto wf1, fs->new_writable_file(uri1));
+    EXPECT_OK(wf1->append("hello"));
+    EXPECT_OK(wf1->append(" world!"));
+    EXPECT_OK(wf1->sync());
+    EXPECT_OK(wf1->close());
+    EXPECT_EQ(sizeof("hello world!"), wf1->size() + 1);
+    EXPECT_OK(fs->path_exists(uri1));
+
+    auto uri2 = StarletPath("/f2");
+    ASSIGN_OR_ABORT(auto wf2, fs->new_writable_file(uri2));
+    EXPECT_OK(wf2->append("hello"));
+    EXPECT_OK(wf2->append(" world!"));
+    EXPECT_OK(wf2->sync());
+    EXPECT_OK(wf2->close());
+    EXPECT_EQ(sizeof("hello world!"), wf2->size() + 1);
+    EXPECT_OK(fs->path_exists(uri2));
+
+    EXPECT_OK(fs->path_exists(uri1));
+    EXPECT_OK(fs->path_exists(uri2));
+
+    std::vector<std::string> paths;
+    EXPECT_OK(fs->delete_files(paths));
+
+    paths.emplace_back(uri1);
+    paths.emplace_back(uri2);
+    EXPECT_OK(fs->delete_files(paths));
+    EXPECT_TRUE(fs->path_exists(uri1).is_not_found());
+    EXPECT_TRUE(fs->path_exists(uri2).is_not_found());
+
+    staros::starlet::fslib::register_builtin_filesystems();
+    staros::starlet::ShardInfo shard_info;
+    shard_info.id = 10010;
+    auto fs_info = shard_info.path_info.mutable_fs_info();
+    fs_info->set_fs_type(staros::FileStoreType::S3);
+    auto s3_fs_info = fs_info->mutable_s3_fs_info();
+    s3_fs_info->set_bucket(config::object_storage_bucket);
+    s3_fs_info->set_endpoint(config::object_storage_endpoint);
+    s3_fs_info->set_region("us-east-1");
+    auto credential = s3_fs_info->mutable_credential();
+    auto simple_credential = credential->mutable_simple_credential();
+    simple_credential->set_access_key(config::object_storage_access_key_id);
+    simple_credential->set_access_key_secret(config::object_storage_secret_access_key);
+    // set full path
+    shard_info.path_info.set_full_path(absl::StrFormat("s3://%s/%d/", s3_fs_info->bucket(), time(NULL)));
+
+    // cache settings
+    shard_info.cache_info.set_enable_cache(false);
+    shard_info.cache_info.set_async_write_back(false);
+
+    (void)g_worker->add_shard(shard_info);
+
+    auto uri3 = build_starlet_uri(shard_info.id, "/f1");
+    paths.emplace_back(uri3);
+    EXPECT_ERROR(fs->delete_files(paths));
+    (void)g_worker->remove_shard(shard_info.id);
 }
 
 INSTANTIATE_TEST_CASE_P(StarletFileSystem, StarletFileSystemTest,

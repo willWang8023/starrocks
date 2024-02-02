@@ -1,9 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.http.rest;
 
 import com.google.common.base.Strings;
-import com.starrocks.analysis.StatementBase;
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.common.DdlException;
@@ -15,11 +28,15 @@ import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.optimizer.dump.DumpInfo;
+import com.starrocks.sql.optimizer.dump.QueryDumpDeserializer;
 import com.starrocks.sql.optimizer.dump.QueryDumpInfo;
+import com.starrocks.sql.optimizer.dump.QueryDumpSerializer;
 import com.starrocks.sql.parser.SqlParser;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
+import org.apache.commons.lang3.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -35,6 +52,17 @@ public class QueryDumpAction extends RestBaseAction {
     private static final Logger LOG = LogManager.getLogger(QueryDumpAction.class);
     private static final String DB = "db";
 
+    private static final String MOCK = "mock";
+
+    private static final Gson GSON = new GsonBuilder()
+            .addSerializationExclusionStrategy(new GsonUtils.HiddenAnnotationExclusionStrategy())
+            .addDeserializationExclusionStrategy(new GsonUtils.HiddenAnnotationExclusionStrategy())
+            .enableComplexMapKeySerialization()
+            .disableHtmlEscaping()
+            .registerTypeAdapter(QueryDumpInfo.class, new QueryDumpSerializer())
+            .registerTypeAdapter(QueryDumpInfo.class, new QueryDumpDeserializer())
+            .create();
+
     public QueryDumpAction(ActionController controller) {
         super(controller);
     }
@@ -47,6 +75,8 @@ public class QueryDumpAction extends RestBaseAction {
     public void executeWithoutPassword(BaseRequest request, BaseResponse response) throws DdlException {
         ConnectContext context = ConnectContext.get();
         String catalogDbName = request.getSingleParameter(DB);
+        boolean enableMock = request.getSingleParameter(MOCK) == null ||
+                "true".equalsIgnoreCase(StringUtils.trim(request.getSingleParameter(MOCK)));
 
         if (!Strings.isNullOrEmpty(catalogDbName)) {
             String[] catalogDbNames = catalogDbName.split("\\.");
@@ -65,7 +95,7 @@ public class QueryDumpAction extends RestBaseAction {
             }
             context.setDatabase(db.getFullName());
         }
-        context.setIsQueryDump(true);
+        context.setIsHTTPQueryDump(true);
 
         String query = request.getContent();
         if (Strings.isNullOrEmpty(query)) {
@@ -76,7 +106,7 @@ public class QueryDumpAction extends RestBaseAction {
 
         StatementBase parsedStmt;
         try {
-            parsedStmt = SqlParser.parseFirstStatement(query, context.getSessionVariable().getSqlMode());
+            parsedStmt = SqlParser.parse(query, context.getSessionVariable()).get(0);
             StmtExecutor executor = new StmtExecutor(context, parsedStmt);
             executor.execute();
         } catch (Exception e) {
@@ -88,7 +118,8 @@ public class QueryDumpAction extends RestBaseAction {
 
         DumpInfo dumpInfo = context.getDumpInfo();
         if (dumpInfo != null) {
-            response.getContent().append(GsonUtils.GSON.toJson(dumpInfo, QueryDumpInfo.class));
+            dumpInfo.setDesensitizedInfo(enableMock);
+            response.getContent().append(GSON.toJson(dumpInfo, QueryDumpInfo.class));
             sendResult(request, response);
         } else {
             response.getContent().append("not use cbo planner, try again.");

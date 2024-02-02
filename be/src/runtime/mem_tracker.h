@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/mem_tracker.h
 
@@ -22,6 +35,8 @@
 #pragma once
 
 #include <cstdint>
+#include <cstdio>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <unordered_map>
@@ -77,7 +92,18 @@ public:
         int64_t peak_consumption = 0;
     };
 
-    enum Type { NO_SET, PROCESS, QUERY_POOL, QUERY, LOAD, CONSISTENCY, COMPACTION, SCHEMA_CHANGE_TASK };
+    enum Type {
+        NO_SET,
+        PROCESS,
+        QUERY_POOL,
+        QUERY,
+        LOAD,
+        CONSISTENCY,
+        COMPACTION,
+        SCHEMA_CHANGE_TASK,
+        RESOURCE_GROUP,
+        RESOURCE_GROUP_BIG_QUERY
+    };
 
     /// 'byte_limit' < 0 means no limit
     /// 'label' is the label used in the usage string (LogUsage())
@@ -91,8 +117,9 @@ public:
 
     /// C'tor for tracker for which consumption counter is created as part of a profile.
     /// The counter is created with name COUNTER_NAME.
-    MemTracker(RuntimeProfile* profile, int64_t byte_limit, std::string label = std::string(),
-               MemTracker* parent = nullptr);
+    explicit MemTracker(RuntimeProfile* profile, std::tuple<bool, bool, bool> attaching_info = {true, true, true},
+                        const std::string& counter_name_prefix = std::string(), int64_t byte_limit = -1,
+                        std::string label = std::string(), MemTracker* parent = nullptr);
 
     ~MemTracker();
 
@@ -106,6 +133,20 @@ public:
 
     // used for single mem_tracker
     void set(int64_t bytes) { _consumption->set(bytes); }
+
+    void update_allocation(int64_t bytes) {
+        if (bytes <= 0) return;
+        for (auto* tracker : _all_trackers) {
+            tracker->_allocation->update(bytes);
+        }
+    }
+
+    void update_deallocation(int64_t bytes) {
+        if (bytes <= 0) return;
+        for (auto* tracker : _all_trackers) {
+            tracker->_deallocation->update(bytes);
+        }
+    }
 
     void consume(int64_t bytes) {
         if (bytes <= 0) {
@@ -152,7 +193,7 @@ public:
     /// Increases consumption of this tracker and its ancestors by 'bytes' only if
     /// they can all consume 'bytes'. If this brings any of them over, none of them
     /// are updated.
-    /// Returns true if the try succeeded.
+    /// Returns nullptr if the try succeeded, otherwise return the tracker that failed.
     WARN_UNUSED_RESULT
     MemTracker* try_consume(int64_t bytes) {
         if (UNLIKELY(bytes <= 0)) return nullptr;
@@ -164,6 +205,36 @@ public:
             if (limit < 0) {
                 tracker->_consumption->add(bytes); // No limit at this tracker.
             } else {
+                if (LIKELY(tracker->_consumption->try_add(bytes, limit))) {
+                    continue;
+                } else {
+                    // Failed for this mem tracker. Roll back the ones that succeeded.
+                    for (int64_t j = _all_trackers.size() - 1; j > i; --j) {
+                        _all_trackers[j]->_consumption->add(-bytes);
+                    }
+                    return tracker;
+                }
+            }
+        }
+        // Everyone succeeded, return.
+        DCHECK_EQ(i, -1);
+        return nullptr;
+    }
+
+    WARN_UNUSED_RESULT
+    MemTracker* try_consume_with_limited(int64_t bytes) {
+        if (UNLIKELY(bytes <= 0)) return nullptr;
+        int64_t i;
+        // Walk the tracker tree top-down.
+        for (i = _all_trackers.size() - 1; i >= 0; --i) {
+            MemTracker* tracker = _all_trackers[i];
+            if (tracker->limit() < 0) {
+                tracker->_consumption->add(bytes); // No limit at this tracker.
+            } else {
+                int64_t limit = tracker->reserve_limit();
+                if (limit == -1) {
+                    limit = tracker->limit();
+                }
                 if (LIKELY(tracker->_consumption->try_add(bytes, limit))) {
                     continue;
                 } else {
@@ -225,11 +296,19 @@ public:
 
     bool limit_exceeded() const { return _limit >= 0 && _limit < consumption(); }
 
+    bool limit_exceeded_by_ratio(int64_t ratio) const { return _limit >= 0 && (_limit * ratio / 100) < consumption(); }
+
     void set_limit(int64_t limit) { _limit = limit; }
 
     int64_t limit() const { return _limit; }
 
     bool has_limit() const { return _limit >= 0; }
+
+    void set_reserve_limit(int64_t reserve_limit) { _reserve_limit = reserve_limit; }
+
+    int64_t reserve_limit() const { return _reserve_limit; }
+
+    bool has_reserve_limit() const { return _reserve_limit >= 0; }
 
     const std::string& label() const { return _label; }
 
@@ -248,6 +327,8 @@ public:
     int64_t consumption() const { return _consumption->current_value(); }
 
     int64_t peak_consumption() const { return _consumption->value(); }
+    int64_t allocation() const { return _allocation->value(); }
+    int64_t deallocation() const { return _deallocation->value(); }
 
     MemTracker* parent() const { return _parent; }
 
@@ -255,12 +336,17 @@ public:
 
     std::string err_msg(const std::string& msg) const;
 
-    static const std::string COUNTER_NAME;
+    static const std::string PEAK_MEMORY_USAGE;
+    static const std::string ALLOCATED_MEMORY_USAGE;
+    static const std::string DEALLOCATED_MEMORY_USAGE;
 
     std::string debug_string() {
         std::stringstream msg;
         msg << "limit: " << _limit << "; "
+            << "reserve_limit: " << _reserve_limit << "; "
             << "consumption: " << _consumption->current_value() << "; "
+            << "allocation: " << _allocation->value() << "; "
+            << "deallocation: " << _deallocation->value() << "; "
             << "label: " << _label << "; "
             << "all tracker size: " << _all_trackers.size() << "; "
             << "limit trackers size: " << _limit_trackers.size() << "; "
@@ -268,7 +354,17 @@ public:
         return msg.str();
     }
 
+    // no any memory allocate
+    size_t debug_string(char* dst, size_t max_length) {
+        return snprintf(dst, max_length, "tracker:%s consumption: %ld\n", _label.c_str(),
+                        _consumption->current_value());
+    }
+
     Type type() const { return _type; }
+
+    std::list<MemTracker*> _child_trackers;
+
+    std::list<MemTracker*> getChild() { return _child_trackers; }
 
 private:
     // Walks the MemTracker hierarchy and populates _all_trackers and _limit_trackers
@@ -282,7 +378,8 @@ private:
 
     Type _type{NO_SET};
 
-    int64_t _limit; // in bytes
+    int64_t _limit;              // in bytes
+    int64_t _reserve_limit = -1; // only used in spillable query
 
     std::string _label;
     MemTracker* _parent;
@@ -291,7 +388,21 @@ private:
     RuntimeProfile::HighWaterMarkCounter* _consumption;
 
     /// holds _consumption counter if not tied to a profile
-    RuntimeProfile::HighWaterMarkCounter _local_counter;
+    RuntimeProfile::HighWaterMarkCounter _local_consumption_counter;
+
+    /// in bytes; not owned. Only record allocation but ignore deallocation
+    /// And for sake of performance, it can only be updated through `update_allocation`
+    RuntimeProfile::Counter* _allocation;
+
+    /// holds _allocation counter if not tied to a profile
+    RuntimeProfile::Counter _local_allocation_counter;
+
+    /// in bytes; not owned. Only record deallocation but ignore allocation
+    /// And for sake of performance, it can only be updated through `update_deallocation`
+    RuntimeProfile::Counter* _deallocation;
+
+    /// holds _deallocation counter if not tied to a profile
+    RuntimeProfile::Counter _local_deallocation_counter;
 
     std::vector<MemTracker*> _all_trackers;   // this tracker plus all of its ancestors
     std::vector<MemTracker*> _limit_trackers; // _all_trackers with valid limits
@@ -299,7 +410,6 @@ private:
     // All the child trackers of this tracker. Used for error reporting only.
     // i.e., Updating a parent tracker does not update the children.
     mutable std::mutex _child_trackers_lock;
-    std::list<MemTracker*> _child_trackers;
     // Iterator into _parent->_child_trackers for this object. Stored to have O(1)
     // remove.
     std::list<MemTracker*>::iterator _child_tracker_it;

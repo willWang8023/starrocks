@@ -1,16 +1,28 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/chunk_aggregator.h"
 
 #include "common/config.h"
-#include "exec/vectorized/sorting/sorting.h"
+#include "exec/sorting/sorting.h"
 #include "gutil/casts.h"
 #include "storage/column_aggregate_func.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-ChunkAggregator::ChunkAggregator(const starrocks::vectorized::Schema* schema, uint32_t reserve_rows,
-                                 uint32_t max_aggregate_rows, double factor, bool is_vertical_merge, bool is_key)
+ChunkAggregator::ChunkAggregator(const starrocks::Schema* schema, uint32_t reserve_rows, uint32_t max_aggregate_rows,
+                                 double factor, bool is_vertical_merge, bool is_key)
         : _schema(schema),
           _reserve_rows(reserve_rows),
           _max_aggregate_rows(max_aggregate_rows),
@@ -22,9 +34,6 @@ ChunkAggregator::ChunkAggregator(const starrocks::vectorized::Schema* schema, ui
     // ensure that the key fields are sorted by id and placed before others.
     for (size_t i = 0; i < _schema->num_key_fields(); i++) {
         CHECK(_schema->field(i)->is_key());
-    }
-    for (size_t i = 0; i + 1 < _schema->num_key_fields(); i++) {
-        CHECK_LT(_schema->field(i)->id(), _schema->field(i + 1)->id());
     }
 #endif
     _key_fields = _schema->num_key_fields();
@@ -190,8 +199,8 @@ void ChunkAggregator::aggregate_reset() {
     }
     _has_aggregate = false;
 
-    _element_memory_usage = 0;
-    _element_memory_usage_num_rows = 0;
+    _reference_memory_usage = 0;
+    _reference_memory_usage_num_rows = 0;
     _bytes_usage = 0;
     _bytes_usage_num_rows = 0;
 }
@@ -220,16 +229,16 @@ size_t ChunkAggregator::memory_usage() {
     }
     --num_rows;
 
-    if (_element_memory_usage_num_rows == num_rows) {
-        return container_memory_usage + _element_memory_usage;
-    } else if (_element_memory_usage_num_rows > num_rows) {
-        _element_memory_usage_num_rows = 0;
-        _element_memory_usage = 0;
+    if (_reference_memory_usage_num_rows == num_rows) {
+        return container_memory_usage + _reference_memory_usage;
+    } else if (_reference_memory_usage_num_rows > num_rows) {
+        _reference_memory_usage_num_rows = 0;
+        _reference_memory_usage = 0;
     }
-    _element_memory_usage += _aggregate_chunk->element_memory_usage(_element_memory_usage_num_rows,
-                                                                    num_rows - _element_memory_usage_num_rows);
-    _element_memory_usage_num_rows = num_rows;
-    return container_memory_usage + _element_memory_usage;
+    _reference_memory_usage += _aggregate_chunk->reference_memory_usage(_reference_memory_usage_num_rows,
+                                                                        num_rows - _reference_memory_usage_num_rows);
+    _reference_memory_usage_num_rows = num_rows;
+    return container_memory_usage + _reference_memory_usage;
 }
 
 size_t ChunkAggregator::bytes_usage() {
@@ -259,4 +268,4 @@ size_t ChunkAggregator::bytes_usage() {
 
 void ChunkAggregator::close() {}
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

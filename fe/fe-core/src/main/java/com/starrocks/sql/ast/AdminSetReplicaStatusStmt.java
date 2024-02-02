@@ -1,12 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.ast;
 
-import com.starrocks.analysis.DdlStmt;
 import com.starrocks.analysis.RedirectStatus;
 import com.starrocks.catalog.Replica.ReplicaStatus;
-
-import java.util.Map;
+import com.starrocks.sql.parser.NodePosition;
 
 /*
  *  admin set replicas status properties ("key" = "val", ..);
@@ -21,16 +32,17 @@ public class AdminSetReplicaStatusStmt extends DdlStmt {
     public static final String BACKEND_ID = "backend_id";
     public static final String STATUS = "status";
 
-    private final Map<String, String> properties;
+    private final PropertySet properties;
     private long tabletId = -1;
     private long backendId = -1;
     private ReplicaStatus status;
 
-    public AdminSetReplicaStatusStmt(Map<String, String> properties) {
+    public AdminSetReplicaStatusStmt(PropertySet properties, NodePosition pos) {
+        super(pos);
         this.properties = properties;
     }
 
-    public Map<String, String> getProperties() {
+    public PropertySet getProperties() {
         return properties;
     }
 
@@ -66,10 +78,5 @@ public class AdminSetReplicaStatusStmt extends DdlStmt {
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitAdminSetReplicaStatusStatement(this, context);
-    }
-
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
     }
 }

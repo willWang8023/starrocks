@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "io/fd_output_stream.h"
 
@@ -9,6 +21,8 @@
 #include "common/logging.h"
 #include "gutil/macros.h"
 #include "io/io_error.h"
+#include "io/io_profiler.h"
+#include "util/stopwatch.hpp"
 
 namespace starrocks::io {
 
@@ -43,6 +57,8 @@ Status FdOutputStream::write(const void* data, int64_t count) {
     if (UNLIKELY(count < 0)) {
         return Status::InvalidArgument(fmt::format("negative count: {}", count));
     }
+    MonotonicStopWatch watch;
+    watch.start();
     int64_t bytes_written = 0;
     while (bytes_written < count) {
         ssize_t r = ::write(_fd, static_cast<const char*>(data) + bytes_written, count - bytes_written);
@@ -56,6 +72,7 @@ Status FdOutputStream::write(const void* data, int64_t count) {
             }
         }
     }
+    IOProfiler::add_write(bytes_written, watch.elapsed_time());
     return Status::OK();
 }
 

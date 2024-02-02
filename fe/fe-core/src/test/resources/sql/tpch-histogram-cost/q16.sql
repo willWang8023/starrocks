@@ -1,34 +1,3 @@
-[sql]
-select
-    p_brand,
-    p_type,
-    p_size,
-    count(distinct ps_suppkey) as supplier_cnt
-from
-    partsupp,
-    part
-where
-        p_partkey = ps_partkey
-  and p_brand <> 'Brand#43'
-  and p_type not like 'PROMO BURNISHED%'
-  and p_size in (31, 43, 9, 6, 18, 11, 25, 1)
-  and ps_suppkey not in (
-    select
-        s_suppkey
-    from
-        supplier
-    where
-            s_comment like '%Customer%Complaints%'
-)
-group by
-    p_brand,
-    p_type,
-    p_size
-order by
-    supplier_cnt desc,
-    p_brand,
-    p_type,
-    p_size ;
 [fragment statistics]
 PLAN FRAGMENT 0(F06)
 Output Exprs:10: P_BRAND | 11: P_TYPE | 12: P_SIZE | 26: count
@@ -36,6 +5,7 @@ Input Partition: UNPARTITIONED
 RESULT SINK
 
 15:MERGING-EXCHANGE
+distribution type: GATHER
 cardinality: 7119
 column statistics:
 * P_BRAND-->[-Infinity, Infinity, 0.0, 10.0, 25.0] ESTIMATE
@@ -79,6 +49,8 @@ OutPut Exchange Id: 15
 |  * P_SIZE-->[1.0, 43.0, 0.0, 4.0, 8.0] ESTIMATE
 |
 11:EXCHANGE
+distribution type: SHUFFLE
+partition exprs: [10: P_BRAND, VARCHAR, false], [11: P_TYPE, VARCHAR, false], [12: P_SIZE, INT, false]
 cardinality: 6914952
 
 PLAN FRAGMENT 2(F00)
@@ -123,6 +95,7 @@ OutPut Exchange Id: 11
 |  * S_SUPPKEY-->[1.0, 1000000.0, 0.0, 4.0, 250000.0] ESTIMATE
 |
 |----7:EXCHANGE
+|       distribution type: BROADCAST
 |       cardinality: 250000
 |
 4:Project
@@ -154,6 +127,8 @@ OutPut Exchange Id: 11
 |  * P_SIZE-->[1.0, 43.0, 0.0, 4.0, 8.0] ESTIMATE
 |
 |----2:EXCHANGE
+|       distribution type: SHUFFLE
+|       partition exprs: [7: P_PARTKEY, INT, false]
 |       cardinality: 2304984
 |
 0:OlapScanNode

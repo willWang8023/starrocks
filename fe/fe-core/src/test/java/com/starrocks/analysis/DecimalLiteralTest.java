@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/DecimalLiteralTest.java
 
@@ -356,11 +369,7 @@ public class DecimalLiteralTest {
         };
         ScalarType decimal32p9s4 = ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL32, 9, 4);
         for (BigDecimal dec32 : decimal32Values) {
-            try {
-                DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec32, decimal32p9s4);
-                Assert.fail("should throw exception");
-            } catch (Exception ignored) {
-            }
+            Assert.assertFalse(DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec32, decimal32p9s4));
         }
 
         BigDecimal decimal64Values[] = {
@@ -371,11 +380,7 @@ public class DecimalLiteralTest {
         };
         ScalarType decimal64p18s6 = ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL64, 18, 6);
         for (BigDecimal dec64 : decimal64Values) {
-            try {
-                DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec64, decimal64p18s6);
-                Assert.fail("should throw exception");
-            } catch (Exception ignored) {
-            }
+            Assert.assertFalse(DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec64, decimal64p18s6));
         }
 
         BigDecimal decimal128Values[] = {
@@ -386,11 +391,7 @@ public class DecimalLiteralTest {
         };
         ScalarType decimal128p38s11 = ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL128, 38, 11);
         for (BigDecimal dec128 : decimal128Values) {
-            try {
-                DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec128, decimal128p38s11);
-                Assert.fail("should throw exception");
-            } catch (Exception ignored) {
-            }
+            Assert.assertFalse(DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec128, decimal128p38s11));
         }
     }
 
@@ -409,11 +410,7 @@ public class DecimalLiteralTest {
         };
         ScalarType decimal32p9s4 = ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL32, 9, 4);
         for (BigDecimal dec32 : decimal32Values) {
-            try {
-                DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec32, decimal32p9s4);
-            } catch (Exception ignored) {
-                Assert.fail("should not throw exception");
-            }
+            Assert.assertTrue(DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec32, decimal32p9s4));
         }
 
         BigDecimal decimal64Values[] = {
@@ -429,11 +426,7 @@ public class DecimalLiteralTest {
         };
         ScalarType decimal64p18s6 = ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL64, 18, 6);
         for (BigDecimal dec64 : decimal64Values) {
-            try {
-                DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec64, decimal64p18s6);
-            } catch (Exception ignored) {
-                Assert.fail("should not throw exception");
-            }
+            Assert.assertTrue(DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec64, decimal64p18s6));
         }
 
         BigDecimal decimal128Values[] = {
@@ -449,11 +442,7 @@ public class DecimalLiteralTest {
         };
         ScalarType decimal128p38s11 = ScalarType.createDecimalV3Type(PrimitiveType.DECIMAL128, 38, 11);
         for (BigDecimal dec128 : decimal128Values) {
-            try {
-                DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec128, decimal128p38s11);
-            } catch (Exception ignored) {
-                Assert.fail("should not throw exception");
-            }
+            Assert.assertTrue(DecimalLiteral.checkLiteralOverflowInDecimalStyle(dec128, decimal128p38s11));
         }
     }
 

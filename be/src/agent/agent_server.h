@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/agent/agent_server.h
 
@@ -40,20 +53,23 @@ class ThreadPool;
 // Each method corresponds to one RPC from FE Master, see BackendService.
 class AgentServer {
 public:
-    explicit AgentServer(ExecEnv* exec_env);
+    explicit AgentServer(ExecEnv* exec_env, bool is_compute_node);
 
     ~AgentServer();
 
     void init_or_die();
 
+    void stop();
+
     void submit_tasks(TAgentResult& agent_result, const std::vector<TAgentTaskRequest>& tasks);
 
-    // TODO(lingbin): make the agent_result to be a pointer, because it will be modified.
     void make_snapshot(TAgentResult& agent_result, const TSnapshotRequest& snapshot_request);
 
     void release_snapshot(TAgentResult& agent_result, const std::string& snapshot_path);
 
     void publish_cluster_state(TAgentResult& agent_result, const TAgentPublishRequest& request);
+
+    void update_max_thread_by_type(int type, int new_val);
 
     // |type| should be one of `TTaskType::type`, didn't define type as  `TTaskType::type` because
     // I don't want to include the header file `gen_cpp/Types_types.h` here.

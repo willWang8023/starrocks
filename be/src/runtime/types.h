@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2023-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/types.h
 
@@ -24,11 +37,12 @@
 #include <string>
 #include <vector>
 
+#include "common/logging.h"
 #include "gen_cpp/Types_types.h" // for TPrimitiveType
 #include "gen_cpp/types.pb.h"    // for PTypeDesc
-#include "runtime/primitive_type.h"
 #include "thrift/protocol/TDebugProtocol.h"
 #include "types/constexpr.h"
+#include "types/logical_type.h"
 
 namespace starrocks {
 
@@ -37,7 +51,7 @@ class TypeInfo;
 // Describes a type. Includes the enum, children types, and any type-specific metadata
 // (e.g. precision and scale for decimals).
 struct TypeDescriptor {
-    PrimitiveType type{INVALID_TYPE};
+    LogicalType type{TYPE_UNKNOWN};
     /// Only meaningful for type TYPE_CHAR/TYPE_VARCHAR/TYPE_HLL
     int len{-1};
     static constexpr int MAX_VARCHAR_LENGTH = 1048576;
@@ -64,9 +78,9 @@ struct TypeDescriptor {
     /// Only set if type == TYPE_STRUCT. The field name of each child.
     std::vector<std::string> field_names;
 
-    TypeDescriptor() {}
+    TypeDescriptor() = default;
 
-    explicit TypeDescriptor(PrimitiveType type) : type(type), len(-1), precision(-1), scale(-1) {}
+    explicit TypeDescriptor(LogicalType type) : type(type) {}
 
     static TypeDescriptor create_char_type(int len) {
         TypeDescriptor ret;
@@ -82,10 +96,41 @@ struct TypeDescriptor {
         return ret;
     }
 
+    static TypeDescriptor create_varbinary_type(int len) {
+        TypeDescriptor ret;
+        ret.type = TYPE_VARBINARY;
+        ret.len = len;
+        return ret;
+    }
+
     static TypeDescriptor create_json_type() {
         TypeDescriptor res;
         res.type = TYPE_JSON;
         res.len = kJsonDefaultSize;
+        return res;
+    }
+
+    static TypeDescriptor create_array_type(const TypeDescriptor& children) {
+        TypeDescriptor res;
+        res.type = TYPE_ARRAY;
+        res.children.push_back(children);
+        return res;
+    }
+
+    static TypeDescriptor create_map_type(const TypeDescriptor& key, const TypeDescriptor& value) {
+        TypeDescriptor res;
+        res.type = TYPE_MAP;
+        res.children.push_back(key);
+        res.children.push_back(value);
+        return res;
+    }
+
+    static TypeDescriptor create_struct_type(const std::vector<std::string> field_names,
+                                             const std::vector<TypeDescriptor>& filed_types) {
+        TypeDescriptor res;
+        res.type = TYPE_STRUCT;
+        res.field_names = field_names;
+        res.children = filed_types;
         return res;
     }
 
@@ -120,7 +165,7 @@ struct TypeDescriptor {
         return ret;
     }
 
-    static TypeDescriptor create_decimalv3_type(PrimitiveType type, int precision, int scale) {
+    static TypeDescriptor create_decimalv3_type(LogicalType type, int precision, int scale) {
         DCHECK(type == TYPE_DECIMAL32 || type == TYPE_DECIMAL64 || type == TYPE_DECIMAL128);
         DCHECK_LE(precision, MAX_PRECISION);
         DCHECK_LE(scale, MAX_SCALE);
@@ -139,9 +184,9 @@ struct TypeDescriptor {
         return ret;
     }
 
-    static TypeDescriptor from_primtive_type(PrimitiveType type,
-                                             [[maybe_unused]] int len = TypeDescriptor::MAX_VARCHAR_LENGTH,
-                                             [[maybe_unused]] int precision = 27, [[maybe_unused]] int scale = 9) {
+    static TypeDescriptor from_logical_type(LogicalType type,
+                                            [[maybe_unused]] int len = TypeDescriptor::MAX_VARCHAR_LENGTH,
+                                            [[maybe_unused]] int precision = 27, [[maybe_unused]] int scale = 9) {
         switch (type) {
         case TYPE_CHAR:
             return TypeDescriptor::create_char_type(MAX_CHAR_LENGTH);
@@ -176,10 +221,10 @@ struct TypeDescriptor {
 
     static TypeDescriptor from_storage_type_info(TypeInfo* type_info);
 
-    static TypeDescriptor from_protobuf(const PTypeDesc& ptype) {
+    static TypeDescriptor from_protobuf(const PTypeDesc& ltype) {
         int idx = 0;
-        TypeDescriptor result(ptype.types(), &idx);
-        DCHECK_EQ(idx, ptype.types_size());
+        TypeDescriptor result(ltype.types(), &idx);
+        DCHECK_EQ(idx, ltype.types_size());
         return result;
     }
 
@@ -196,17 +241,10 @@ struct TypeDescriptor {
             return true;
         }
         if (is_decimal_type()) {
-            return type == o.type && scale == o.scale;
+            return type == o.type && precision == o.precision && scale == o.scale;
         } else {
             return type == o.type;
         }
-    }
-
-    bool is_implicit_castable(const TypeDescriptor& from) const {
-        if (is_decimal_type()) {
-            return precision == from.precision && scale == from.scale;
-        }
-        return false;
     }
 
     bool operator==(const TypeDescriptor& o) const {
@@ -241,7 +279,7 @@ struct TypeDescriptor {
 
     inline bool is_string_type() const {
         return type == TYPE_VARCHAR || type == TYPE_CHAR || type == TYPE_HLL || type == TYPE_OBJECT ||
-               type == TYPE_PERCENTILE;
+               type == TYPE_PERCENTILE || type == TYPE_VARBINARY;
     }
 
     inline bool is_date_type() const { return type == TYPE_DATE || type == TYPE_DATETIME; }
@@ -254,12 +292,15 @@ struct TypeDescriptor {
         return (type == TYPE_DECIMAL || type == TYPE_DECIMALV2 || is_decimalv3_type());
     }
 
-    inline bool is_var_len_string_type() const {
-        return type == TYPE_VARCHAR || type == TYPE_HLL || type == TYPE_CHAR || type == TYPE_OBJECT ||
-               type == TYPE_PERCENTILE;
-    }
+    inline bool is_unknown_type() const { return type == TYPE_UNKNOWN; }
 
     inline bool is_complex_type() const { return type == TYPE_STRUCT || type == TYPE_ARRAY || type == TYPE_MAP; }
+
+    inline bool is_struct_type() const { return type == TYPE_STRUCT; }
+
+    inline bool is_array_type() const { return type == TYPE_ARRAY; }
+
+    inline bool is_map_type() const { return type == TYPE_MAP; }
 
     inline bool is_collection_type() const { return type == TYPE_ARRAY || type == TYPE_MAP; }
 
@@ -277,6 +318,8 @@ struct TypeDescriptor {
     /// Returns the size of a slot for this type.
     int get_slot_size() const;
 
+    size_t get_flat_size() const;
+
     static inline int get_decimal_byte_size(int precision) {
         DCHECK_GT(precision, 0);
         if (precision <= MAX_DECIMAL4_PRECISION) {
@@ -293,6 +336,8 @@ struct TypeDescriptor {
     /// Recursive implementation of ToThrift() that populates 'thrift_type' with the
     /// TTypeNodes for this type and its children.
     void to_thrift(TTypeDesc* thrift_type) const;
+
+    size_t get_array_depth_limit() const;
 
 private:
     /// Used to create a possibly nested type from the flattened Thrift representation.

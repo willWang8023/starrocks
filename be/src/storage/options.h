@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/options.h
 
@@ -34,7 +47,7 @@ class MemTracker;
 
 struct StorePath {
     StorePath() = default;
-    explicit StorePath(std::string path_) : path(std::move(path_)), storage_medium(TStorageMedium::HDD) {}
+    explicit StorePath(std::string path_) : path(std::move(path_)) {}
     std::string path;
     TStorageMedium::type storage_medium{TStorageMedium::HDD};
 };
@@ -44,6 +57,8 @@ Status parse_root_path(const std::string& root_path, StorePath* path);
 
 Status parse_conf_store_paths(const std::string& config_path, std::vector<StorePath>* path);
 
+Status parse_conf_datacache_paths(const std::string& config_path, std::vector<std::string>* paths);
+
 struct EngineOptions {
     // list paths that tablet will be put into.
     std::vector<StorePath> store_paths;
@@ -51,7 +66,17 @@ struct EngineOptions {
     UniqueId backend_uid{0, 0};
     MemTracker* compaction_mem_tracker = nullptr;
     MemTracker* update_mem_tracker = nullptr;
-    // config path to store cluster_id, used by DummyStorageEngine
-    std::string conf_path;
+    // if start as cn, no need to write cluster id
+    bool need_write_cluster_id = true;
 };
+
+// Options only applies to cloud-native table r/w IO
+struct LakeIOOptions {
+    // Cache remote file locally on read requests.
+    // This options can be ignored if the underlying filesystem does not support local cache.
+    bool fill_data_cache = false;
+    // Specify different buffer size for different read scenarios
+    int64_t buffer_size = -1;
+};
+
 } // namespace starrocks

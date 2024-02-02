@@ -29,19 +29,10 @@ class DiskMetrics;
 class NetMetrics;
 class FileDescriptorMetrics;
 class SnmpMetrics;
+class QueryCacheMetrics;
 
 class MemoryMetrics {
 public:
-#ifndef USE_JEMALLOC
-    // tcmalloc metrics.
-    METRIC_DEFINE_INT_GAUGE(allocated_bytes, MetricUnit::BYTES);
-    METRIC_DEFINE_INT_GAUGE(total_thread_cache_bytes, MetricUnit::BYTES);
-    METRIC_DEFINE_INT_GAUGE(central_cache_free_bytes, MetricUnit::BYTES);
-    METRIC_DEFINE_INT_GAUGE(transfer_cache_free_bytes, MetricUnit::BYTES);
-    METRIC_DEFINE_INT_GAUGE(thread_cache_free_bytes, MetricUnit::BYTES);
-    METRIC_DEFINE_INT_GAUGE(pageheap_free_bytes, MetricUnit::BYTES);
-    METRIC_DEFINE_INT_GAUGE(pageheap_unmapped_bytes, MetricUnit::BYTES);
-#else
     METRIC_DEFINE_INT_GAUGE(jemalloc_allocated_bytes, MetricUnit::BYTES);
     METRIC_DEFINE_INT_GAUGE(jemalloc_active_bytes, MetricUnit::BYTES);
     METRIC_DEFINE_INT_GAUGE(jemalloc_metadata_bytes, MetricUnit::BYTES);
@@ -49,7 +40,7 @@ public:
     METRIC_DEFINE_INT_GAUGE(jemalloc_resident_bytes, MetricUnit::BYTES);
     METRIC_DEFINE_INT_GAUGE(jemalloc_mapped_bytes, MetricUnit::BYTES);
     METRIC_DEFINE_INT_GAUGE(jemalloc_retained_bytes, MetricUnit::BYTES);
-#endif
+
     // MemPool metrics
     METRIC_DEFINE_INT_GAUGE(process_mem_bytes, MetricUnit::BYTES);
     METRIC_DEFINE_INT_GAUGE(query_mem_bytes, MetricUnit::BYTES);
@@ -74,6 +65,7 @@ public:
     METRIC_DEFINE_INT_GAUGE(chunk_allocator_mem_bytes, MetricUnit::BYTES);
     METRIC_DEFINE_INT_GAUGE(clone_mem_bytes, MetricUnit::BYTES);
     METRIC_DEFINE_INT_GAUGE(consistency_mem_bytes, MetricUnit::BYTES);
+    METRIC_DEFINE_INT_GAUGE(datacache_mem_bytes, MetricUnit::BYTES);
 
     // column pool metrics.
     METRIC_DEFINE_INT_GAUGE(column_pool_total_bytes, MetricUnit::BYTES);
@@ -134,7 +126,12 @@ private:
     void _update_fd_metrics();
 
     void _install_snmp_metrics(MetricRegistry* registry);
+
     void _update_snmp_metrics();
+
+    void _install_query_cache_metrics(MetricRegistry* registry);
+
+    void _update_query_cache_metrics();
 
 private:
     static const char* const _s_hook_name;
@@ -144,6 +141,7 @@ private:
     std::map<std::string, DiskMetrics*> _disk_metrics;
     std::map<std::string, NetMetrics*> _net_metrics;
     std::unique_ptr<FileDescriptorMetrics> _fd_metrics;
+    std::unique_ptr<QueryCacheMetrics> _query_cache_metrics;
     int _proc_net_dev_version = 0;
     std::unique_ptr<SnmpMetrics> _snmp_metrics;
 

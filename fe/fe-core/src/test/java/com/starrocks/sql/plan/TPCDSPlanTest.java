@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.plan;
 
@@ -21,6 +34,7 @@ public class TPCDSPlanTest extends TPCDSPlanTestBase {
 
     @Before
     public void setUp() {
+        super.setUp();
         tpcdsStats = getTPCDSTableStats();
     }
 
@@ -643,17 +657,17 @@ public class TPCDSPlanTest extends TPCDSPlanTestBase {
     public void testQuery48LeftDeepJoinReorderAvoidInnerJoinOnSameTable() throws Exception {
         setTPCDSFactor(1);
         String plan = getFragmentPlan(Q48);
-        assertContains(plan, "  11:HASH JOIN\n" +
-                "  |  join op: INNER JOIN (BROADCAST)\n" +
+        assertContains(plan, "8:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (PARTITIONED)\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 6: ss_cdemo_sk = 53: cd_demo_sk\n" +
-                "  |  other predicates: ((((55: cd_marital_status = 'M') AND (56: cd_education_status = '4 yr Degree')) " +
-                "AND ((14: ss_sales_price >= 100.00) AND (14: ss_sales_price <= 150.00))) OR " +
-                "(((55: cd_marital_status = 'D') AND (56: cd_education_status = '2 yr Degree')) AND " +
-                "((14: ss_sales_price >= 50.00) AND (14: ss_sales_price <= 100.00)))) OR (((55: cd_marital_status = 'S') " +
-                "AND (56: cd_education_status = 'College')) AND ((14: ss_sales_price >= 150.00) " +
-                "AND (14: ss_sales_price <= 200.00)))\n" +
+                "  |  other join predicates: ((((55: cd_marital_status = 'M') AND (56: cd_education_status = '4 yr Degree')) " +
+                "AND ((14: ss_sales_price >= 100.00) AND (14: ss_sales_price <= 150.00))) OR (((55: cd_marital_status = 'D') " +
+                "AND (56: cd_education_status = '2 yr Degree')) AND ((14: ss_sales_price >= 50.00) " +
+                "AND (14: ss_sales_price <= 100.00)))) OR (((55: cd_marital_status = 'S') " +
+                "AND (56: cd_education_status = 'College')) " +
+                "AND ((14: ss_sales_price >= 150.00) AND (14: ss_sales_price <= 200.00)))\n" +
                 "  |  \n" +
-                "  |----10:EXCHANGE");
+                "  |----7:EXCHANGE");
     }
 }

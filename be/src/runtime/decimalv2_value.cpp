@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/decimalv2_value.cpp
 
@@ -271,7 +284,7 @@ int DecimalV2Value::parse_from_str(const char* decimal_str, int32_t length) {
 }
 
 std::string DecimalV2Value::to_string(int round_scale) const {
-    if (_value == 0) return std::string(1, '0');
+    if (_value == 0) return "0";
 
     int last_char_idx = PRECISION + 2 + (_value < 0);
     std::string str = std::string(last_char_idx, '0');

@@ -1,11 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exec/pipeline/scan/olap_scan_operator.h"
 
 #include "column/chunk.h"
+#include "exec/olap_scan_node.h"
 #include "exec/pipeline/scan/olap_chunk_source.h"
 #include "exec/pipeline/scan/olap_scan_context.h"
-#include "exec/vectorized/olap_scan_node.h"
 #include "runtime/current_thread.h"
 #include "runtime/exec_env.h"
 #include "runtime/runtime_state.h"
@@ -19,6 +31,12 @@ OlapScanOperatorFactory::OlapScanOperatorFactory(int32_t id, ScanNode* scan_node
         : ScanOperatorFactory(id, scan_node), _ctx_factory(std::move(ctx_factory)) {}
 
 Status OlapScanOperatorFactory::do_prepare(RuntimeState* state) {
+    auto olap_scan_node = dynamic_cast<OlapScanNode*>(_scan_node);
+    DCHECK(olap_scan_node != nullptr);
+    const TOlapScanNode& thrift_olap_scan_node = olap_scan_node->thrift_olap_scan_node();
+    const TupleDescriptor* tuple_desc = state->desc_tbl().get_tuple_descriptor(thrift_olap_scan_node.tuple_id);
+    DCHECK(tuple_desc != nullptr);
+    _ctx_factory->set_scan_table_id(tuple_desc->table_desc()->table_id());
     return Status::OK();
 }
 
@@ -27,6 +45,11 @@ void OlapScanOperatorFactory::do_close(RuntimeState*) {}
 OperatorPtr OlapScanOperatorFactory::do_create(int32_t dop, int32_t driver_sequence) {
     return std::make_shared<OlapScanOperator>(this, _id, driver_sequence, dop, _scan_node,
                                               _ctx_factory->get_or_create(driver_sequence));
+}
+
+const std::vector<ExprContext*>& OlapScanOperatorFactory::partition_exprs() const {
+    auto* olap_scan_node = down_cast<OlapScanNode*>(_scan_node);
+    return olap_scan_node->bucket_exprs();
 }
 
 // ==================== OlapScanOperator ====================
@@ -78,9 +101,13 @@ Status OlapScanOperator::do_prepare(RuntimeState*) {
 void OlapScanOperator::do_close(RuntimeState* state) {}
 
 ChunkSourcePtr OlapScanOperator::create_chunk_source(MorselPtr morsel, int32_t chunk_source_index) {
-    auto* olap_scan_node = down_cast<vectorized::OlapScanNode*>(_scan_node);
-    return std::make_shared<OlapChunkSource>(_driver_sequence, _chunk_source_profiles[chunk_source_index].get(),
-                                             std::move(morsel), olap_scan_node, _ctx.get());
+    auto* olap_scan_node = down_cast<OlapScanNode*>(_scan_node);
+    return std::make_shared<OlapChunkSource>(this, _chunk_source_profiles[chunk_source_index].get(), std::move(morsel),
+                                             olap_scan_node, _ctx.get());
+}
+
+int64_t OlapScanOperator::get_scan_table_id() const {
+    return _ctx->get_scan_table_id();
 }
 
 void OlapScanOperator::attach_chunk_source(int32_t source_index) {
@@ -100,7 +127,7 @@ size_t OlapScanOperator::num_buffered_chunks() const {
 }
 
 ChunkPtr OlapScanOperator::get_chunk_from_buffer() {
-    vectorized::ChunkPtr chunk = nullptr;
+    ChunkPtr chunk = nullptr;
     if (_ctx->get_chunk_buffer().try_get(_driver_sequence, &chunk)) {
         return chunk;
     }
@@ -113,6 +140,10 @@ size_t OlapScanOperator::buffer_size() const {
 
 size_t OlapScanOperator::buffer_capacity() const {
     return _ctx->get_chunk_buffer().limiter()->capacity();
+}
+
+size_t OlapScanOperator::buffer_memory_usage() const {
+    return _ctx->get_chunk_buffer().memory_usage();
 }
 
 size_t OlapScanOperator::default_buffer_capacity() const {

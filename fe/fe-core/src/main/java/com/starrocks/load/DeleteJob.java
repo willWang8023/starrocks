@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/DeleteJob.java
 
@@ -21,7 +34,7 @@
 
 package com.starrocks.load;
 
-import com.starrocks.analysis.DeleteStmt;
+import com.starrocks.analysis.Predicate;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Table;
@@ -30,8 +43,11 @@ import com.starrocks.common.UserException;
 import com.starrocks.qe.QueryState;
 import com.starrocks.qe.QueryStateException;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.transaction.AbstractTxnStateChangeCallback;
 import com.starrocks.transaction.GlobalTransactionMgr;
+import com.starrocks.transaction.TabletCommitInfo;
+import com.starrocks.transaction.TabletFailInfo;
 import com.starrocks.transaction.TransactionAlreadyCommitException;
 import com.starrocks.transaction.TransactionState;
 import com.starrocks.transaction.TransactionStatus;
@@ -56,6 +72,7 @@ public abstract class DeleteJob extends AbstractTxnStateChangeCallback {
     protected String label;
     protected DeleteState state;
     protected MultiDeleteInfo deleteInfo;
+    List<Predicate> deleteConditions;
 
     public DeleteJob(long id, long transactionId, String label, MultiDeleteInfo deleteInfo) {
         this.id = id;
@@ -90,21 +107,29 @@ public abstract class DeleteJob extends AbstractTxnStateChangeCallback {
         return deleteInfo;
     }
 
+    public List<Predicate> getDeleteConditions() {
+        return deleteConditions;
+    }
+
+    public void setDeleteConditions(List<Predicate> deleteConditions) {
+        this.deleteConditions = deleteConditions;
+    }
+
     @Override
     public void afterVisible(TransactionState txnState, boolean txnOperated) {
         if (!txnOperated) {
             return;
         }
         setState(DeleteState.FINISHED);
-        GlobalStateMgr.getCurrentState().getDeleteHandler().recordFinishedJob(this);
-        GlobalStateMgr.getCurrentGlobalTransactionMgr().getCallbackFactory().removeCallback(getId());
+        GlobalStateMgr.getCurrentState().getDeleteMgr().recordFinishedJob(this);
+        GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().getCallbackFactory().removeCallback(getId());
         GlobalStateMgr.getCurrentState().getEditLog().logFinishMultiDelete(deleteInfo);
     }
 
     @Override
     public void afterAborted(TransactionState txnState, boolean txnOperated, String txnStatusChangeReason) {
         // just to clean the callback
-        GlobalStateMgr.getCurrentGlobalTransactionMgr().getCallbackFactory().removeCallback(getId());
+        GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().getCallbackFactory().removeCallback(getId());
     }
 
     public abstract void run(DeleteStmt stmt, Database db, Table table, List<Partition> partitions)
@@ -114,13 +139,14 @@ public abstract class DeleteJob extends AbstractTxnStateChangeCallback {
 
     public abstract void clear();
 
-    public boolean cancel(DeleteHandler.CancelType cancelType, String reason) {
+    public boolean cancel(DeleteMgr.CancelType cancelType, String reason) {
         LOG.info("start to cancel delete job, transactionId: {}, cancelType: {}", getTransactionId(),
                 cancelType.name());
 
-        GlobalTransactionMgr globalTransactionMgr = GlobalStateMgr.getCurrentGlobalTransactionMgr();
+        GlobalTransactionMgr globalTransactionMgr = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr();
         try {
-            globalTransactionMgr.abortTransaction(getDeleteInfo().getDbId(), getTransactionId(), reason);
+            globalTransactionMgr.abortTransaction(getDeleteInfo().getDbId(), getTransactionId(), reason,
+                    getTabletCommitInfos(), getTabletFailInfos(), null);
         } catch (TransactionAlreadyCommitException e) {
             return false;
         } catch (Exception e) {
@@ -137,18 +163,22 @@ public abstract class DeleteJob extends AbstractTxnStateChangeCallback {
      */
     public abstract boolean commitImpl(Database db, long timeoutMs) throws UserException;
 
+    protected abstract List<TabletCommitInfo> getTabletCommitInfos();
+
+    protected abstract List<TabletFailInfo> getTabletFailInfos();
+
     public void commit(Database db, long timeoutMs) throws DdlException, QueryStateException {
         TransactionStatus status = TransactionStatus.UNKNOWN;
         try {
             if (commitImpl(db, timeoutMs)) {
-                GlobalStateMgr.getCurrentState().getDeleteHandler()
+                GlobalStateMgr.getCurrentState().getDeleteMgr()
                         .updateTableDeleteInfo(GlobalStateMgr.getCurrentState(), db.getId(),
                                 getDeleteInfo().getTableId());
             }
-            status = GlobalStateMgr.getCurrentGlobalTransactionMgr().
+            status = GlobalStateMgr.getCurrentState().getGlobalTransactionMgr().
                     getTransactionState(db.getId(), getTransactionId()).getTransactionStatus();
         } catch (UserException e) {
-            if (cancel(DeleteHandler.CancelType.COMMIT_FAIL, e.getMessage())) {
+            if (cancel(DeleteMgr.CancelType.COMMIT_FAIL, e.getMessage())) {
                 throw new DdlException(e.getMessage(), e);
             } else {
                 // do nothing

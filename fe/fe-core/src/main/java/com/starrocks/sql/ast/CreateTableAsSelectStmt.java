@@ -1,12 +1,25 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.ast;
 
 import com.starrocks.analysis.RedirectStatus;
-import com.starrocks.analysis.StatementBase;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.util.List;
 
@@ -25,15 +38,22 @@ public class CreateTableAsSelectStmt extends StatementBase {
     public CreateTableAsSelectStmt(CreateTableStmt createTableStmt,
                                    List<String> columnNames,
                                    QueryStatement queryStatement) {
+        this(createTableStmt, columnNames, queryStatement, NodePosition.ZERO);
+    }
+
+    public CreateTableAsSelectStmt(CreateTableStmt createTableStmt,
+                                   List<String> columnNames,
+                                   QueryStatement queryStatement, NodePosition pos) {
+        super(pos);
         this.createTableStmt = createTableStmt;
         this.columnNames = columnNames;
         this.queryStatement = queryStatement;
         this.insertStmt = new InsertStmt(createTableStmt.getDbTbl(), queryStatement);
     }
 
-    public void createTable(ConnectContext session) throws AnalysisException {
+    public boolean createTable(ConnectContext session) throws AnalysisException {
         try {
-            session.getGlobalStateMgr().createTable(createTableStmt);
+            return session.getGlobalStateMgr().getMetadataMgr().createTable(createTableStmt);
         } catch (DdlException e) {
             throw new AnalysisException(e.getMessage());
         }
@@ -41,8 +61,8 @@ public class CreateTableAsSelectStmt extends StatementBase {
 
     public void dropTable(ConnectContext session) throws AnalysisException {
         try {
-            session.getGlobalStateMgr().dropTable(new DropTableStmt(true, createTableStmt.getDbTbl(), true));
-        } catch (DdlException e) {
+            session.getGlobalStateMgr().getMetadataMgr().dropTable(new DropTableStmt(true, createTableStmt.getDbTbl(), true));
+        } catch (Exception e) {
             throw new AnalysisException(e.getMessage());
         }
     }
@@ -69,12 +89,12 @@ public class CreateTableAsSelectStmt extends StatementBase {
     }
 
     @Override
-    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
-        return visitor.visitCreateTableAsSelectStatement(this, context);
+    public String toSql() {
+        return createTableStmt.toSql() + " AS " + queryStatement.toSql();
     }
 
     @Override
-    public boolean isSupportNewPlanner() {
-        return true;
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitCreateTableAsSelectStatement(this, context);
     }
 }

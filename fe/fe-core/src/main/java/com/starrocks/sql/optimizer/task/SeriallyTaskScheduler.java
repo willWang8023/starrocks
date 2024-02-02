@@ -1,14 +1,27 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.optimizer.task;
 
-import com.google.common.base.Stopwatch;
+import com.starrocks.common.profile.Timer;
+import com.starrocks.common.profile.Tracers;
 import com.starrocks.sql.common.ErrorType;
 import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.optimizer.Group;
+import com.starrocks.sql.optimizer.Memo;
 
 import java.util.Stack;
-import java.util.concurrent.TimeUnit;
 
 public class SeriallyTaskScheduler implements TaskScheduler {
     private final Stack<OptimizerTask> tasks;
@@ -24,12 +37,14 @@ public class SeriallyTaskScheduler implements TaskScheduler {
     @Override
     public void executeTasks(TaskContext context) {
         long timeout = context.getOptimizerContext().getSessionVariable().getOptimizerExecuteTimeout();
-        Stopwatch watch = context.getOptimizerContext().getTraceInfo().getStopwatch();
+        long watch = context.getOptimizerContext().optimizerElapsedMs();
         while (!tasks.empty()) {
-            if (watch.elapsed(TimeUnit.MILLISECONDS) > timeout) {
+            if (timeout > 0 && watch > timeout) {
                 // Should have at least one valid plan
                 // group will be null when in rewrite phase
-                Group group = context.getOptimizerContext().getMemo().getRootGroup();
+                // memo may be null for rule-based optimizer
+                Memo memo = context.getOptimizerContext().getMemo();
+                Group group = memo == null ? null : memo.getRootGroup();
                 if (group == null || !group.hasBestExpression(context.getRequiredProperty())) {
                     throw new StarRocksPlannerException("StarRocks planner use long time " + timeout +
                             " ms in " + (group == null ? "logical" : "memo") + " phase, This probably because " +
@@ -46,7 +61,9 @@ public class SeriallyTaskScheduler implements TaskScheduler {
             }
             OptimizerTask task = tasks.pop();
             context.getOptimizerContext().setTaskContext(context);
-            task.execute();
+            try (Timer ignore = Tracers.watchScope(Tracers.Module.OPTIMIZER, task.getClass().getSimpleName())) {
+                task.execute();
+            }
         }
     }
 

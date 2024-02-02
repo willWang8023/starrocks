@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.lake.backup;
 
@@ -11,26 +24,28 @@ import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FsBroker;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Tablet;
 import com.starrocks.common.UserException;
 import com.starrocks.common.io.Text;
 import com.starrocks.lake.LakeTable;
 import com.starrocks.lake.LakeTablet;
-import com.starrocks.lake.proto.LockTabletMetadataRequest;
-import com.starrocks.lake.proto.LockTabletMetadataResponse;
-import com.starrocks.lake.proto.Snapshot;
-import com.starrocks.lake.proto.UnlockTabletMetadataRequest;
-import com.starrocks.lake.proto.UploadSnapshotsRequest;
-import com.starrocks.lake.proto.UploadSnapshotsResponse;
 import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.proto.LockTabletMetadataRequest;
+import com.starrocks.proto.LockTabletMetadataResponse;
+import com.starrocks.proto.Snapshot;
+import com.starrocks.proto.UnlockTabletMetadataRequest;
+import com.starrocks.proto.UploadSnapshotsRequest;
+import com.starrocks.proto.UploadSnapshotsResponse;
 import com.starrocks.rpc.BrpcProxy;
 import com.starrocks.rpc.LakeService;
+import com.starrocks.rpc.RpcException;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.thrift.THdfsProperties;
-import org.apache.log4j.LogManager;
-import org.apache.log4j.Logger;
+import org.apache.logging.log4j.LogManager;
+import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -54,7 +69,8 @@ public class LakeBackupJob extends BackupJob {
 
     private Map<Long, Future<UploadSnapshotsResponse>> uploadResponses = Maps.newHashMap();
 
-    public LakeBackupJob() {}
+    public LakeBackupJob() {
+    }
 
     public LakeBackupJob(String label, long dbId, String dbName, List<TableRef> tableRefs, long timeoutMs,
                          GlobalStateMgr globalStateMgr, long repoId) {
@@ -71,7 +87,7 @@ public class LakeBackupJob extends BackupJob {
                 status = new Status(Status.ErrCode.NOT_FOUND, "table " + tblName + " does not exist");
                 return;
             }
-            if (!tbl.isLakeTable()) {
+            if (!tbl.isCloudNativeTable()) {
                 status = new Status(Status.ErrCode.COMMON_ERROR, "table " + tblName
                         + " is not LAKE table");
                 return;
@@ -92,11 +108,11 @@ public class LakeBackupJob extends BackupJob {
     }
 
     @Override
-    protected void prepareSnapshotTask(Partition partition, Table tbl, Tablet tablet, MaterializedIndex index,
+    protected void prepareSnapshotTask(PhysicalPartition partition, Table tbl, Tablet tablet, MaterializedIndex index,
                                        long visibleVersion, int schemaHash) {
         try {
-            Backend backend = GlobalStateMgr.getCurrentSystemInfo()
-                    .getBackend(((LakeTablet) tablet).getPrimaryBackendId());
+            Backend backend = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo()
+                    .getBackend(((LakeTablet) tablet).getPrimaryComputeNodeId());
             LakeTableSnapshotInfo snapshotInfo = new LakeTableSnapshotInfo(dbId,
                     tbl.getId(), partition.getId(), index.getId(), tablet.getId(),
                     backend.getId(), schemaHash, visibleVersion);
@@ -118,8 +134,13 @@ public class LakeBackupJob extends BackupJob {
     @Override
     protected void sendSnapshotRequests() {
         for (Map.Entry<SnapshotInfo, LockTabletMetadataRequest> entry : lockRequests.entrySet()) {
-            Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackend(entry.getKey().getBeId());
-            LakeService lakeService = BrpcProxy.getLakeService(backend.getHost(), backend.getBrpcPort());
+            Backend backend = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackend(entry.getKey().getBeId());
+            LakeService lakeService = null;
+            try {
+                lakeService = BrpcProxy.getLakeService(backend.getHost(), backend.getBrpcPort());
+            } catch (RpcException e) {
+                throw new RuntimeException(e);
+            }
             Future<LockTabletMetadataResponse> response = lakeService.lockTabletMetadata(entry.getValue());
             lockResponses.put(entry.getKey(), response);
         }
@@ -136,9 +157,14 @@ public class LakeBackupJob extends BackupJob {
             request.tabletId = info.getTabletId();
             request.version = ((LakeTableSnapshotInfo) info).getVersion();
             request.expireTime = (createTime + timeoutMs) / 1000;
-            Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackend(info.getBeId());
-            LakeService lakeService = BrpcProxy.getLakeService(backend.getHost(),
-                    backend.getBrpcPort());
+            Backend backend = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackend(info.getBeId());
+            LakeService lakeService = null;
+            try {
+                lakeService = BrpcProxy.getLakeService(backend.getHost(),
+                        backend.getBrpcPort());
+            } catch (RpcException e) {
+                throw new RuntimeException(e);
+            }
             lakeService.unlockTabletMetadata(request);
         }
     }
@@ -160,7 +186,7 @@ public class LakeBackupJob extends BackupJob {
             snapshot.destPath = repo.getRepoTabletPathBySnapshotInfo(label, info);
             request.snapshots.put(lakeInfo.getTabletId(), snapshot);
         }
-        Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackend(beId);
+        Backend backend = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackend(beId);
         unfinishedTaskIds.put(beId, 1L);
         uploadRequests.put(backend, request);
     }
@@ -168,7 +194,12 @@ public class LakeBackupJob extends BackupJob {
     @Override
     protected void sendUploadTasks() {
         for (Map.Entry<Backend, UploadSnapshotsRequest> entry : uploadRequests.entrySet()) {
-            LakeService lakeService = BrpcProxy.getLakeService(entry.getKey().getHost(), entry.getKey().getBrpcPort());
+            LakeService lakeService = null;
+            try {
+                lakeService = BrpcProxy.getLakeService(entry.getKey().getHost(), entry.getKey().getBrpcPort());
+            } catch (RpcException e) {
+                throw new RuntimeException(e);
+            }
             Future<UploadSnapshotsResponse> response = lakeService.uploadSnapshots(entry.getValue());
             uploadResponses.put(entry.getKey().getId(), response);
         }

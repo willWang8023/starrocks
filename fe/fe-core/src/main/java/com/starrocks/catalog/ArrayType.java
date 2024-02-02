@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.catalog;
 
@@ -19,13 +32,6 @@ public class ArrayType extends Type {
     private Type itemType;
 
     public ArrayType(Type itemType) {
-        if (itemType != null && itemType.isDecimalV3()) {
-            throw new InternalError("Decimal32/64/128 is not supported in current version");
-        }
-        this.itemType = itemType;
-    }
-
-    public ArrayType(Type itemType, boolean fromSubQuery) {
         this.itemType = itemType;
     }
 
@@ -50,9 +56,13 @@ public class ArrayType extends Type {
     @Override
     public String toSql(int depth) {
         if (depth >= MAX_NESTING_DEPTH) {
-            return "ARRAY<...>";
+            return "array<...>";
         }
-        return String.format("ARRAY<%s>", itemType.toSql(depth + 1));
+        if (itemType.isDecimalOfAnyVersion()) {
+            return String.format("array<%s>", itemType);
+        } else {
+            return String.format("array<%s>", itemType.toSql(depth + 1));
+        }
     }
 
     @Override
@@ -76,6 +86,20 @@ public class ArrayType extends Type {
         Preconditions.checkNotNull(itemType);
         node.setType(TTypeNodeType.ARRAY);
         itemType.toThrift(container);
+    }
+
+    @Override
+    public boolean isFullyCompatible(Type other) {
+        if (!other.isArrayType()) {
+            return false;
+        }
+
+        if (equals(other)) {
+            return true;
+        }
+
+        ArrayType t = (ArrayType) other;
+        return itemType.isFullyCompatible(t.getItemType());
     }
 
     @Override
@@ -103,6 +127,19 @@ public class ArrayType extends Type {
         return clone;
     }
 
+    @Override
+    public void selectAllFields() {
+        if (itemType.isComplexType()) {
+            itemType.selectAllFields();
+        }
+    }
+
+    public void pruneUnusedSubfields() {
+        if (itemType.isComplexType()) {
+            itemType.pruneUnusedSubfields();
+        }
+    }
+
     /**
      * @return 33 (utf8_general_ci) if type is array
      * https://dev.mysql.com/doc/internals/en/com-query-response.html#column-definition
@@ -123,6 +160,15 @@ public class ArrayType extends Type {
 
     public boolean isNullTypeItem() {
         return itemType.isNull();
+    }
+
+    public String toMysqlDataTypeString() {
+        return "array";
+    }
+
+    // This implementation is the same as BE schema_columns_scanner.cpp type_to_string
+    public String toMysqlColumnTypeString() {
+        return toSql();
     }
 }
 

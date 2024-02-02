@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/base_tablet.h
 
@@ -69,6 +82,7 @@ public:
 
     // Property encapsulated in TabletMeta
     const TabletMetaSharedPtr tablet_meta();
+    const TabletMetaSharedPtr tablet_meta() const;
 
     void set_tablet_meta(const TabletMetaSharedPtr& tablet_meta) { _tablet_meta = tablet_meta; }
 
@@ -86,7 +100,20 @@ public:
     bool equal(int64_t tablet_id, int32_t schema_hash);
 
     // properties encapsulated in TabletSchema
-    const TabletSchema& tablet_schema() const;
+    virtual const TabletSchema& unsafe_tablet_schema_ref() const;
+
+    virtual const TabletSchemaCSPtr tablet_schema() const;
+
+    bool set_tablet_schema_into_rowset_meta() {
+        bool flag = false;
+        for (const RowsetMetaSharedPtr& rowset_meta : _tablet_meta->all_rs_metas()) {
+            if (!rowset_meta->has_tablet_schema_pb()) {
+                rowset_meta->set_tablet_schema(tablet_schema());
+                flag = true;
+            }
+        }
+        return flag;
+    }
 
 protected:
     virtual void on_shutdown() {}
@@ -113,6 +140,10 @@ inline const std::string& BaseTablet::schema_hash_path() const {
 }
 
 inline const TabletMetaSharedPtr BaseTablet::tablet_meta() {
+    return _tablet_meta;
+}
+
+inline const TabletMetaSharedPtr BaseTablet::tablet_meta() const {
     return _tablet_meta;
 }
 
@@ -159,8 +190,12 @@ inline bool BaseTablet::equal(int64_t id, int32_t hash) {
     return tablet_id() == id && schema_hash() == hash;
 }
 
-inline const TabletSchema& BaseTablet::tablet_schema() const {
+inline const TabletSchema& BaseTablet::unsafe_tablet_schema_ref() const {
     return _tablet_meta->tablet_schema();
+}
+
+inline const TabletSchemaCSPtr BaseTablet::tablet_schema() const {
+    return _tablet_meta->tablet_schema_ptr();
 }
 
 } /* namespace starrocks */

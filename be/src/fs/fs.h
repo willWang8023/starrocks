@@ -10,10 +10,13 @@
 #pragma once
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 
 #include "common/statusor.h"
+#include "fs/credential/cloud_configuration_factory.h"
+#include "gen_cpp/PlanNodes_types.h"
 #include "io/input_stream.h"
 #include "io/seekable_input_stream.h"
 #include "runtime/descriptors.h"
@@ -24,11 +27,10 @@ namespace starrocks {
 class RandomAccessFile;
 class WritableFile;
 class SequentialFile;
-class ResultFileOptions;
+struct ResultFileOptions;
 class TUploadReq;
 class TDownloadReq;
 struct WritableFileOptions;
-struct RandomAccessFileOptions;
 
 struct SpaceInfo {
     // Total size of the filesystem, in bytes
@@ -42,27 +44,32 @@ struct SpaceInfo {
 struct FSOptions {
 private:
     FSOptions(const TBrokerScanRangeParams* scan_range_params, const TExportSink* export_sink,
-              const ResultFileOptions* result_file_options, const TUploadReq* upload, const TDownloadReq* download)
+              const ResultFileOptions* result_file_options, const TUploadReq* upload, const TDownloadReq* download,
+              const TCloudConfiguration* cloud_configuration)
             : scan_range_params(scan_range_params),
               export_sink(export_sink),
               result_file_options(result_file_options),
               upload(upload),
-              download(download) {}
+              download(download),
+              cloud_configuration(cloud_configuration) {}
 
 public:
-    FSOptions() : FSOptions(nullptr, nullptr, nullptr, nullptr, nullptr) {}
+    FSOptions() : FSOptions(nullptr, nullptr, nullptr, nullptr, nullptr, nullptr) {}
 
     FSOptions(const TBrokerScanRangeParams* scan_range_params)
-            : FSOptions(scan_range_params, nullptr, nullptr, nullptr, nullptr) {}
+            : FSOptions(scan_range_params, nullptr, nullptr, nullptr, nullptr, nullptr) {}
 
-    FSOptions(const TExportSink* export_sink) : FSOptions(nullptr, export_sink, nullptr, nullptr, nullptr) {}
+    FSOptions(const TExportSink* export_sink) : FSOptions(nullptr, export_sink, nullptr, nullptr, nullptr, nullptr) {}
 
     FSOptions(const ResultFileOptions* result_file_options)
-            : FSOptions(nullptr, nullptr, result_file_options, nullptr, nullptr) {}
+            : FSOptions(nullptr, nullptr, result_file_options, nullptr, nullptr, nullptr) {}
 
-    FSOptions(const TUploadReq* upload) : FSOptions(nullptr, nullptr, nullptr, upload, nullptr) {}
+    FSOptions(const TUploadReq* upload) : FSOptions(nullptr, nullptr, nullptr, upload, nullptr, nullptr) {}
 
-    FSOptions(const TDownloadReq* download) : FSOptions(nullptr, nullptr, nullptr, nullptr, download) {}
+    FSOptions(const TDownloadReq* download) : FSOptions(nullptr, nullptr, nullptr, nullptr, download, nullptr) {}
+
+    FSOptions(const TCloudConfiguration* cloud_configuration)
+            : FSOptions(nullptr, nullptr, nullptr, nullptr, nullptr, cloud_configuration) {}
 
     const THdfsProperties* hdfs_properties() const;
 
@@ -71,13 +78,42 @@ public:
     const ResultFileOptions* result_file_options;
     const TUploadReq* upload;
     const TDownloadReq* download;
+    const TCloudConfiguration* cloud_configuration;
 };
 
-struct FileStatus {
-    FileStatus(std::string_view name, bool is_dir, int64_t size) : name(name), is_dir(is_dir), size(size) {}
-    std::string name;
-    bool is_dir;
-    int64_t size;
+struct SequentialFileOptions {
+    // Don't cache remote file locally on read requests.
+    // This options can be ignored if the underlying filesystem does not support local cache.
+    bool skip_fill_local_cache = false;
+    // Specify different buffer size for different read scenarios
+    int64_t buffer_size = -1;
+};
+
+struct RandomAccessFileOptions {
+    // Don't cache remote file locally on read requests.
+    // This options can be ignored if the underlying filesystem does not support local cache.
+    bool skip_fill_local_cache = false;
+    // Specify different buffer size for different read scenarios
+    int64_t buffer_size = -1;
+};
+
+struct DirEntry {
+    std::string_view name;
+    std::optional<int64_t> mtime;
+    std::optional<int64_t> size; // Undefined if "is_dir" is true
+    std::optional<bool> is_dir;
+};
+
+struct FileInfo {
+    std::string path;
+    std::optional<int64_t> size;
+};
+
+struct FileWriteStat {
+    int64_t open_time{0};
+    int64_t close_time{0};
+    int64_t size{0};
+    std::string path;
 };
 
 class FileSystem {
@@ -107,22 +143,43 @@ public:
     // implementation instead of relying on this default environment.
     static FileSystem* Default();
 
+    static void get_file_write_history(std::vector<FileWriteStat>* stats);
+    static void on_file_write_open(WritableFile* file);
+    static void on_file_write_close(WritableFile* file);
+
     virtual Type type() const = 0;
 
     // Create a brand new sequentially-readable file with the specified name.
     //  If the file does not exist, returns a non-OK status.
     //
     // The returned file will only be accessed by one thread at a time.
-    virtual StatusOr<std::unique_ptr<SequentialFile>> new_sequential_file(const std::string& fname) = 0;
+    StatusOr<std::unique_ptr<SequentialFile>> new_sequential_file(const std::string& fname) {
+        return new_sequential_file(SequentialFileOptions(), fname);
+    }
+
+    virtual StatusOr<std::unique_ptr<SequentialFile>> new_sequential_file(const SequentialFileOptions& opts,
+                                                                          const std::string& fname) = 0;
 
     // Create a brand new random access read-only file with the
     // specified name.
     //
     // The returned file will only be accessed by one thread at a time.
-    virtual StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const std::string& fname) = 0;
+    StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const std::string& fname) {
+        return new_random_access_file(RandomAccessFileOptions(), fname);
+    }
+
+    StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const FileInfo& file_info) {
+        return new_random_access_file(RandomAccessFileOptions(), file_info);
+    }
 
     virtual StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const RandomAccessFileOptions& opts,
                                                                                const std::string& fname) = 0;
+
+    // Implementations may make use of the file info to make some optimizations, such as getting the file size directly.
+    virtual StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const RandomAccessFileOptions& opts,
+                                                                               const FileInfo& file_info) {
+        return new_random_access_file(opts, file_info.path);
+    }
 
     // Create an object that writes to a new file with the specified
     // name.  Deletes any existing file with the same name and creates a
@@ -152,8 +209,6 @@ public:
     //         IOError if an IO Error was encountered
     virtual Status get_children(const std::string& dir, std::vector<std::string>* result) = 0;
 
-    virtual Status list_path(const std::string& dir, std::vector<FileStatus>* result) { return Status::OK(); }
-
     // Iterate the specified directory and call given callback function with child's
     // name. This function continues execution until all children have been iterated
     // or callback function return false.
@@ -168,6 +223,10 @@ public:
     //                  permission to access "dir", or if "dir" is invalid.
     //         IOError if an IO Error was encountered
     virtual Status iterate_dir(const std::string& dir, const std::function<bool(std::string_view)>& cb) = 0;
+
+    // `iterate_dir2` is similar to `iterate_dir` but in addition to returning the directory entry name, it
+    // also returns some file statistics.
+    virtual Status iterate_dir2(const std::string& dir, const std::function<bool(DirEntry)>& cb) = 0;
 
     // Delete the named file.
     // FIXME: If the named file does not exist, OK or NOT_FOUND is returned, depend on the implementation.
@@ -212,6 +271,7 @@ public:
 
     // Get the last modification time by given 'fname'.
     virtual StatusOr<uint64_t> get_file_modified_time(const std::string& fname) = 0;
+
     // Rename file src to target.
     virtual Status rename_file(const std::string& src, const std::string& target) = 0;
 
@@ -220,16 +280,34 @@ public:
 
     // Determines the information about the filesystem on which the pathname 'path' is located.
     virtual StatusOr<SpaceInfo> space(const std::string& path) { return Status::NotSupported("FileSystem::space()"); }
-};
 
-struct RandomAccessFileOptions {
-    RandomAccessFileOptions() = default;
+    // Given the path to a remote file, delete the file's cache on the local file system, if any.
+    // On success, Status::OK is returned. If there is no cache, Status::NotFound is returned.
+    virtual Status drop_local_cache(const std::string& path) { return Status::NotFound(path); }
+
+    // Batch delete the given files.
+    // return ok if all success (not found error ignored), error if any failed and the message indicates the fail message
+    // possibly stop at the first error if is simulating batch deletes.
+    virtual Status delete_files(const std::vector<std::string>& paths) {
+        for (auto&& path : paths) {
+            auto st = delete_file(path);
+            if (!st.ok() && !st.is_not_found()) {
+                return st;
+            }
+        }
+        return Status::OK();
+    }
 };
 
 // Creation-time options for WritableFile
 struct WritableFileOptions {
     // Call Sync() during Close().
     bool sync_on_close = true;
+    // For remote filesystem, skip filling local filesystem cache on write requests
+    bool skip_fill_local_cache = false;
+
+    bool direct_write = false;
+
     // See OpenMode for details.
     FileSystem::OpenMode mode = FileSystem::MUST_CREATE;
 };
@@ -259,13 +337,23 @@ public:
               _stream(std::move(stream)),
               _name(std::move(name)) {}
 
+    explicit RandomAccessFile(std::shared_ptr<io::SeekableInputStream> stream, std::string name, bool is_cache_hit)
+            : io::SeekableInputStreamWrapper(stream.get(), kDontTakeOwnership),
+              _stream(std::move(stream)),
+              _name(std::move(name)),
+              _is_cache_hit(is_cache_hit) {}
+
     std::shared_ptr<io::SeekableInputStream> stream() { return _stream; }
 
     const std::string& filename() const { return _name; }
 
+    bool is_cache_hit() const { return _is_cache_hit; }
+
 private:
     std::shared_ptr<io::SeekableInputStream> _stream;
     std::string _name;
+    // for cachefs in fs_starlet
+    bool _is_cache_hit{false};
 };
 
 // A file abstraction for sequential writing.  The implementation
@@ -279,6 +367,9 @@ public:
 
     WritableFile() = default;
     virtual ~WritableFile() = default;
+
+    // No copying allowed
+    DISALLOW_COPY(WritableFile);
 
     // Append data to the end of the file
     virtual Status append(const Slice& data) = 0;
@@ -316,11 +407,6 @@ public:
 
     // Returns the filename provided when the WritableFile was constructed.
     virtual const std::string& filename() const = 0;
-
-private:
-    // No copying allowed
-    WritableFile(const WritableFile&) = delete;
-    void operator=(const WritableFile&) = delete;
 };
 
 } // namespace starrocks

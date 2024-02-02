@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "fs/fs_broker.h"
 
@@ -73,9 +85,9 @@ static Status to_status(const TBrokerOperationStatus& st) {
 template <typename Method, typename Request, typename Response>
 static Status call_method(const TNetworkAddress& broker, Method method, const Request& request, Response* response,
                           int retry_count = 1, int timeout_ms = DEFAULT_TIMEOUT_MS) {
-    Status status;
     TFileBrokerServiceClient* client;
 #ifndef BE_TEST
+    Status status;
     BrokerServiceConnection conn(client_cache(), broker, timeout_ms, &status);
     if (!status.ok()) {
         LOG(WARNING) << "Fail to get broker client: " << status;
@@ -168,7 +180,7 @@ static Status broker_close_writer(const TNetworkAddress& broker, const TBrokerFD
 class BrokerInputStream : public io::SeekableInputStream {
 public:
     BrokerInputStream(const TNetworkAddress& broker, const TBrokerFD& fd, int64_t size)
-            : _broker(broker), _fd(fd), _offset(0), _size(size) {}
+            : _broker(broker), _fd(fd), _size(size) {}
 
     ~BrokerInputStream() override { broker_close_reader(_broker, _fd); }
 
@@ -190,7 +202,7 @@ public:
 private:
     TNetworkAddress _broker;
     TBrokerFD _fd;
-    int64_t _offset;
+    int64_t _offset{0};
     int64_t _size;
 };
 
@@ -198,7 +210,9 @@ class BrokerWritableFile : public WritableFile {
 public:
     BrokerWritableFile(const TNetworkAddress& broker, std::string path, const TBrokerFD& fd, size_t offset,
                        int timeout_ms)
-            : _broker(broker), _path(std::move(path)), _fd(fd), _offset(offset), _timeout_ms(timeout_ms) {}
+            : _broker(broker), _path(std::move(path)), _fd(fd), _offset(offset), _timeout_ms(timeout_ms) {
+        FileSystem::on_file_write_open(this);
+    }
 
     ~BrokerWritableFile() override { (void)BrokerWritableFile::close(); }
 
@@ -236,6 +250,7 @@ public:
         if (_closed) {
             return Status::OK();
         }
+        FileSystem::on_file_write_close(this);
         Status st = broker_close_writer(_broker, _fd, _timeout_ms);
         _closed = true;
         return st;
@@ -261,7 +276,8 @@ private:
     int _timeout_ms = DEFAULT_TIMEOUT_MS;
 };
 
-StatusOr<std::unique_ptr<SequentialFile>> BrokerFileSystem::new_sequential_file(const std::string& path) {
+StatusOr<std::unique_ptr<SequentialFile>> BrokerFileSystem::new_sequential_file(const SequentialFileOptions& opts,
+                                                                                const std::string& path) {
     TBrokerOpenReaderRequest request;
     TBrokerOpenReaderResponse response;
     request.__set_path(path);
@@ -284,10 +300,6 @@ StatusOr<std::unique_ptr<SequentialFile>> BrokerFileSystem::new_sequential_file(
     ASSIGN_OR_RETURN(const uint64_t file_size, get_file_size(path));
     auto stream = std::make_shared<BrokerInputStream>(_broker_addr, response.fd, file_size);
     return std::make_unique<SequentialFile>(std::move(stream), path);
-}
-
-StatusOr<std::unique_ptr<RandomAccessFile>> BrokerFileSystem::new_random_access_file(const std::string& path) {
-    return new_random_access_file(RandomAccessFileOptions(), path);
 }
 
 StatusOr<std::unique_ptr<RandomAccessFile>> BrokerFileSystem::new_random_access_file(
@@ -324,7 +336,7 @@ StatusOr<std::unique_ptr<WritableFile>> BrokerFileSystem::new_writable_file(cons
                                                                             const std::string& path) {
     if (opts.mode == FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE) {
         if (auto st = _path_exists(path); st.ok()) {
-            return Status::NotSupported("Cannot truncate a file by broker, path={}"_format(path));
+            return Status::NotSupported(fmt::format("Cannot truncate a file by broker, path={}", path));
         }
     } else if (opts.mode == MUST_CREATE) {
         if (auto st = _path_exists(path); st.ok()) {
@@ -334,7 +346,8 @@ StatusOr<std::unique_ptr<WritableFile>> BrokerFileSystem::new_writable_file(cons
         return Status::NotSupported("Open with MUST_EXIST not supported by broker");
     } else if (opts.mode == CREATE_OR_OPEN) {
         if (auto st = _path_exists(path); st.ok()) {
-            return Status::NotSupported("Cannot open an already exists file through broker, path={}"_format(path));
+            return Status::NotSupported(
+                    fmt::format("Cannot open an already exists file through broker, path={}", path));
         }
     } else {
         auto msg = strings::Substitute("Unsupported open mode $0", opts.mode);
@@ -394,6 +407,10 @@ Status BrokerFileSystem::iterate_dir(const std::string& dir, const std::function
         }
     }
     return Status::OK();
+}
+
+Status BrokerFileSystem::iterate_dir2(const std::string& dir, const std::function<bool(DirEntry)>& cb) {
+    return iterate_dir(dir, [&](std::string_view name) { return cb(DirEntry{.name = name}); });
 }
 
 Status BrokerFileSystem::delete_file(const std::string& path) {

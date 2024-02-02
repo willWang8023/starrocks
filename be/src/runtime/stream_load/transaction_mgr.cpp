@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "runtime/stream_load/transaction_mgr.h"
 
@@ -41,6 +53,7 @@
 #include "util/defer_op.h"
 #include "util/json_util.h"
 #include "util/metrics.h"
+#include "util/misc.h"
 #include "util/starrocks_metrics.h"
 #include "util/string_parser.hpp"
 #include "util/thrift_rpc_helper.h"
@@ -76,7 +89,7 @@ TransactionMgr::TransactionMgr(ExecEnv* exec_env) : _exec_env(exec_env) {
 
         while (!_is_stopped.load()) {
             _clean_stream_context();
-            sleep(interval);
+            nap_sleep(interval, [this] { return _is_stopped.load(); });
         }
     });
     Thread::set_thread_name(_transaction_clean_thread, "transaction_clean");
@@ -98,11 +111,11 @@ std::string TransactionMgr::_build_reply(const std::string& label, const std::st
 }
 
 Status TransactionMgr::list_transactions(const HttpRequest* req, std::string* resp) {
-    auto ids = std::move(_exec_env->stream_context_mgr()->get_ids());
+    auto ids = _exec_env->stream_context_mgr()->get_ids();
 
     rapidjson::StringBuffer s;
     rapidjson::PrettyWriter<rapidjson::StringBuffer> writer(s);
-    for (auto id : ids) {
+    for (const auto& id : ids) {
         std::string txn_resp;
         auto ctx = _exec_env->stream_context_mgr()->get(id);
         if (ctx != nullptr) {
@@ -171,7 +184,7 @@ Status TransactionMgr::begin_transaction(const HttpRequest* req, std::string* re
         if (!st.ok()) {
             ctx->status = st;
             if (ctx->need_rollback) {
-                _rollback_transaction(ctx);
+                (void)_rollback_transaction(ctx);
             }
         }
         LOG(INFO) << "new transaction manage request. " << ctx->brief() << ", tbl=" << ctx->table << " op=begin";
@@ -246,9 +259,10 @@ Status TransactionMgr::commit_transaction(const HttpRequest* req, std::string* r
 
         st = _commit_transaction(ctx, boost::iequals(TXN_PREPARE, req->param(HTTP_TXN_OP_KEY)));
         if (!st.ok()) {
+            LOG(ERROR) << "Fail to commit txn: " << st << " " << ctx->brief();
             ctx->status = st;
             if (ctx->need_rollback) {
-                _rollback_transaction(ctx);
+                (void)_rollback_transaction(ctx);
             }
         }
         *resp = _build_reply(TXN_COMMIT, ctx);
@@ -317,7 +331,7 @@ Status TransactionMgr::_commit_transaction(StreamLoadContext* ctx, bool prepare)
         // 1. finish stream pipe & wait it done
         if (ctx->buffer != nullptr && ctx->buffer->pos > 0) {
             ctx->buffer->flip();
-            ctx->body_sink->append(std::move(ctx->buffer));
+            RETURN_IF_ERROR(ctx->body_sink->append(std::move(ctx->buffer)));
             ctx->buffer = nullptr;
         }
         RETURN_IF_ERROR(ctx->body_sink->finish());
@@ -377,9 +391,9 @@ Status TransactionMgr::_rollback_transaction(StreamLoadContext* ctx) {
 }
 
 void TransactionMgr::_clean_stream_context() {
-    auto ids = std::move(_exec_env->stream_context_mgr()->get_ids());
+    auto ids = _exec_env->stream_context_mgr()->get_ids();
 
-    for (auto id : ids) {
+    for (const auto& id : ids) {
         auto ctx = _exec_env->stream_context_mgr()->get(id);
         if (ctx != nullptr) {
             int64_t now = UnixSeconds();

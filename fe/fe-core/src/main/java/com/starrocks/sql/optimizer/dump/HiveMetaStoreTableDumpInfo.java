@@ -1,53 +1,31 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.dump;
 
-import com.starrocks.catalog.PartitionKey;
-import com.starrocks.external.hive.HiveColumnStats;
-import com.starrocks.external.hive.HivePartition;
-import com.starrocks.external.hive.HivePartitionStats;
-import com.starrocks.external.hive.HiveTableStats;
-
 import java.util.List;
-import java.util.Map;
 
 public interface HiveMetaStoreTableDumpInfo {
     default String getType() {
         return "";
     }
 
-    default void setPartitionKeys(Map<PartitionKey, Long> partitionKeys) {
+    default void setPartitionNames(List<String> partitionNames) {
     }
 
-    default Map<PartitionKey, Long> getPartitionKeys() {
-        return null;
-    }
-
-    default void setHiveTableStats(HiveTableStats hiveTableStats) {
-    }
-
-    default HiveTableStats getHiveTableStats() {
-        return null;
-    }
-
-    default void addPartitionsStats(Map<PartitionKey, HivePartitionStats> hivePartitionStats) {
-    }
-
-    default Map<PartitionKey, HivePartitionStats> getPartitionsStats() {
-        return null;
-    }
-
-    default void addTableLevelColumnStats(Map<String, HiveColumnStats> tableLevelColumnStats) {
-    }
-
-    default Map<String, HiveColumnStats> getTableLevelColumnStats() {
-        return null;
-    }
-
-    default void addPartitions(Map<PartitionKey, HivePartition> partitions) {
-    }
-
-    default Map<PartitionKey, HivePartition> getPartitions() {
+    default List<String> getPartitionNames() {
         return null;
     }
 
@@ -63,5 +41,12 @@ public interface HiveMetaStoreTableDumpInfo {
 
     default List<String> getDataColumnNames() {
         return null;
+    }
+
+    default double getScanRowCount() {
+        return 1;
+    }
+
+    default void setScanRowCount(double rowCount) {
     }
 }

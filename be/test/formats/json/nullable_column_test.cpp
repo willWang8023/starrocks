@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "formats/json/nullable_column.h"
 
@@ -8,7 +20,7 @@
 #include "runtime/types.h"
 #include "simdjson.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 class AddNullableColumnTest : public ::testing::Test {};
 
@@ -85,4 +97,18 @@ TEST_F(AddNullableColumnTest, test_add_invalid) {
     ASSERT_TRUE(st.is_invalid_argument());
 }
 
-} // namespace starrocks::vectorized
+TEST_F(AddNullableColumnTest, add_null_numeric_array) {
+    auto desc = TypeDescriptor::create_array_type(TypeDescriptor::from_logical_type(TYPE_INT));
+    auto column = ColumnHelper::create_column(desc, true);
+
+    simdjson::ondemand::parser parser;
+    auto json = R"(  { "f_array": [null]}  )"_padded;
+    auto doc = parser.iterate(json);
+    simdjson::ondemand::value val = doc.find_field("f_array");
+
+    auto st = add_nullable_column(column.get(), desc, "f_array", &val, false);
+    ASSERT_TRUE(st.ok());
+    column->check_or_die();
+}
+
+} // namespace starrocks

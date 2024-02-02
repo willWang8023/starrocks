@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -12,15 +24,13 @@
 namespace starrocks {
 
 class Slice;
-namespace vectorized {
 class Column;
-}
+class NullableColumn;
 
 } // namespace starrocks
 
 namespace starrocks::parquet {
 
-// NOTE: This class is only used for unit test
 class Encoder {
 public:
     Encoder() = default;
@@ -44,28 +54,25 @@ public:
         return Status::NotSupported("set_dict is not supported");
     }
 
-    virtual Status get_dict_values(vectorized::Column* column) {
-        return Status::NotSupported("get_dict_values is not supported");
-    }
+    virtual Status get_dict_values(Column* column) { return Status::NotSupported("get_dict_values is not supported"); }
 
-    virtual Status get_dict_values(const std::vector<int32_t>& dict_codes, vectorized::Column* column) {
+    virtual Status get_dict_values(const std::vector<int32_t>& dict_codes, const NullableColumn& nulls,
+                                   Column* column) {
         return Status::NotSupported("get_dict_values is not supported");
-    }
-
-    virtual Status get_dict_codes(const std::vector<Slice>& dict_values, std::vector<int32_t>* dict_codes) {
-        return Status::NotSupported("get_dict_codes is not supported");
     }
 
     // used to set fixed length
-    virtual void set_type_legth(int32_t type_length) {}
+    virtual void set_type_length(int32_t type_length) {}
 
-    // Set a new page to decoded.
+    // Set a new page to decode.
     virtual Status set_data(const Slice& data) = 0;
 
     // For history reason, decoder don't known how many elements encoded in one page.
     // Caller must assure that no out-of-bounds access.
     // It will return ERROR if caller wants to read out-of-bound data.
-    virtual Status next_batch(size_t count, ColumnContentType content_type, vectorized::Column* dst) = 0;
+    virtual Status next_batch(size_t count, ColumnContentType content_type, Column* dst) = 0;
+
+    virtual Status skip(size_t values_to_skip) = 0;
 
     // Currently, this function is only used to read dictionary values.
     virtual Status next_batch(size_t count, uint8_t* dst) {

@@ -1,14 +1,27 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "column/nullable_column.h"
 
 #include "column/column_helper.h"
+#include "column/vectorized_fwd.h"
 #include "gutil/casts.h"
 #include "gutil/strings/fastmem.h"
 #include "simd/simd.h"
 #include "util/mysql_row_buffer.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 NullableColumn::NullableColumn(MutableColumnPtr&& data_column, MutableColumnPtr&& null_column)
         : _data_column(std::move(data_column)), _has_null(false) {
@@ -38,6 +51,19 @@ size_t NullableColumn::null_count() const {
     return SIMD::count_nonzero(_null_column->get_data());
 }
 
+size_t NullableColumn::null_count(size_t offset, size_t count) const {
+    if (!_has_null) {
+        return 0;
+    }
+    return SIMD::count_nonzero(_null_column->raw_data() + offset, count);
+}
+
+void NullableColumn::remove_first_n_values(size_t count) {
+    _data_column->remove_first_n_values(count);
+    _null_column->remove_first_n_values(count);
+    _has_null = SIMD::contain_nonzero(_null_column->get_data(), 0, _null_column->size());
+}
+
 void NullableColumn::append_datum(const Datum& datum) {
     if (datum.is_null()) {
         append_nulls(1);
@@ -50,8 +76,9 @@ void NullableColumn::append_datum(const Datum& datum) {
 
 void NullableColumn::append(const Column& src, size_t offset, size_t count) {
     DCHECK_EQ(_null_column->size(), _data_column->size());
-
-    if (src.is_nullable()) {
+    if (src.only_null()) {
+        append_nulls(count);
+    } else if (src.is_nullable()) {
         const auto& c = down_cast<const NullableColumn&>(src);
 
         DCHECK_EQ(c._null_column->size(), c._data_column->size());
@@ -69,9 +96,10 @@ void NullableColumn::append(const Column& src, size_t offset, size_t count) {
 
 void NullableColumn::append_selective(const Column& src, const uint32_t* indexes, uint32_t from, uint32_t size) {
     DCHECK_EQ(_null_column->size(), _data_column->size());
-    uint32_t orig_size = _null_column->size();
-
-    if (src.is_nullable()) {
+    size_t orig_size = _null_column->size();
+    if (src.only_null()) {
+        append_nulls(size);
+    } else if (src.is_nullable()) {
         const auto& src_column = down_cast<const NullableColumn&>(src);
 
         DCHECK_EQ(src_column._null_column->size(), src_column._data_column->size());
@@ -89,9 +117,10 @@ void NullableColumn::append_selective(const Column& src, const uint32_t* indexes
 
 void NullableColumn::append_value_multiple_times(const Column& src, uint32_t index, uint32_t size) {
     DCHECK_EQ(_null_column->size(), _data_column->size());
-    uint32_t orig_size = _null_column->size();
-
-    if (src.is_nullable()) {
+    size_t orig_size = _null_column->size();
+    if (src.only_null()) {
+        append_nulls(size);
+    } else if (src.is_nullable()) {
         const auto& src_column = down_cast<const NullableColumn&>(src);
 
         DCHECK_EQ(src_column._null_column->size(), src_column._data_column->size());
@@ -107,9 +136,16 @@ void NullableColumn::append_value_multiple_times(const Column& src, uint32_t ind
     DCHECK_EQ(_null_column->size(), _data_column->size());
 }
 
+ColumnPtr NullableColumn::replicate(const std::vector<uint32_t>& offsets) {
+    return NullableColumn::create(this->_data_column->replicate(offsets),
+                                  std::dynamic_pointer_cast<NullColumn>(this->_null_column->replicate(offsets)));
+}
+
 bool NullableColumn::append_nulls(size_t count) {
-    DCHECK_GT(count, 0u);
-    _data_column->append_default(count);
+    if (count == 0) {
+        return true;
+    }
+    _data_column->resize_uninitialized(_data_column->size() + count);
     null_column_data().insert(null_column_data().end(), count, 1);
     DCHECK_EQ(_null_column->size(), _data_column->size());
     _has_null = true;
@@ -143,6 +179,15 @@ bool NullableColumn::append_continuous_strings(const Buffer<Slice>& strs) {
     return false;
 }
 
+bool NullableColumn::append_continuous_fixed_length_strings(const char* data, size_t size, int fixed_length) {
+    if (_data_column->append_continuous_fixed_length_strings(data, size, fixed_length)) {
+        null_column_data().resize(_null_column->size() + size, 0);
+        return true;
+    }
+    DCHECK_EQ(_null_column->size(), _data_column->size());
+    return false;
+}
+
 size_t NullableColumn::append_numbers(const void* buff, size_t length) {
     size_t n;
     if ((n = _data_column->append_numbers(buff, length)) > 0) {
@@ -168,30 +213,32 @@ void NullableColumn::update_has_null() {
     _has_null = SIMD::contain_nonzero(_null_column->get_data(), 0);
 }
 
-Status NullableColumn::update_rows(const Column& src, const uint32_t* indexes) {
+void NullableColumn::update_rows(const Column& src, const uint32_t* indexes) {
     DCHECK_EQ(_null_column->size(), _data_column->size());
     size_t replace_num = src.size();
     if (src.is_nullable()) {
         const auto& c = down_cast<const NullableColumn&>(src);
-        RETURN_IF_ERROR(_null_column->update_rows(*c._null_column, indexes));
-        RETURN_IF_ERROR(_data_column->update_rows(*c._data_column, indexes));
+        _null_column->update_rows(*c._null_column, indexes);
+        _data_column->update_rows(*c._data_column, indexes);
         // update rows may convert between null and not null, so we need count every times
         update_has_null();
     } else {
         auto new_null_column = NullColumn::create();
         new_null_column->get_data().insert(new_null_column->get_data().end(), replace_num, 0);
-        RETURN_IF_ERROR(_null_column->update_rows(*new_null_column.get(), indexes));
-        RETURN_IF_ERROR(_data_column->update_rows(src, indexes));
+        _null_column->update_rows(*new_null_column.get(), indexes);
+        _data_column->update_rows(src, indexes);
     }
-
-    return Status::OK();
 }
 
-size_t NullableColumn::filter_range(const Column::Filter& filter, size_t from, size_t to) {
+size_t NullableColumn::filter_range(const Filter& filter, size_t from, size_t to) {
     auto s1 = _data_column->filter_range(filter, from, to);
-    auto s2 = _null_column->filter_range(filter, from, to);
-    update_has_null();
-    DCHECK_EQ(s1, s2);
+    if (!_has_null) {
+        _null_column->resize(s1);
+    } else {
+        auto s2 = _null_column->filter_range(filter, from, to);
+        DCHECK_EQ(s1, s2);
+        update_has_null();
+    }
     return s1;
 }
 
@@ -200,7 +247,7 @@ int NullableColumn::compare_at(size_t left, size_t right, const Column& rhs, int
         return rhs.is_null(right) ? 0 : nan_direction_hint;
     }
     if (rhs.is_nullable()) {
-        const NullableColumn& nullable_rhs = down_cast<const NullableColumn&>(rhs);
+        const auto& nullable_rhs = down_cast<const NullableColumn&>(rhs);
         if (nullable_rhs.immutable_null_column_data()[right]) {
             return -nan_direction_hint;
         }
@@ -208,6 +255,24 @@ int NullableColumn::compare_at(size_t left, size_t right, const Column& rhs, int
         return _data_column->compare_at(left, right, rhs_data, nan_direction_hint);
     } else {
         return _data_column->compare_at(left, right, rhs, nan_direction_hint);
+    }
+}
+
+int NullableColumn::equals(size_t left, const Column& rhs, size_t right, bool safe_eq) const {
+    if (immutable_null_column_data()[left]) {
+        return safe_eq ? rhs.is_null(right) : EQUALS_NULL;
+    }
+
+    // left not null
+    if (rhs.is_nullable()) {
+        const auto& nullable_rhs = down_cast<const NullableColumn&>(rhs);
+        if (nullable_rhs.immutable_null_column_data()[right]) {
+            return safe_eq ? EQUALS_FALSE : EQUALS_NULL;
+        }
+        const auto& rhs_data = *(nullable_rhs._data_column);
+        return _data_column->equals(left, rhs_data, right, safe_eq);
+    } else {
+        return _data_column->equals(left, rhs, right, safe_eq);
     }
 }
 
@@ -340,7 +405,7 @@ int64_t NullableColumn::xor_checksum(uint32_t from, uint32_t to) const {
     for (size_t i = 0; i < num; ++i) {
         xor_checksum ^= src[i];
         if (!src[i]) {
-            xor_checksum ^= _data_column->xor_checksum(i, i + 1);
+            xor_checksum ^= _data_column->xor_checksum(static_cast<uint32_t>(i), static_cast<uint32_t>(i + 1));
         }
     }
     return xor_checksum;
@@ -376,4 +441,4 @@ StatusOr<ColumnPtr> NullableColumn::downgrade() {
     return downgrade_helper_func(&_data_column);
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

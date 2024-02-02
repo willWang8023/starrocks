@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/test/olap/rowset/segment_v2/column_reader_writer_test.cpp
 
@@ -33,10 +46,9 @@
 #include "fs/fs_memory.h"
 #include "gen_cpp/segment.pb.h"
 #include "runtime/mem_pool.h"
+#include "storage/aggregate_type.h"
 #include "storage/chunk_helper.h"
-#include "storage/column_block.h"
 #include "storage/decimal12.h"
-#include "storage/field.h"
 #include "storage/olap_common.h"
 #include "storage/range.h"
 #include "storage/rowset/column_reader.h"
@@ -46,6 +58,7 @@
 #include "storage/rowset/segment.h"
 #include "storage/storage_engine.h"
 #include "storage/tablet_schema_helper.h"
+#include "storage/type_traits.h"
 #include "storage/types.h"
 #include "testutil/assert.h"
 #include "types/date_value.h"
@@ -86,12 +99,12 @@ protected:
     void TearDown() override {}
 
     std::shared_ptr<Segment> create_dummy_segment(const std::shared_ptr<FileSystem>& fs, const std::string& fname) {
-        return std::make_shared<Segment>(Segment::private_type(0), fs, fname, 1, _dummy_segment_schema.get());
+        return std::make_shared<Segment>(fs, FileInfo{fname}, 1, _dummy_segment_schema, nullptr);
     }
 
-    template <FieldType type, EncodingTypePB encoding, uint32_t version>
-    void test_nullable_data(const vectorized::Column& src, const std::string null_encoding = "0",
-                            const std::string null_ratio = "0") {
+    template <LogicalType type, EncodingTypePB encoding, uint32_t version>
+    void test_nullable_data(const Column& src, const std::string& null_encoding = "0",
+                            const std::string& null_ratio = "0") {
         config::set_config("null_encoding", null_encoding);
 
         using Type = typename TypeTraits<type>::CppType;
@@ -115,7 +128,7 @@ protected:
             writer_opts.meta->set_column_id(0);
             writer_opts.meta->set_unique_id(0);
             writer_opts.meta->set_type(type);
-            if (type == OLAP_FIELD_TYPE_CHAR || type == OLAP_FIELD_TYPE_VARCHAR) {
+            if (type == TYPE_CHAR || type == TYPE_VARCHAR) {
                 writer_opts.meta->set_length(128);
             } else {
                 writer_opts.meta->set_length(0);
@@ -125,10 +138,10 @@ protected:
             writer_opts.meta->set_is_nullable(true);
             writer_opts.need_zone_map = true;
 
-            TabletColumn column(OLAP_FIELD_AGGREGATION_NONE, type);
-            if (type == OLAP_FIELD_TYPE_VARCHAR) {
+            TabletColumn column(STORAGE_AGGREGATE_NONE, type);
+            if (type == TYPE_VARCHAR) {
                 column = create_varchar_key(1, true, 128);
-            } else if (type == OLAP_FIELD_TYPE_CHAR) {
+            } else if (type == TYPE_CHAR) {
                 column = create_char_key(1, true, 128);
             }
             ASSIGN_OR_ABORT(auto writer, ColumnWriter::create(writer_opts, &column, wfile.get()));
@@ -147,27 +160,20 @@ protected:
         }
         // read and check
         {
-            // create page cache
-            std::unique_ptr<MemTracker> page_cache_mem_tracker = std::make_unique<MemTracker>();
-            StoragePageCache::create_global_cache(page_cache_mem_tracker.get(), 1000000000);
             // read and check
             auto res = ColumnReader::create(&meta, segment.get());
             ASSERT_TRUE(res.ok());
             auto reader = std::move(res).value();
 
-            ColumnIterator* iter = nullptr;
-            auto st = reader->new_iterator(&iter);
-            ASSERT_TRUE(st.ok());
-            std::unique_ptr<ColumnIterator> guard(iter);
+            ASSIGN_OR_ABORT(auto iter, reader->new_iterator());
             ASSIGN_OR_ABORT(auto read_file, fs->new_random_access_file(fname));
 
-            ASSERT_TRUE(st.ok());
             ColumnIteratorOptions iter_opts;
             OlapReaderStatistics stats;
             iter_opts.stats = &stats;
             iter_opts.read_file = read_file.get();
             iter_opts.use_page_cache = true;
-            st = iter->init(iter_opts);
+            auto st = iter->init(iter_opts);
             ASSERT_TRUE(st.ok());
 
             // first read get data from disk
@@ -177,7 +183,7 @@ protected:
                 {
                     st = iter->seek_to_first();
                     ASSERT_TRUE(st.ok()) << st.to_string();
-                    vectorized::ColumnPtr dst = ChunkHelper::column_from_field_type(type, true);
+                    ColumnPtr dst = ChunkHelper::column_from_field_type(type, true);
                     // will do direct copy to column
                     size_t rows_read = src.size();
                     dst->reserve(rows_read);
@@ -199,7 +205,7 @@ protected:
                         ASSERT_TRUE(st.ok());
 
                         size_t rows_read = 1024;
-                        vectorized::ColumnPtr dst = ChunkHelper::column_from_field_type(type, true);
+                        ColumnPtr dst = ChunkHelper::column_from_field_type(type, true);
 
                         st = iter->next_batch(&rows_read, dst.get());
                         ASSERT_TRUE(st.ok());
@@ -216,12 +222,12 @@ protected:
                     st = iter->seek_to_first();
                     ASSERT_TRUE(st.ok());
 
-                    vectorized::ColumnPtr dst = ChunkHelper::column_from_field_type(type, true);
-                    vectorized::SparseRange read_range;
+                    ColumnPtr dst = ChunkHelper::column_from_field_type(type, true);
+                    SparseRange<> read_range;
                     size_t write_num = src.size();
-                    read_range.add(vectorized::Range(0, write_num / 3));
-                    read_range.add(vectorized::Range(write_num / 2, (write_num * 2 / 3)));
-                    read_range.add(vectorized::Range((write_num * 3 / 4), write_num));
+                    read_range.add(Range<>(0, write_num / 3));
+                    read_range.add(Range<>(write_num / 2, (write_num * 2 / 3)));
+                    read_range.add(Range<>((write_num * 3 / 4), write_num));
                     size_t read_num = read_range.span_size();
 
                     st = iter->next_batch(read_range, dst.get());
@@ -229,9 +235,9 @@ protected:
                     ASSERT_EQ(read_num, dst->size());
 
                     size_t offset = 0;
-                    vectorized::SparseRangeIterator read_iter = read_range.new_iterator();
+                    SparseRangeIterator<> read_iter = read_range.new_iterator();
                     while (read_iter.has_more()) {
-                        vectorized::Range r = read_iter.next(read_num);
+                        Range<> r = read_iter.next(read_num);
                         for (int i = 0; i < r.span_size(); ++i) {
                             ASSERT_EQ(0, type_info->cmp(src.get(r.begin() + i), dst->get(i + offset)))
                                     << " row " << r.begin() + i << ": "
@@ -245,7 +251,7 @@ protected:
         }
     }
 
-    template <FieldType type>
+    template <LogicalType type>
     void test_read_default_value(string value, void* result) {
         using Type = typename TypeTraits<type>::CppType;
         TypeInfoPtr type_info = get_type_info(type);
@@ -262,60 +268,46 @@ protected:
                 st = iter.seek_to_first();
                 ASSERT_TRUE(st.ok()) << st.to_string();
 
-                MemPool pool;
-                std::unique_ptr<ColumnVectorBatch> cvb;
-                ColumnVectorBatch::create(0, true, type_info, nullptr, &cvb);
-                cvb->resize(1024);
-                ColumnBlock col(cvb.get(), &pool);
+                auto column = ChunkHelper::column_from_field_type(type, true);
 
                 int idx = 0;
-                size_t rows_read = 1024;
-                ColumnBlockView dst(&col);
-                bool has_null;
-                st = iter.next_batch(&rows_read, &dst, &has_null);
+                size_t rows_read = 512;
+                st = iter.next_batch(&rows_read, column.get());
                 ASSERT_TRUE(st.ok());
                 for (int j = 0; j < rows_read; ++j) {
-                    if (type == OLAP_FIELD_TYPE_CHAR) {
-                        ASSERT_EQ(*(string*)result, reinterpret_cast<const Slice*>(col.cell_ptr(j))->to_string())
+                    if (type == TYPE_CHAR) {
+                        ASSERT_EQ(*(string*)result, reinterpret_cast<const Slice*>(column->raw_data())[j].to_string())
                                 << "j:" << j;
-                    } else if (type == OLAP_FIELD_TYPE_VARCHAR || type == OLAP_FIELD_TYPE_HLL ||
-                               type == OLAP_FIELD_TYPE_OBJECT) {
-                        ASSERT_EQ(value, reinterpret_cast<const Slice*>(col.cell_ptr(j))->to_string()) << "j:" << j;
+                    } else if (type == TYPE_VARCHAR || type == TYPE_HLL || type == TYPE_OBJECT) {
+                        ASSERT_EQ(value, reinterpret_cast<const Slice*>(column->raw_data())[j].to_string())
+                                << "j:" << j;
                     } else {
-                        ASSERT_EQ(*(Type*)result, *(reinterpret_cast<const Type*>(col.cell_ptr(j))));
+                        ASSERT_EQ(*(Type*)result, reinterpret_cast<const Type*>(column->raw_data())[j]);
                     }
                     idx++;
                 }
             }
 
             {
-                MemPool pool;
-                std::unique_ptr<ColumnVectorBatch> cvb;
-                ColumnVectorBatch::create(0, true, type_info, nullptr, &cvb);
-                cvb->resize(1024);
-                ColumnBlock col(cvb.get(), &pool);
+                auto column = ChunkHelper::column_from_field_type(type, true);
 
-                for (int rowid = 0; rowid < 2048; rowid += 128) {
+                for (int rowid = 0; rowid < 1024; rowid += 128) {
                     st = iter.seek_to_ordinal(rowid);
                     ASSERT_TRUE(st.ok());
 
-                    int idx = rowid;
-                    size_t rows_read = 1024;
-                    ColumnBlockView dst(&col);
-                    bool has_null;
-                    st = iter.next_batch(&rows_read, &dst, &has_null);
+                    size_t rows_read = 512;
+                    st = iter.next_batch(&rows_read, column.get());
                     ASSERT_TRUE(st.ok());
                     for (int j = 0; j < rows_read; ++j) {
-                        if (type == OLAP_FIELD_TYPE_CHAR) {
-                            ASSERT_EQ(*(string*)result, reinterpret_cast<const Slice*>(col.cell_ptr(j))->to_string())
+                        if (type == TYPE_CHAR) {
+                            ASSERT_EQ(*(string*)result,
+                                      reinterpret_cast<const Slice*>(column->raw_data())[j].to_string())
                                     << "j:" << j;
-                        } else if (type == OLAP_FIELD_TYPE_VARCHAR || type == OLAP_FIELD_TYPE_HLL ||
-                                   type == OLAP_FIELD_TYPE_OBJECT) {
-                            ASSERT_EQ(value, reinterpret_cast<const Slice*>(col.cell_ptr(j))->to_string());
+                        } else if (type == TYPE_VARCHAR || type == TYPE_HLL || type == TYPE_OBJECT) {
+                            ASSERT_EQ(value, reinterpret_cast<const Slice*>(column->raw_data())[j].to_string());
                         } else {
-                            ASSERT_EQ(*(Type*)result, *(reinterpret_cast<const Type*>(col.cell_ptr(j))));
+                            ASSERT_EQ(*(Type*)result, reinterpret_cast<const Type*>(column->raw_data())[j]);
                         }
-                        idx++;
                     }
                 }
             }
@@ -323,28 +315,28 @@ protected:
     }
 
     template <uint32_t version>
-    void test_int_array(std::string null_encoding = "0") {
+    void test_int_array(const std::string& null_encoding = "0") {
         config::set_config("null_encoding", null_encoding);
         auto fs = std::make_shared<MemoryFileSystem>();
         ASSERT_TRUE(fs->create_dir(TEST_DIR).ok());
 
         TabletColumn array_column = create_array(0, true, sizeof(Collection));
-        TabletColumn int_column = create_int_value(0, OLAP_FIELD_AGGREGATION_NONE, true);
+        TabletColumn int_column = create_int_value(0, STORAGE_AGGREGATE_NONE, true);
         array_column.add_sub_column(int_column);
 
-        auto src_offsets = vectorized::UInt32Column::create();
-        auto src_elements = vectorized::Int32Column::create();
-        vectorized::ColumnPtr src_column = vectorized::ArrayColumn::create(src_elements, src_offsets);
+        auto src_offsets = UInt32Column::create();
+        auto src_elements = NullableColumn::create(Int32Column::create(), NullColumn::create());
+        ColumnPtr src_column = ArrayColumn::create(src_elements, src_offsets);
 
         // insert [1, 2, 3], [4, 5, 6]
-        src_elements->append(1);
-        src_elements->append(2);
-        src_elements->append(3);
+        src_elements->append_datum(1);
+        src_elements->append_datum(2);
+        src_elements->append_datum(3);
         src_offsets->append(3);
 
-        src_elements->append(4);
-        src_elements->append(5);
-        src_elements->append(6);
+        src_elements->append_datum(4);
+        src_elements->append_datum(5);
+        src_elements->append_datum(6);
         src_offsets->append(6);
 
         TypeInfoPtr type_info = get_type_info(array_column);
@@ -362,7 +354,7 @@ protected:
             writer_opts.meta = &meta;
             writer_opts.meta->set_column_id(0);
             writer_opts.meta->set_unique_id(0);
-            writer_opts.meta->set_type(OLAP_FIELD_TYPE_ARRAY);
+            writer_opts.meta->set_type(TYPE_ARRAY);
             writer_opts.meta->set_length(0);
             writer_opts.meta->set_encoding(DEFAULT_ENCODING);
             writer_opts.meta->set_compression(starrocks::LZ4_FRAME);
@@ -398,9 +390,7 @@ protected:
             ASSERT_TRUE(res.ok());
             auto reader = std::move(res).value();
 
-            ColumnIterator* iter = nullptr;
-            ASSERT_TRUE(reader->new_iterator(&iter).ok());
-            std::unique_ptr<ColumnIterator> guard(iter);
+            ASSIGN_OR_ABORT(auto iter, reader->new_iterator());
             ASSIGN_OR_ABORT(auto read_file, fs->new_random_access_file(fname));
 
             ColumnIteratorOptions iter_opts;
@@ -414,29 +404,29 @@ protected:
                 auto st = iter->seek_to_first();
                 ASSERT_TRUE(st.ok()) << st.to_string();
 
-                auto dst_offsets = vectorized::UInt32Column::create();
-                auto dst_elements = vectorized::Int32Column::create();
-                auto dst_column = vectorized::ArrayColumn::create(dst_elements, dst_offsets);
+                auto dst_offsets = UInt32Column::create();
+                auto dst_elements = NullableColumn::create(Int32Column::create(), NullColumn::create());
+                auto dst_column = ArrayColumn::create(dst_elements, dst_offsets);
                 size_t rows_read = src_column->size();
                 st = iter->next_batch(&rows_read, dst_column.get());
                 ASSERT_TRUE(st.ok());
                 ASSERT_EQ(src_column->size(), rows_read);
 
-                ASSERT_EQ("[1, 2, 3]", dst_column->debug_item(0));
-                ASSERT_EQ("[4, 5, 6]", dst_column->debug_item(1));
+                ASSERT_EQ("[1,2,3]", dst_column->debug_item(0));
+                ASSERT_EQ("[4,5,6]", dst_column->debug_item(1));
             }
 
             ASSERT_EQ(2, meta.num_rows());
-            ASSERT_EQ(36, reader->total_mem_footprint());
+            ASSERT_EQ(42, reader->total_mem_footprint());
         }
     }
 
-    template <FieldType type>
-    vectorized::ColumnPtr numeric_data(int null_ratio) {
+    template <LogicalType type>
+    ColumnPtr numeric_data(int null_ratio) {
         using CppType = typename CppTypeTraits<type>::CppType;
         auto col = ChunkHelper::column_from_field_type(type, true);
         CppType value = 0;
-        size_t count = 2 * 1024 * 1024 / sizeof(CppType);
+        size_t count = 2 * 1024 / sizeof(CppType);
         col->reserve(count);
         for (size_t i = 0; i < count; ++i) {
             (void)col->append_numbers(&value, sizeof(CppType));
@@ -449,14 +439,14 @@ protected:
         return col;
     }
 
-    vectorized::ColumnPtr low_cardinality_strings(int null_ratio) {
+    ColumnPtr low_cardinality_strings(int null_ratio) {
         static std::string s1(4, 'a');
         static std::string s2(4, 'b');
         size_t count = 128 * 1024 / 4;
-        auto col = ChunkHelper::column_from_field_type(OLAP_FIELD_TYPE_VARCHAR, true);
-        auto nc = down_cast<vectorized::NullableColumn*>(col.get());
+        auto col = ChunkHelper::column_from_field_type(TYPE_VARCHAR, true);
+        auto nc = down_cast<NullableColumn*>(col.get());
         nc->reserve(count);
-        down_cast<vectorized::BinaryColumn*>(nc->data_column().get())->get_data().reserve(s1.size() * count);
+        down_cast<BinaryColumn*>(nc->data_column().get())->get_data().reserve(s1.size() * count);
         auto v = std::vector<Slice>{s1, s2, s1, s1, s2, s2, s1, s2, s1, s1, s2, s1, s2, s1, s1, s1};
         for (size_t i = 0; i < count; i += 16) {
             CHECK(col->append_strings(v));
@@ -469,7 +459,7 @@ protected:
         return col;
     }
 
-    vectorized::ColumnPtr high_cardinality_strings(int null_ratio) {
+    ColumnPtr high_cardinality_strings(int null_ratio) {
         std::string s1("abcdefghijklmnopqrstuvwxyz");
         std::string s2("bbcdefghijklmnopqrstuvwxyz");
         std::string s3("cbcdefghijklmnopqrstuvwxyz");
@@ -479,11 +469,11 @@ protected:
         std::string s7("gbcdefghijklmnopqrstuvwxyz");
         std::string s8("hbcdefghijklmnopqrstuvwxyz");
 
-        auto col = ChunkHelper::column_from_field_type(OLAP_FIELD_TYPE_VARCHAR, true);
+        auto col = ChunkHelper::column_from_field_type(TYPE_VARCHAR, true);
         size_t count = (128 * 1024 / s1.size()) / 8 * 8;
-        auto nc = down_cast<vectorized::NullableColumn*>(col.get());
+        auto nc = down_cast<NullableColumn*>(col.get());
         nc->reserve(count);
-        down_cast<vectorized::BinaryColumn*>(nc->data_column().get())->get_data().reserve(count * s1.size());
+        down_cast<BinaryColumn*>(nc->data_column().get())->get_data().reserve(count * s1.size());
         for (size_t i = 0; i < count; i += 8) {
             (void)col->append_strings({s1, s2, s3, s4, s5, s6, s7, s8});
 
@@ -504,37 +494,37 @@ protected:
         return col;
     }
 
-    vectorized::ColumnPtr date_values(int null_ratio) {
-        size_t count = 4 * 1024 * 1024 / sizeof(vectorized::DateValue);
-        auto col = ChunkHelper::column_from_field_type(OLAP_FIELD_TYPE_DATE_V2, true);
-        vectorized::DateValue value = vectorized::DateValue::create(2020, 10, 1);
+    ColumnPtr date_values(int null_ratio) {
+        size_t count = 4 * 1024 / sizeof(DateValue);
+        auto col = ChunkHelper::column_from_field_type(TYPE_DATE, true);
+        DateValue value = DateValue::create(2020, 10, 1);
         for (size_t i = 0; i < count; i++) {
             CHECK_EQ(1, col->append_numbers(&value, sizeof(value)));
-            value = value.add<vectorized::TimeUnit::DAY>(1);
+            value = value.add<TimeUnit::DAY>(1);
         }
         for (size_t i = 0; i < count; i += null_ratio) {
-            ((vectorized::DateValue*)col->raw_data())[i] = vectorized::DateValue{0};
+            ((DateValue*)col->raw_data())[i] = DateValue{0};
             CHECK(col->set_null(i));
         }
         return col;
     }
 
-    vectorized::ColumnPtr datetime_values(int null_ratio) {
-        size_t count = 4 * 1024 * 1024 / sizeof(vectorized::TimestampValue);
-        auto col = ChunkHelper::column_from_field_type(OLAP_FIELD_TYPE_TIMESTAMP, true);
-        vectorized::TimestampValue value = vectorized::TimestampValue::create(2020, 10, 1, 10, 20, 1);
+    ColumnPtr datetime_values(int null_ratio) {
+        size_t count = 4 * 1024 / sizeof(TimestampValue);
+        auto col = ChunkHelper::column_from_field_type(TYPE_DATETIME, true);
+        TimestampValue value = TimestampValue::create(2020, 10, 1, 10, 20, 1);
         for (size_t i = 0; i < count; i++) {
             CHECK_EQ(1, col->append_numbers(&value, sizeof(value)));
-            value = value.add<vectorized::TimeUnit::MICROSECOND>(1);
+            value = value.add<TimeUnit::MICROSECOND>(1);
         }
         for (size_t i = 0; i < count; i += null_ratio) {
-            ((vectorized::TimestampValue*)col->raw_data())[i] = vectorized::TimestampValue{0};
+            ((TimestampValue*)col->raw_data())[i] = TimestampValue{0};
             CHECK(col->set_null(i));
         }
         return col;
     }
 
-    template <FieldType type>
+    template <LogicalType type>
     void test_numeric_types() {
         auto col = numeric_data<type>(1);
         test_nullable_data<type, BIT_SHUFFLE, 1>(*col, "0", "1");
@@ -558,49 +548,49 @@ protected:
 
 // NOLINTNEXTLINE
 TEST_F(ColumnReaderWriterTest, test_int) {
-    test_numeric_types<OLAP_FIELD_TYPE_INT>();
+    test_numeric_types<TYPE_INT>();
 }
 
 // NOLINTNEXTLINE
 TEST_F(ColumnReaderWriterTest, test_double) {
-    test_numeric_types<OLAP_FIELD_TYPE_DOUBLE>();
+    test_numeric_types<TYPE_DOUBLE>();
 }
 
 // NOLINTNEXTLINE
 TEST_F(ColumnReaderWriterTest, test_date) {
     auto col = date_values(100);
-    test_nullable_data<OLAP_FIELD_TYPE_DATE_V2, BIT_SHUFFLE, 1>(*col, "0", "100");
-    test_nullable_data<OLAP_FIELD_TYPE_DATE_V2, BIT_SHUFFLE, 2>(*col, "0", "100");
-    test_nullable_data<OLAP_FIELD_TYPE_DATE_V2, BIT_SHUFFLE, 2>(*col, "1", "100");
+    test_nullable_data<TYPE_DATE, BIT_SHUFFLE, 1>(*col, "0", "100");
+    test_nullable_data<TYPE_DATE, BIT_SHUFFLE, 2>(*col, "0", "100");
+    test_nullable_data<TYPE_DATE, BIT_SHUFFLE, 2>(*col, "1", "100");
 }
 
 // NOLINTNEXTLINE
 TEST_F(ColumnReaderWriterTest, test_datetime) {
     auto col = datetime_values(100);
-    test_nullable_data<OLAP_FIELD_TYPE_TIMESTAMP, BIT_SHUFFLE, 1>(*col, "0", "100");
-    test_nullable_data<OLAP_FIELD_TYPE_TIMESTAMP, BIT_SHUFFLE, 2>(*col, "0", "100");
-    test_nullable_data<OLAP_FIELD_TYPE_TIMESTAMP, BIT_SHUFFLE, 2>(*col, "1", "100");
+    test_nullable_data<TYPE_DATETIME, BIT_SHUFFLE, 1>(*col, "0", "100");
+    test_nullable_data<TYPE_DATETIME, BIT_SHUFFLE, 2>(*col, "0", "100");
+    test_nullable_data<TYPE_DATETIME, BIT_SHUFFLE, 2>(*col, "1", "100");
 }
 
 // NOLINTNEXTLINE
 TEST_F(ColumnReaderWriterTest, test_binary) {
     auto c = low_cardinality_strings(10000);
-    test_nullable_data<OLAP_FIELD_TYPE_VARCHAR, DICT_ENCODING, 1>(*c, "0", "10000");
-    test_nullable_data<OLAP_FIELD_TYPE_VARCHAR, DICT_ENCODING, 2>(*c, "0", "10000");
-    test_nullable_data<OLAP_FIELD_TYPE_VARCHAR, DICT_ENCODING, 2>(*c, "1", "10000");
+    test_nullable_data<TYPE_VARCHAR, DICT_ENCODING, 1>(*c, "0", "10000");
+    test_nullable_data<TYPE_VARCHAR, DICT_ENCODING, 2>(*c, "0", "10000");
+    test_nullable_data<TYPE_VARCHAR, DICT_ENCODING, 2>(*c, "1", "10000");
 
-    test_nullable_data<OLAP_FIELD_TYPE_CHAR, DICT_ENCODING, 1>(*c, "0", "10000");
-    test_nullable_data<OLAP_FIELD_TYPE_CHAR, DICT_ENCODING, 2>(*c, "0", "10000");
-    test_nullable_data<OLAP_FIELD_TYPE_CHAR, DICT_ENCODING, 2>(*c, "1", "10000");
+    test_nullable_data<TYPE_CHAR, DICT_ENCODING, 1>(*c, "0", "10000");
+    test_nullable_data<TYPE_CHAR, DICT_ENCODING, 2>(*c, "0", "10000");
+    test_nullable_data<TYPE_CHAR, DICT_ENCODING, 2>(*c, "1", "10000");
 
     c = high_cardinality_strings(100);
-    test_nullable_data<OLAP_FIELD_TYPE_VARCHAR, DICT_ENCODING, 1>(*c, "0", "100");
-    test_nullable_data<OLAP_FIELD_TYPE_VARCHAR, DICT_ENCODING, 2>(*c, "0", "100");
-    test_nullable_data<OLAP_FIELD_TYPE_VARCHAR, DICT_ENCODING, 2>(*c, "1", "100");
+    test_nullable_data<TYPE_VARCHAR, DICT_ENCODING, 1>(*c, "0", "100");
+    test_nullable_data<TYPE_VARCHAR, DICT_ENCODING, 2>(*c, "0", "100");
+    test_nullable_data<TYPE_VARCHAR, DICT_ENCODING, 2>(*c, "1", "100");
 
-    test_nullable_data<OLAP_FIELD_TYPE_CHAR, DICT_ENCODING, 1>(*c, "0", "100");
-    test_nullable_data<OLAP_FIELD_TYPE_CHAR, DICT_ENCODING, 2>(*c, "0", "100");
-    test_nullable_data<OLAP_FIELD_TYPE_CHAR, DICT_ENCODING, 2>(*c, "1", "100");
+    test_nullable_data<TYPE_CHAR, DICT_ENCODING, 1>(*c, "0", "100");
+    test_nullable_data<TYPE_CHAR, DICT_ENCODING, 2>(*c, "0", "100");
+    test_nullable_data<TYPE_CHAR, DICT_ENCODING, 2>(*c, "1", "100");
 }
 
 #ifdef STRING_COLUMN_WRITER_TEST
@@ -608,7 +598,7 @@ TEST_F(ColumnReaderWriterTest, test_binary) {
 TEST_F(ColumnReaderWriterTest, test_string_column_writer_benchmark) {
     for (int i = 0; i < 10000; i++) {
         auto c = high_cardinality_strings(100000);
-        test_nullable_data<OLAP_FIELD_TYPE_VARCHAR, PLAIN_ENCODING, 1>(*c, "0", "10000");
+        test_nullable_data<TYPE_VARCHAR, PLAIN_ENCODING, 1>(*c, "0", "10000");
     }
 }
 #endif
@@ -617,48 +607,48 @@ TEST_F(ColumnReaderWriterTest, test_string_column_writer_benchmark) {
 TEST_F(ColumnReaderWriterTest, test_default_value) {
     std::string v_int("1");
     int32_t result = 1;
-    test_read_default_value<OLAP_FIELD_TYPE_TINYINT>(v_int, &result);
-    test_read_default_value<OLAP_FIELD_TYPE_SMALLINT>(v_int, &result);
-    test_read_default_value<OLAP_FIELD_TYPE_INT>(v_int, &result);
+    test_read_default_value<TYPE_TINYINT>(v_int, &result);
+    test_read_default_value<TYPE_SMALLINT>(v_int, &result);
+    test_read_default_value<TYPE_INT>(v_int, &result);
 
     std::string v_bigint("9223372036854775807");
     int64_t result_bigint = std::numeric_limits<int64_t>::max();
-    test_read_default_value<OLAP_FIELD_TYPE_BIGINT>(v_bigint, &result_bigint);
+    test_read_default_value<TYPE_BIGINT>(v_bigint, &result_bigint);
     int128_t result_largeint = std::numeric_limits<int64_t>::max();
-    test_read_default_value<OLAP_FIELD_TYPE_LARGEINT>(v_bigint, &result_largeint);
+    test_read_default_value<TYPE_LARGEINT>(v_bigint, &result_largeint);
 
     std::string v_float("1.00");
     float result2 = 1.00;
-    test_read_default_value<OLAP_FIELD_TYPE_FLOAT>(v_float, &result2);
+    test_read_default_value<TYPE_FLOAT>(v_float, &result2);
 
     std::string v_double("1.00");
     double result3 = 1.00;
-    test_read_default_value<OLAP_FIELD_TYPE_DOUBLE>(v_double, &result3);
+    test_read_default_value<TYPE_DOUBLE>(v_double, &result3);
 
     std::string v_varchar("varchar");
-    test_read_default_value<OLAP_FIELD_TYPE_VARCHAR>(v_varchar, &v_varchar);
+    test_read_default_value<TYPE_VARCHAR>(v_varchar, &v_varchar);
 
     std::string v_char("char");
-    test_read_default_value<OLAP_FIELD_TYPE_CHAR>(v_char, &v_char);
+    test_read_default_value<TYPE_CHAR>(v_char, &v_char);
 
     char* c = (char*)malloc(1);
     c[0] = 0;
     std::string v_object(c, 1);
-    test_read_default_value<OLAP_FIELD_TYPE_HLL>(v_object, &v_object);
-    test_read_default_value<OLAP_FIELD_TYPE_OBJECT>(v_object, &v_object);
+    test_read_default_value<TYPE_HLL>(v_object, &v_object);
+    test_read_default_value<TYPE_OBJECT>(v_object, &v_object);
     free(c);
 
     std::string v_date("2019-11-12");
     uint24_t result_date(1034092);
-    test_read_default_value<OLAP_FIELD_TYPE_DATE>(v_date, &result_date);
+    test_read_default_value<TYPE_DATE_V1>(v_date, &result_date);
 
     std::string v_datetime("2019-11-12 12:01:08");
     int64_t result_datetime = 20191112120108;
-    test_read_default_value<OLAP_FIELD_TYPE_DATETIME>(v_datetime, &result_datetime);
+    test_read_default_value<TYPE_DATETIME_V1>(v_datetime, &result_datetime);
 
     std::string v_decimal("102418.000000002");
     decimal12_t decimal(102418, 2);
-    test_read_default_value<OLAP_FIELD_TYPE_DECIMAL>(v_decimal, &decimal);
+    test_read_default_value<TYPE_DECIMAL>(v_decimal, &decimal);
 }
 
 // test array<int>, and nullable
@@ -668,7 +658,7 @@ TEST_F(ColumnReaderWriterTest, test_array_int) {
 }
 
 TEST_F(ColumnReaderWriterTest, test_scalar_column_total_mem_footprint) {
-    auto col = ChunkHelper::column_from_field_type(OLAP_FIELD_TYPE_INT, true);
+    auto col = ChunkHelper::column_from_field_type(TYPE_INT, true);
     size_t count = 1024;
     col->reserve(count);
     for (int32_t i = 0; i < count; ++i) {
@@ -694,14 +684,14 @@ TEST_F(ColumnReaderWriterTest, test_scalar_column_total_mem_footprint) {
         writer_opts.meta = &meta;
         writer_opts.meta->set_column_id(0);
         writer_opts.meta->set_unique_id(0);
-        writer_opts.meta->set_type(OLAP_FIELD_TYPE_INT);
+        writer_opts.meta->set_type(TYPE_INT);
         writer_opts.meta->set_length(0);
         writer_opts.meta->set_encoding(BIT_SHUFFLE);
         writer_opts.meta->set_compression(starrocks::LZ4_FRAME);
         writer_opts.meta->set_is_nullable(true);
         writer_opts.need_zone_map = true;
 
-        TabletColumn column(OLAP_FIELD_AGGREGATION_NONE, OLAP_FIELD_TYPE_INT);
+        TabletColumn column(STORAGE_AGGREGATE_NONE, TYPE_INT);
         ASSIGN_OR_ABORT(auto writer, ColumnWriter::create(writer_opts, &column, wfile.get()));
         ASSERT_OK(writer->init());
 
@@ -724,6 +714,89 @@ TEST_F(ColumnReaderWriterTest, test_scalar_column_total_mem_footprint) {
         auto reader = std::move(res).value();
         ASSERT_EQ(1024, meta.num_rows());
         ASSERT_EQ(1024 * 4 + 1024, reader->total_mem_footprint());
+    }
+}
+
+TEST_F(ColumnReaderWriterTest, test_large_varchar_column_writer) {
+    auto fs = std::make_shared<MemoryFileSystem>();
+    ASSERT_TRUE(fs->create_dir(TEST_DIR).ok());
+    const std::string fname = strings::Substitute("$0/test_large_varchar_column_writer.data", TEST_DIR);
+    // write data
+    {
+        int32_t old_config = config::dictionary_speculate_min_chunk_size;
+        const int TEST_N = 100;
+        // Test 3 different dictionary_speculate_min_chunk_size.
+        int32_t dict_chunk_sizes[3] = {TEST_N - 1, TEST_N, TEST_N + 1};
+        for (int32_t dict_chunk_size : dict_chunk_sizes) {
+            fs->delete_file(fname);
+            ASSIGN_OR_ABORT(auto wfile, fs->new_writable_file(fname));
+            ColumnMetaPB meta;
+            ColumnWriterOptions writer_opts;
+            writer_opts.page_format = 2;
+            writer_opts.meta = &meta;
+            writer_opts.meta->set_column_id(0);
+            writer_opts.meta->set_unique_id(0);
+            writer_opts.meta->set_type(TYPE_VARCHAR);
+            writer_opts.meta->set_length(1024 * 1024);
+            writer_opts.meta->set_encoding(PLAIN_ENCODING);
+            writer_opts.meta->set_compression(starrocks::LZ4_FRAME);
+            writer_opts.meta->set_is_nullable(true);
+            writer_opts.need_zone_map = true;
+
+            TabletColumn column(STORAGE_AGGREGATE_NONE, TYPE_VARCHAR);
+            column = create_varchar_key(1, true, 1024 * 1024);
+            ASSIGN_OR_ABORT(auto writer, ColumnWriter::create(writer_opts, &column, wfile.get()));
+            ASSERT_OK(writer->init());
+            config::dictionary_speculate_min_chunk_size = dict_chunk_size;
+            auto col = ChunkHelper::column_from_field_type(TYPE_VARCHAR, true);
+            config::dictionary_speculate_min_chunk_size = 4096;
+            std::vector<Slice> col_slices;
+            std::vector<std::string> col_strs;
+            col_strs.resize(TEST_N);
+            for (int i = 0; i < TEST_N; i++) {
+                col_strs[i] = strings::Substitute("test_$0", i);
+                col_slices.push_back(Slice(col_strs[i]));
+            }
+            col->reserve(TEST_N);
+            col->append_strings(col_slices);
+            ASSERT_TRUE(writer->append(*col).ok());
+
+            ASSERT_TRUE(writer->finish().ok());
+            ASSERT_TRUE(writer->write_data().ok());
+            ASSERT_TRUE(writer->write_ordinal_index().ok());
+            ASSERT_TRUE(writer->write_zone_map().ok());
+
+            // close the file
+            ASSERT_TRUE(wfile->close().ok());
+            // read and check result
+            auto segment = create_dummy_segment(fs, fname);
+            auto res = ColumnReader::create(&meta, segment.get());
+            ASSERT_TRUE(res.ok());
+            auto reader = std::move(res).value();
+            ASSIGN_OR_ABORT(auto iter, reader->new_iterator());
+            ASSIGN_OR_ABORT(auto read_file, fs->new_random_access_file(fname));
+            ColumnIteratorOptions iter_opts;
+            OlapReaderStatistics stats;
+            iter_opts.stats = &stats;
+            iter_opts.read_file = read_file.get();
+            iter_opts.use_page_cache = true;
+            auto st = iter->init(iter_opts);
+            ASSERT_TRUE(st.ok());
+            ASSERT_TRUE(iter->seek_to_first().ok());
+            ColumnPtr dst = ChunkHelper::column_from_field_type(TYPE_VARCHAR, true);
+            dst->reserve(TEST_N);
+            size_t rows_read = TEST_N;
+            ASSERT_TRUE(iter->next_batch(&rows_read, dst.get()).ok());
+            ASSERT_EQ(dst->size(), TEST_N);
+
+            TypeInfoPtr type_info = get_type_info(TYPE_VARCHAR);
+            for (size_t i = 0; i < TEST_N; i++) {
+                ASSERT_EQ(0, type_info->cmp(col->get(i), dst->get(i)))
+                        << " row " << i << ": " << datum_to_string(type_info.get(), col->get(i)) << " vs "
+                        << datum_to_string(type_info.get(), dst->get(i));
+            }
+        }
+        config::dictionary_speculate_min_chunk_size = old_config;
     }
 }
 

@@ -1,13 +1,3 @@
-[sql]
-select
-    sum(l_extendedprice * l_discount) as revenue
-from
-    lineitem
-where
-        l_shipdate >= date '1995-01-01'
-  and l_shipdate < date '1996-01-01'
-  and l_discount between 0.02 and 0.04
-  and l_quantity < 24 ;
 [fragment]
 PLAN FRAGMENT 0
 OUTPUT EXPRS:19: sum
@@ -30,11 +20,12 @@ EXCHANGE ID: 03
 UNPARTITIONED
 
 2:AGGREGATE (update serialize)
-|  output: sum(18: expr)
+|  output: sum(6: L_EXTENDEDPRICE * 7: L_DISCOUNT)
 |  group by:
 |
 1:Project
-|  <slot 18> : 6: L_EXTENDEDPRICE * 7: L_DISCOUNT
+|  <slot 6> : 6: L_EXTENDEDPRICE
+|  <slot 7> : 7: L_DISCOUNT
 |
 0:OlapScanNode
 TABLE: lineitem
@@ -43,9 +34,7 @@ PREDICATES: 11: L_SHIPDATE >= '1995-01-01', 11: L_SHIPDATE < '1996-01-01', 7: L_
 partitions=1/1
 rollup: lineitem
 tabletRatio=20/20
-tabletList=10213,10215,10217,10219,10221,10223,10225,10227,10229,10231 ...
 cardinality=8142251
 avgRowSize=36.0
-numNodes=0
 [end]
 

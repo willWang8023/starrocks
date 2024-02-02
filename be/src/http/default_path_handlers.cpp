@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/http/default_path_handlers.cpp
 
@@ -21,11 +34,6 @@
 
 #include "http/default_path_handlers.h"
 
-#ifdef USE_JEMALLOC
-#include "jemalloc/jemalloc.h"
-#else
-#include <gperftools/malloc_extension.h>
-#endif
 #include <gutil/strings/numbers.h>
 #include <gutil/strings/substitute.h>
 
@@ -34,6 +42,7 @@
 
 #include "common/configbase.h"
 #include "http/web_page_handler.h"
+#include "jemalloc/jemalloc.h"
 #include "runtime/exec_env.h"
 #include "runtime/mem_tracker.h"
 #include "storage/storage_engine.h"
@@ -75,6 +84,7 @@ void logs_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* ou
 void config_handler(const WebPageHandler::ArgumentMap& args, std::stringstream* output) {
     (*output) << "<h2>Configurations</h2>";
     (*output) << "<pre>";
+    std::lock_guard<std::mutex> l(*config::get_mstring_conf_lock());
     for (const auto& it : *(config::full_conf_map)) {
         (*output) << it.first << "=" << it.second << std::endl;
     }
@@ -113,37 +123,40 @@ void mem_tracker_handler(MemTracker* mem_tracker, const WebPageHandler::Argument
     iter = args.find("type");
     if (iter != args.end()) {
         if (iter->second == "compaction") {
-            start_mem_tracker = ExecEnv::GetInstance()->compaction_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->compaction_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "load") {
-            start_mem_tracker = ExecEnv::GetInstance()->load_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->load_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "metadata") {
-            start_mem_tracker = ExecEnv::GetInstance()->metadata_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->metadata_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "query_pool") {
-            start_mem_tracker = ExecEnv::GetInstance()->query_pool_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->query_pool_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "schema_change") {
-            start_mem_tracker = ExecEnv::GetInstance()->schema_change_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->schema_change_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "clone") {
-            start_mem_tracker = ExecEnv::GetInstance()->clone_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->clone_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "column_pool") {
-            start_mem_tracker = ExecEnv::GetInstance()->column_pool_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->column_pool_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "page_cache") {
-            start_mem_tracker = ExecEnv::GetInstance()->page_cache_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->page_cache_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "update") {
-            start_mem_tracker = ExecEnv::GetInstance()->update_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->update_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "chunk_allocator") {
-            start_mem_tracker = ExecEnv::GetInstance()->chunk_allocator_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->chunk_allocator_mem_tracker();
             cur_level = 2;
         } else if (iter->second == "consistency") {
-            start_mem_tracker = ExecEnv::GetInstance()->consistency_mem_tracker();
+            start_mem_tracker = GlobalEnv::GetInstance()->consistency_mem_tracker();
+            cur_level = 2;
+        } else if (iter->second == "datacache") {
+            start_mem_tracker = GlobalEnv::GetInstance()->datacache_mem_tracker();
             cur_level = 2;
         } else {
             start_mem_tracker = mem_tracker;
@@ -158,7 +171,7 @@ void mem_tracker_handler(MemTracker* mem_tracker, const WebPageHandler::Argument
 
     // Metadata memory statistics use the old memory framework,
     // not in RootMemTrackerTree, so it needs to be added here
-    MemTracker* meta_mem_tracker = ExecEnv::GetInstance()->metadata_mem_tracker();
+    MemTracker* meta_mem_tracker = GlobalEnv::GetInstance()->metadata_mem_tracker();
     MemTracker::SimpleItem meta_item{"metadata",
                                      "process",
                                      2,
@@ -168,7 +181,7 @@ void mem_tracker_handler(MemTracker* mem_tracker, const WebPageHandler::Argument
 
     // Update memory statistics use the old memory framework,
     // not in RootMemTrackerTree, so it needs to be added here
-    MemTracker* update_mem_tracker = ExecEnv::GetInstance()->update_mem_tracker();
+    MemTracker* update_mem_tracker = GlobalEnv::GetInstance()->update_mem_tracker();
     MemTracker::SimpleItem update_item{"update",
                                        "process",
                                        2,
@@ -178,7 +191,7 @@ void mem_tracker_handler(MemTracker* mem_tracker, const WebPageHandler::Argument
 
     if (start_mem_tracker != nullptr) {
         start_mem_tracker->list_mem_usage(&items, cur_level, upper_level);
-        if (start_mem_tracker == ExecEnv::GetInstance()->process_mem_tracker()) {
+        if (start_mem_tracker == GlobalEnv::GetInstance()->process_mem_tracker()) {
             items.emplace_back(meta_item);
             items.emplace_back(update_item);
         }
@@ -197,12 +210,10 @@ void mem_tracker_handler(MemTracker* mem_tracker, const WebPageHandler::Argument
     (*output) << "</tbody></table>\n";
 }
 
-#ifdef USE_JEMALLOC
 void malloc_stats_write_cb(void* opaque, const char* data) {
-    std::string* buf = static_cast<std::string*>(opaque);
+    auto* buf = static_cast<std::string*>(opaque);
     buf->append(data);
 }
-#endif
 
 // Registered to handle "/memz", and prints out memory allocation statistics.
 void mem_usage_handler(MemTracker* mem_tracker, const WebPageHandler::ArgumentMap& args, std::stringstream* output) {
@@ -220,18 +231,11 @@ void mem_usage_handler(MemTracker* mem_tracker, const WebPageHandler::ArgumentMa
     (*output) << "<pre>";
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
     (*output) << "Memory tracking is not available with address sanitizer builds.";
-#elif defined(USE_JEMALLOC)
+#else
     std::string buf;
     je_malloc_stats_print(malloc_stats_write_cb, &buf, "a");
     boost::replace_all(buf, "\n", "<br>");
     (*output) << buf << "</pre>";
-#else
-    char buf[2048];
-    MallocExtension::instance()->GetStats(buf, 2048);
-    // Replace new lines with <br> for html
-    std::string tmp(buf);
-    boost::replace_all(tmp, "\n", "<br>");
-    (*output) << tmp << "</pre>";
 #endif
     (*output) << "<pre>";
     string stats = StorageEngine::instance()->update_manager()->detail_memory_stats();

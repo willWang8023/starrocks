@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.starrocks.analysis.StringLiteral;
@@ -74,15 +87,34 @@ public class AnalyzeFunctionTest {
     }
 
     @Test
-    public void testDateFloor() {
+    public void testTimeSlice() {
         analyzeSuccess("select time_slice(th, interval 1 year) from tall");
+        analyzeSuccess("select time_slice(th, interval 1 year, ceil) from tall");
         analyzeSuccess("select time_slice(th, interval 1 month) from tall");
+        analyzeSuccess("select time_slice(th, interval 1 month, ceil) from tall");
         analyzeSuccess("select time_slice(th, interval 1 day) from tall");
+        analyzeSuccess("select time_slice(th, interval 1 day, ceil) from tall");
         analyzeSuccess("select time_slice(th, interval 1 week) from tall");
+        analyzeSuccess("select time_slice(th, interval 1 week, ceil) from tall");
         analyzeSuccess("select time_slice(th, interval 1 quarter) from tall");
+        analyzeSuccess("select time_slice(th, interval 1 quarter, ceil) from tall");
         analyzeSuccess("select time_slice(th, interval 1 hour) from tall");
+        analyzeSuccess("select time_slice(th, interval 1 hour, ceil) from tall");
         analyzeSuccess("select time_slice(th, interval 1 minute) from tall");
+        analyzeSuccess("select time_slice(th, interval 1 minute, ceil) from tall");
         analyzeSuccess("select time_slice(th, interval 1 second) from tall");
+        analyzeSuccess("select time_slice(th, interval 1 second, ceil) from tall");
+
+        analyzeSuccess("select date_slice(ti, interval 1 year) from tall");
+        analyzeSuccess("select date_slice(ti, interval 1 year, ceil) from tall");
+        analyzeSuccess("select date_slice(ti, interval 1 month) from tall");
+        analyzeSuccess("select date_slice(ti, interval 1 month, ceil) from tall");
+        analyzeSuccess("select date_slice(ti, interval 1 day) from tall");
+        analyzeSuccess("select date_slice(ti, interval 1 day, ceil) from tall");
+        analyzeSuccess("select date_slice(ti, interval 1 week) from tall");
+        analyzeSuccess("select date_slice(ti, interval 1 week, ceil) from tall");
+        analyzeSuccess("select date_slice(ti, interval 1 quarter) from tall");
+        analyzeSuccess("select date_slice(ti, interval 1 quarter, ceil) from tall");
 
         analyzeFail("select time_slice(ta, th) from tall",
                 "time_slice requires second parameter must be a constant interval");
@@ -92,6 +124,15 @@ public class AnalyzeFunctionTest {
 
         analyzeFail("select time_slice(ta, -1) from tall",
                 "time_slice requires second parameter must be greater than 0");
+
+        analyzeFail("select time_slice(th, interval 1 second, FCEILK) from tall",
+                "Incorrect type/value of arguments in expr 'time_slice'");
+
+        analyzeFail("select time_slice('2023-12-31 03:12:04',interval -3.2 day)",
+                "time_slice requires second parameter must be a constant interval");
+
+        analyzeFail("select date_slice('2023-12-31',interval -3.2 day)",
+                "date_slice requires second parameter must be a constant interval");
     }
 
     @Test
@@ -125,61 +166,61 @@ public class AnalyzeFunctionTest {
         QueryStatement queryStatement =
                 (QueryStatement) analyzeSuccess("select date_add('2022-01-01', interval 2 day)");
         Assert.assertEquals("SELECT date_add('2022-01-01 00:00:00', INTERVAL 2 DAY)",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select date_add('2022-01-01 00:00:00', interval 2 day)");
         Assert.assertEquals("SELECT date_add('2022-01-01 00:00:00', INTERVAL 2 DAY)",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select date_add('2022-01-01', interval 2 minute)");
         Assert.assertEquals("SELECT date_add('2022-01-01 00:00:00', INTERVAL 2 MINUTE)",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select date_add('2022-01-01 00:00:00', interval 2 minute)");
         Assert.assertEquals("SELECT date_add('2022-01-01 00:00:00', INTERVAL 2 MINUTE)",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select timestampadd(day, 2, '2022-01-01')");
         Assert.assertEquals("SELECT timestampadd(DAY, 2, '2022-01-01 00:00:00')",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select date_add('2022-01-01', 2)");
         Assert.assertEquals("SELECT date_add('2022-01-01 00:00:00', INTERVAL 2 DAY)",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select date_add('2022-01-01', interval 2 year)");
         Assert.assertEquals("SELECT date_add('2022-01-01 00:00:00', INTERVAL 2 YEAR)",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select date_sub('2022-01-01', interval 2 year)");
         Assert.assertEquals("SELECT date_sub('2022-01-01 00:00:00', INTERVAL 2 YEAR)",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select subdate('2022-01-01', interval 2 year)");
         Assert.assertEquals("SELECT subdate('2022-01-01 00:00:00', INTERVAL 2 YEAR)",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select date_add('2022-01-01', interval 2 year)");
         Assert.assertEquals("SELECT date_add('2022-01-01 00:00:00', INTERVAL 2 YEAR)",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select timestampdiff(day, '2020-01-01', '2020-01-03')");
         Assert.assertEquals("SELECT timestampdiff(DAY, '2020-01-01 00:00:00', '2020-01-03 00:00:00')",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess(
                 "select timestampdiff(day, '2020-01-01 00:00:00', '2020-01-03 00:00:00')");
         Assert.assertEquals("SELECT timestampdiff(DAY, '2020-01-01 00:00:00', '2020-01-03 00:00:00')",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess("select timestampdiff(minute, '2020-01-01', '2020-01-03')");
         Assert.assertEquals("SELECT timestampdiff(MINUTE, '2020-01-01 00:00:00', '2020-01-03 00:00:00')",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
 
         queryStatement = (QueryStatement) analyzeSuccess(
                 "select timestampdiff(minute, '2020-01-01 00:00:00', '2020-01-03 00:00:00')");
         Assert.assertEquals("SELECT timestampdiff(MINUTE, '2020-01-01 00:00:00', '2020-01-03 00:00:00')",
-                AST2SQL.toString(queryStatement.getQueryRelation()));
+                AstToStringBuilder.toString(queryStatement.getQueryRelation()));
     }
 
     @Test
@@ -197,6 +238,7 @@ public class AnalyzeFunctionTest {
 
         analyzeSuccess("select password('root')");
 
+        analyzeSuccess("select ilike(ta, ta) from tall");
         analyzeSuccess("select like(ta, ta) from tall");
         analyzeSuccess("select regexp(ta, ta) from tall");
         analyzeSuccess("select rlike(ta, ta) from tall");
@@ -213,7 +255,8 @@ public class AnalyzeFunctionTest {
         analyzeSuccess("SELECT {fn ucase(`ta`)} FROM tall");
         analyzeSuccess("SELECT {fn UCASE(ucase(`ta`))} FROM tall");
         analyzeSuccess("select { fn extract(year from th)} from tall");
-        analyzeFail("select {fn date_format(th, \"%Y\")} from tall", "invalid odbc scalar function");
+        analyzeFail("select {fn date_format(th, \"%Y\")} from tall",
+                "Invalid odbc scalar function 'date_format(th, '%Y')'");
     }
 
     @Test
@@ -242,5 +285,14 @@ public class AnalyzeFunctionTest {
                 "DROP FUNCTION f(int, ...)", getConnectContext());
         UtFrameUtils.parseStmtWithNewParserNotIncludeAnalyzer(
                 "DROP FUNCTION db.f(int, char(2))", getConnectContext());
+    }
+
+    @Test
+    public void testStatistics() throws Exception {
+        analyzeFail("select corr(v1,3) from t0");
+        analyzeFail("select covar_samp(v1,3) from t0");
+        analyzeFail("select covar_samp(3,v1) from t0");
+        analyzeFail("select covar_pop(v1,3) from t0");
+        analyzeFail("select corr(v1) from t0");
     }
 }

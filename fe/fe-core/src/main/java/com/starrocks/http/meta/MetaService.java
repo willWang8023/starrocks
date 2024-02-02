@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/meta/MetaService.java
 
@@ -33,6 +46,7 @@ import com.starrocks.persist.MetaCleaner;
 import com.starrocks.persist.Storage;
 import com.starrocks.persist.StorageInfo;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
 import com.starrocks.staros.StarMgrServer;
 import com.starrocks.system.Frontend;
 import io.netty.handler.codec.http.HttpMethod;
@@ -302,7 +316,7 @@ public class MetaService {
 
             if (!Strings.isNullOrEmpty(host) && !Strings.isNullOrEmpty(portString)) {
                 int port = Integer.parseInt(portString);
-                Frontend fe = GlobalStateMgr.getCurrentState().checkFeExist(host, port);
+                Frontend fe = GlobalStateMgr.getCurrentState().getNodeMgr().checkFeExist(host, port);
                 if (fe == null) {
                     response.updateHeader("role", FrontendNodeType.UNKNOWN.name());
                 } else {
@@ -388,6 +402,43 @@ public class MetaService {
             }
 
             response.appendContent("dump finished. " + dumpFilePath);
+            writeResponse(request, response);
+            return;
+        }
+    }
+
+    public static class DumpStarMgrAction extends MetaBaseAction {
+        private static final Logger LOG = LogManager.getLogger(DumpStarMgrAction.class);
+
+        public DumpStarMgrAction(ActionController controller, File imageDir) {
+            super(controller, imageDir);
+        }
+
+        public static void registerAction(ActionController controller, File imageDir)
+                throws IllegalArgException {
+            controller.registerHandler(HttpMethod.GET, "/dump_starmgr", new DumpStarMgrAction(controller, imageDir));
+        }
+
+        @Override
+        public boolean needAdmin() {
+            return true;
+        }
+
+        @Override
+        protected boolean needCheckClientIsFe() {
+            return false;
+        }
+
+        @Override
+        public void executeGet(BaseRequest request, BaseResponse response) {
+            if (RunMode.getCurrentRunMode() != RunMode.SHARED_DATA) {
+                String str = "current run mode " + RunMode.name() + " does not support dump starmgr meta.";
+                response.appendContent(str);
+            } else {
+                String str = GlobalStateMgr.getCurrentState().getStarOSAgent().dump();
+                response.appendContent(str);
+            }
+
             writeResponse(request, response);
             return;
         }

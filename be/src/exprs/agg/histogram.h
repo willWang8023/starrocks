@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -10,12 +22,12 @@
 #include "gutil/casts.h"
 #include "runtime/large_int_value.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 template <typename T>
 struct Bucket {
 public:
-    Bucket() {}
+    Bucket() = default;
     Bucket(T lower, T upper, size_t count, size_t upper_repeats)
             : lower(lower), upper(upper), count(count), upper_repeats(upper_repeats), count_in_bucket(1) {}
     T lower;
@@ -30,15 +42,15 @@ public:
 
 template <typename T>
 struct HistogramState {
-    HistogramState() {}
+    HistogramState() = default;
     std::vector<T> data;
 };
 
-template <PrimitiveType PT, typename T = RunTimeCppType<PT>>
+template <LogicalType LT, typename T = RunTimeCppType<LT>>
 class HistogramAggregationFunction final
-        : public AggregateFunctionBatchHelper<HistogramState<T>, HistogramAggregationFunction<PT, T>> {
+        : public AggregateFunctionBatchHelper<HistogramState<T>, HistogramAggregationFunction<LT, T>> {
 public:
-    using ColumnType = RunTimeColumnType<PT>;
+    using ColumnType = RunTimeColumnType<LT>;
 
     void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
                 size_t row_num) const override {
@@ -81,10 +93,9 @@ public:
         DCHECK(false);
     }
 
-    std::string toBucketJson(std::string lower, std::string upper, size_t count, size_t upper_repeats,
+    std::string toBucketJson(const std::string& lower, const std::string& upper, size_t count, size_t upper_repeats,
                              double sample_ratio) const {
-        return fmt::format("[\"{}\",\"{}\",\"{}\",\"{}\"]", lower, upper,
-                           std::to_string((int64_t)(count * sample_ratio)),
+        return fmt::format(R"(["{}","{}","{}","{}"])", lower, upper, std::to_string((int64_t)(count * sample_ratio)),
                            std::to_string((int64_t)(upper_repeats * sample_ratio)));
     }
 
@@ -128,26 +139,26 @@ public:
             bucket_json = "[]";
         } else {
             bucket_json = "[";
-            if constexpr (pt_is_largeint<PT>) {
+            if constexpr (lt_is_largeint<LT>) {
                 for (int i = 0; i < buckets.size(); ++i) {
                     bucket_json += toBucketJson(LargeIntValue::to_string(buckets[i].lower),
                                                 LargeIntValue::to_string(buckets[i].upper), buckets[i].count,
                                                 buckets[i].upper_repeats, sample_ratio) +
                                    ",";
                 }
-            } else if constexpr (pt_is_arithmetic<PT>) {
+            } else if constexpr (lt_is_arithmetic<LT>) {
                 for (int i = 0; i < buckets.size(); ++i) {
                     bucket_json += toBucketJson(std::to_string(buckets[i].lower), std::to_string(buckets[i].upper),
                                                 buckets[i].count, buckets[i].upper_repeats, sample_ratio) +
                                    ",";
                 }
-            } else if constexpr (pt_is_date_or_datetime<PT>) {
+            } else if constexpr (lt_is_date_or_datetime<LT>) {
                 for (int i = 0; i < buckets.size(); ++i) {
                     bucket_json += toBucketJson(buckets[i].lower.to_string(), buckets[i].upper.to_string(),
                                                 buckets[i].count, buckets[i].upper_repeats, sample_ratio) +
                                    ",";
                 }
-            } else if constexpr (pt_is_decimal<PT>) {
+            } else if constexpr (lt_is_decimal<LT>) {
                 int scale = ctx->get_arg_type(0)->scale;
                 int precision = ctx->get_arg_type(0)->precision;
                 for (int i = 0; i < buckets.size(); ++i) {
@@ -156,7 +167,7 @@ public:
                                                 buckets[i].count, buckets[i].upper_repeats, sample_ratio) +
                                    ",";
                 }
-            } else if constexpr (pt_is_binary<PT>) {
+            } else if constexpr (lt_is_string<LT>) {
                 for (int i = 0; i < buckets.size(); ++i) {
                     bucket_json += toBucketJson(buckets[i].lower.to_string(), buckets[i].upper.to_string(),
                                                 buckets[i].count, buckets[i].upper_repeats, sample_ratio) +
@@ -173,4 +184,4 @@ public:
     std::string get_name() const override { return "histogram"; }
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

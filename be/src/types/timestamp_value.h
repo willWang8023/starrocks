@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -7,24 +19,23 @@
 
 #include <string>
 
+#include "runtime/datetime_value.h"
 #include "runtime/time_types.h"
 #include "types/date_value.h"
 #include "util/hash_util.hpp"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 enum DateTimeType { TIMESTAMP_TIME = 1, TIMESTAMP_DATE = 2, TIMESTAMP_DATETIME = 3 };
-
-const int DATE_MAX_DAYNR = 3652424;
-
-// Limits of time value
-const int TIME_MAX_HOUR = 838;
 
 class TimestampValue {
 public:
     using type = Timestamp;
 
-    inline static TimestampValue create(int year, int month, int day, int hour, int minute, int second);
+    inline static TimestampValue create(int year, int month, int day, int hour, int minute, int second,
+                                        int microsecond);
+
+    static TimestampValue create_from_unixtime(int64_t ts, const cctz::time_zone& ctz);
 
     inline Timestamp timestamp() const { return _timestamp; }
 
@@ -75,6 +86,7 @@ public:
 
     void to_timestamp(int* year, int* month, int* day, int* hour, int* minute, int* second, int* usec) const;
 
+    void trunc_to_millisecond();
     void trunc_to_second();
     void trunc_to_minute();
     void trunc_to_hour();
@@ -84,23 +96,36 @@ public:
     void trunc_to_week(int days);
     void trunc_to_quarter();
 
-    void floor_to_second_period(int period);
-    void floor_to_minute_period(int period);
-    void floor_to_hour_period(int period);
-    void floor_to_day_period(int period);
-    void floor_to_month_period(int period);
-    void floor_to_year_period(int period);
-    void floor_to_week_period(int period);
-    void floor_to_quarter_period(int period);
+    template <bool end>
+    void floor_to_microsecond_period(long period);
+    template <bool end>
+    void floor_to_millisecond_period(long period);
+    template <bool end>
+    void floor_to_second_period(long period);
+    template <bool end>
+    void floor_to_minute_period(long period);
+    template <bool end>
+    void floor_to_hour_period(long period);
+    template <bool end>
+    void floor_to_day_period(long period);
+    template <bool end>
+    void floor_to_month_period(long period);
+    template <bool end>
+    void floor_to_year_period(long period);
+    template <bool end>
+    void floor_to_week_period(long period);
+    template <bool end>
+    void floor_to_quarter_period(long period);
 
     bool from_string(const char* date_str, size_t len);
 
     int64_t to_unix_second() const;
 
     bool from_unixtime(int64_t second, const std::string& timezone);
-    bool from_unixtime(int64_t second, const cctz::time_zone& ctz);
+    void from_unixtime(int64_t second, const cctz::time_zone& ctz);
+    void from_unixtime(int64_t second, int64_t microsecond, const cctz::time_zone& ctz);
 
-    void from_unix_second(int64_t second);
+    void from_unix_second(int64_t second, int64_t microsecond = 0);
 
     template <TimeUnit UNIT>
     TimestampValue add(int count) const {
@@ -134,10 +159,107 @@ public:
     Timestamp _timestamp;
 };
 
-TimestampValue TimestampValue::create(int year, int month, int day, int hour, int minute, int second) {
+TimestampValue TimestampValue::create(int year, int month, int day, int hour, int minute, int second,
+                                      int microsecond = 0) {
     TimestampValue ts;
-    ts.from_timestamp(year, month, day, hour, minute, second, 0);
+    ts.from_timestamp(year, month, day, hour, minute, second, microsecond);
     return ts;
+}
+
+template <bool end>
+void TimestampValue::floor_to_microsecond_period(long period) {
+    int64_t microseconds = ((timestamp::to_julian(_timestamp) - date::AD_EPOCH_JULIAN) * SECS_PER_DAY * USECS_PER_SEC) +
+                           (timestamp::to_time(_timestamp));
+
+    microseconds -= microseconds % period;
+    if constexpr (end) {
+        microseconds += period;
+    }
+
+    JulianDate days = microseconds / (USECS_PER_SEC * SECS_PER_DAY) + date::AD_EPOCH_JULIAN;
+    microseconds %= (USECS_PER_SEC * SECS_PER_DAY);
+
+    _timestamp = timestamp::from_julian_and_time(days, microseconds);
+}
+
+template <bool end>
+void TimestampValue::floor_to_millisecond_period(long period) {
+    TimestampValue::floor_to_microsecond_period<end>(period * 1000);
+}
+
+template <bool end>
+void TimestampValue::floor_to_second_period(long period) {
+    int64_t seconds = timestamp::to_julian(_timestamp);
+    seconds -= date::AD_EPOCH_JULIAN;
+    seconds *= SECS_PER_DAY;
+    seconds += timestamp::to_time(_timestamp) / USECS_PER_SEC;
+    seconds -= seconds % period;
+    if constexpr (end) {
+        seconds += period;
+    }
+
+    JulianDate day = seconds / SECS_PER_DAY + date::AD_EPOCH_JULIAN;
+    Timestamp s = seconds % SECS_PER_DAY;
+    _timestamp = timestamp::from_julian_and_time(day, s * USECS_PER_SEC);
+}
+
+template <bool end>
+void TimestampValue::floor_to_minute_period(long period) {
+    TimestampValue::floor_to_second_period<end>(period * 60);
+}
+
+template <bool end>
+void TimestampValue::floor_to_hour_period(long period) {
+    TimestampValue::floor_to_second_period<end>(period * 60 * 60);
+}
+
+template <bool end>
+void TimestampValue::floor_to_day_period(long period) {
+    int64_t days = timestamp::to_julian(_timestamp);
+    days -= date::AD_EPOCH_JULIAN;
+    days -= days % period;
+    days += date::AD_EPOCH_JULIAN;
+    if constexpr (end) {
+        days += period;
+    }
+    _timestamp = timestamp::from_julian_and_time(days, 0);
+}
+
+template <bool end>
+void TimestampValue::floor_to_month_period(long period) {
+    int year, month, day;
+    date::to_date_with_cache(timestamp::to_julian(_timestamp), &year, &month, &day);
+
+    int months = (year - 1) * 12 + month;
+    months -= (months - 1) % period;
+    if constexpr (end) {
+        months += period;
+    }
+    year = months / 12 + 1;
+    month = months - months / 12 * 12;
+    _timestamp = timestamp::from_datetime(year, month, 1, 0, 0, 0, 0);
+}
+
+template <bool end>
+void TimestampValue::floor_to_year_period(long period) {
+    int year, month, day;
+    date::to_date_with_cache(timestamp::to_julian(_timestamp), &year, &month, &day);
+
+    year -= (year - 1) % period;
+    if constexpr (end) {
+        year += period;
+    }
+    _timestamp = timestamp::from_datetime(year, 1, 1, 0, 0, 0, 0);
+}
+
+template <bool end>
+void TimestampValue::floor_to_week_period(long period) {
+    TimestampValue::floor_to_day_period<end>(period * 7);
+}
+
+template <bool end>
+void TimestampValue::floor_to_quarter_period(long period) {
+    TimestampValue::floor_to_month_period<end>(period * 3);
 }
 
 inline bool operator==(const TimestampValue& lhs, const TimestampValue& rhs) {
@@ -169,13 +291,11 @@ inline std::ostream& operator<<(std::ostream& os, const TimestampValue& value) {
     return os;
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks
 
 namespace std {
 template <>
-struct hash<starrocks::vectorized::TimestampValue> {
-    size_t operator()(const starrocks::vectorized::TimestampValue& v) const {
-        return std::hash<int64_t>()(v._timestamp);
-    }
+struct hash<starrocks::TimestampValue> {
+    size_t operator()(const starrocks::TimestampValue& v) const { return std::hash<int64_t>()(v._timestamp); }
 };
 } // namespace std

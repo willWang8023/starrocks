@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/catalog/MaterializedIndex.java
 
@@ -21,6 +34,7 @@
 
 package com.starrocks.catalog;
 
+import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.gson.annotations.SerializedName;
@@ -133,7 +147,7 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
      * Checks whether {@code this} {@link MaterializedIndex} is visible to a transaction.
      * <p>
      * If this {@link MaterializedIndex} is not visible to a transaction,
-     * {@link com.starrocks.transaction.PublishVersionDaemon} will not send {@link com.starrocks.lake.proto.PublishVersionRequest}
+     * {@link com.starrocks.transaction.PublishVersionDaemon} will not send {@link com.starrocks.proto.PublishVersionRequest}
      * to tablets of this index.
      * <p>
      * Only used for {@link com.starrocks.lake.LakeTable} now.
@@ -177,14 +191,14 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
     }
 
     public void addTablet(Tablet tablet, TabletMeta tabletMeta) {
-        addTablet(tablet, tabletMeta, false);
+        addTablet(tablet, tabletMeta, true);
     }
 
-    public void addTablet(Tablet tablet, TabletMeta tabletMeta, boolean isRestore) {
+    public void addTablet(Tablet tablet, TabletMeta tabletMeta, boolean updateInvertedIndex) {
         idToTablets.put(tablet.getId(), tablet);
         tablets.add(tablet);
-        if (!isRestore) {
-            GlobalStateMgr.getCurrentInvertedIndex().addTablet(tablet.getId(), tabletMeta);
+        if (updateInvertedIndex) {
+            GlobalStateMgr.getCurrentState().getTabletInvertedIndex().addTablet(tablet.getId(), tabletMeta);
         }
     }
 
@@ -218,6 +232,14 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
             dataSize += tablet.getDataSize(false);
         }
         return dataSize;
+    }
+
+    public long getTabletMaxDataSize() {
+        long maxDataSize = 0;
+        for (Tablet tablet : getTablets()) {
+            maxDataSize = Math.max(maxDataSize, tablet.getDataSize(true));
+        }
+        return maxDataSize;
     }
 
     public long getReplicaCount() {
@@ -293,6 +315,11 @@ public class MaterializedIndex extends MetaObject implements Writable, GsonPostP
         MaterializedIndex materializedIndex = new MaterializedIndex();
         materializedIndex.readFields(in);
         return materializedIndex;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(idToTablets);
     }
 
     @Override

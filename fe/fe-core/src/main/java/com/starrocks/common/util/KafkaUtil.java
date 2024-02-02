@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/util/KafkaUtil.java
 
@@ -37,12 +50,15 @@ import com.starrocks.proto.PProxyResult;
 import com.starrocks.proto.PStringPair;
 import com.starrocks.rpc.BackendServiceClient;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.system.Backend;
+import com.starrocks.server.RunMode;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.thrift.TNetworkAddress;
 import com.starrocks.thrift.TStatusCode;
+import com.starrocks.warehouse.Warehouse;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
@@ -164,26 +180,69 @@ public class KafkaUtil {
         private PProxyResult sendProxyRequest(PProxyRequest request) throws UserException {
             TNetworkAddress address = new TNetworkAddress();
             try {
-                List<Long> backendIds = GlobalStateMgr.getCurrentSystemInfo().getBackendIds(true);
-                if (backendIds.isEmpty()) {
-                    throw new LoadException("Failed to send proxy request. No alive backends");
+                // TODO: need to refactor after be split into cn + dn
+                List<Long> nodeIds = new ArrayList<>();
+                if ((RunMode.isSharedDataMode())) {
+                    Warehouse warehouse = GlobalStateMgr.getCurrentState().getWarehouseMgr().getDefaultWarehouse();
+                    for (long nodeId : warehouse.getAnyAvailableCluster().getComputeNodeIds()) {
+                        ComputeNode node =
+                                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendOrComputeNode(nodeId);
+                        if (node != null && node.isAlive()) {
+                            nodeIds.add(nodeId);
+                        }
+                    }
+                    if (nodeIds.isEmpty()) {
+                        throw new LoadException("Failed to send proxy request. No alive backends or computeNodes");
+                    }
+                } else {
+                    nodeIds = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendIds(true);
+                    if (nodeIds.isEmpty()) {
+                        throw new LoadException("Failed to send proxy request. No alive backends");
+                    }
                 }
-                Collections.shuffle(backendIds);
-                Backend be = GlobalStateMgr.getCurrentSystemInfo().getBackend(backendIds.get(0));
+
+                Collections.shuffle(nodeIds);
+
+                ComputeNode be =
+                        GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendOrComputeNode(nodeIds.get(0));
                 address = new TNetworkAddress(be.getHost(), be.getBrpcPort());
 
                 // get info
-                request.timeout = Config.routine_load_kafka_timeout_second;
-                Future<PProxyResult> future = BackendServiceClient.getInstance().getInfo(address, request);
-                PProxyResult result = future.get(Config.routine_load_kafka_timeout_second, TimeUnit.SECONDS);
-                TStatusCode code = TStatusCode.findByValue(result.status.statusCode);
-                if (code != TStatusCode.OK) {
-                    LOG.warn("failed to send proxy request to " + address + " err " + result.status.errorMsgs);
-                    throw new UserException(
-                            "failed to send proxy request to " + address + " err " + result.status.errorMsgs);
-                } else {
-                    return result;
+                int retryTimes = 0;
+                while (true) {
+                    request.timeout = Config.routine_load_kafka_timeout_second;
+                    Future<PProxyResult> future = BackendServiceClient.getInstance().getInfo(address, request);
+                    PProxyResult result;
+                    try {
+                        result = future.get(Config.routine_load_kafka_timeout_second, TimeUnit.SECONDS);
+                    } catch (Exception e) {
+                        LOG.warn("failed to send proxy request to " + address + " err " + e.getMessage());
+                        // Jprotobuf-rpc-socket throws an ExecutionException when an exception occurs.
+                        // We use the error message to identify the type of exception.
+                        if (e.getMessage().contains("Ocurrs time out")) {
+                            // When getting kafka info timed out, we tried again three times.
+                            if (++retryTimes > 3 || (retryTimes + 1) * Config.routine_load_kafka_timeout_second >
+                                    Config.routine_load_task_timeout_second) {
+                                throw e;
+                            }
+                            continue;
+                        } else {
+                            throw e;
+                        }
+                    }
+                    TStatusCode code = TStatusCode.findByValue(result.status.statusCode);
+                    if (code != TStatusCode.OK) {
+                        LOG.warn("failed to send proxy request to " + address + " err " + result.status.errorMsgs);
+                        throw new UserException(
+                                "failed to send proxy request to " + address + " err " + result.status.errorMsgs);
+                    } else {
+                        return result;
+                    }
                 }
+            } catch (InterruptedException ie) {
+                LOG.warn("got interrupted exception when sending proxy request to " + address);
+                Thread.currentThread().interrupt();
+                throw new LoadException("got interrupted exception when sending proxy request to " + address);
             } catch (Exception e) {
                 LOG.warn("failed to send proxy request to " + address + " err " + e.getMessage());
                 throw new LoadException("failed to send proxy request to " + address + " err " + e.getMessage());

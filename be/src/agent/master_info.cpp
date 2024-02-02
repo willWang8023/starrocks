@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "agent/master_info.h"
 
@@ -56,6 +68,14 @@ std::optional<int64_t> get_backend_id() {
     MasterInfoPtr ptr;
     if (get_master_info(&ptr) && ptr->__isset.backend_id) {
         return ptr->backend_id;
+    }
+    return {};
+}
+
+std::optional<TRunMode::type> get_master_run_mode() {
+    MasterInfoPtr ptr;
+    if (get_master_info(&ptr) && ptr->__isset.run_mode) {
+        return ptr->run_mode;
     }
     return {};
 }

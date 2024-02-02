@@ -21,8 +21,8 @@ import com.baidu.bjf.remoting.protobuf.Codec;
 import com.baidu.bjf.remoting.protobuf.ProtobufProxy;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
-import com.starrocks.common.FeMetaVersion;
-import com.starrocks.meta.MetaContext;
+import com.starrocks.catalog.Replica.ReplicaState;
+import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.proto.TxnFinishStatePB;
 import com.starrocks.thrift.TUniqueId;
 import com.starrocks.transaction.TransactionState.LoadJobSourceType;
@@ -33,16 +33,13 @@ import org.junit.After;
 import org.junit.Assert;
 import org.junit.Test;
 
-import java.io.ByteArrayInputStream;
-import java.io.ByteArrayOutputStream;
-import java.io.DataInputStream;
-import java.io.DataOutputStream;
 import java.io.File;
-import java.io.FileInputStream;
-import java.io.FileOutputStream;
 import java.io.IOException;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.HashSet;
+import java.util.List;
+import java.util.Set;
 import java.util.UUID;
 
 public class TransactionStateTest {
@@ -56,33 +53,16 @@ public class TransactionStateTest {
     }
 
     @Test
-    public void testSerDe() throws IOException {
-        MetaContext metaContext = new MetaContext();
-        metaContext.setMetaVersion(FeMetaVersion.VERSION_83);
-        metaContext.setThreadLocalInfo();
-
-        // 1. Write objects to file
-        File file = new File(fileName);
-        file.createNewFile();
-        DataOutputStream out = new DataOutputStream(new FileOutputStream(file));
-
+    public void testSerDe() {
         UUID uuid = UUID.randomUUID();
         TransactionState transactionState = new TransactionState(1000L, Lists.newArrayList(20000L, 20001L),
                 3000, "label123", new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits()),
                 LoadJobSourceType.BACKEND_STREAMING, new TxnCoordinator(TxnSourceType.BE, "127.0.0.1"), 50000L,
                 60 * 1000L);
 
-        transactionState.write(out);
-        out.flush();
-        out.close();
-
-        // 2. Read objects from file
-        DataInputStream in = new DataInputStream(new FileInputStream(file));
-        TransactionState readTransactionState = new TransactionState();
-        readTransactionState.readFields(in);
-
+        String json = GsonUtils.GSON.toJson(transactionState);
+        TransactionState readTransactionState = GsonUtils.GSON.fromJson(json, TransactionState.class);
         Assert.assertEquals(transactionState.getCoordinator().ip, readTransactionState.getCoordinator().ip);
-        in.close();
     }
 
     @Test
@@ -91,11 +71,23 @@ public class TransactionStateTest {
         for (int i = 1; i <= 100000; i *= 10) {
             TxnFinishStatePB txnFinishStatePB = buildTxnFinishState(i).toPB();
             byte[] bytes = finishStatePBCodec.encode(txnFinishStatePB);
-            System.out.printf("normal: %d abnormal: %d  size: %d\n", txnFinishStatePB.normalReplicas.size(),
-                    txnFinishStatePB.abnormalReplicasWithVersion.size(), bytes.length);
+            // System.out.printf("normal: %d abnormal: %d  size: %d\n", txnFinishStatePB.normalReplicas.size(),
+            //        txnFinishStatePB.abnormalReplicasWithVersion.size(), bytes.length);
             TxnFinishStatePB txn2 = finishStatePBCodec.decode(bytes);
             Assert.assertEquals(txnFinishStatePB.normalReplicas.size(), txn2.normalReplicas.size());
             Assert.assertEquals(txnFinishStatePB.abnormalReplicasWithVersion.size(), txn2.abnormalReplicasWithVersion.size());
+        }
+    }
+
+    @Test
+    public void testSerDeTxnFinishStateJSON() throws IOException {
+        for (int i = 1; i <= 100000; i *= 10) {
+            TxnFinishState s1 = buildTxnFinishState(i);
+            String json = GsonUtils.GSON.toJson(s1);
+            // System.out.printf("json: %s\n", json);
+            TxnFinishState s2 = GsonUtils.GSON.fromJson(json, TxnFinishState.class);
+            Assert.assertEquals(s1.normalReplicas.size(), s2.normalReplicas.size());
+            Assert.assertEquals(s1.abnormalReplicasWithVersion.size(), s2.abnormalReplicasWithVersion.size());
         }
     }
 
@@ -114,13 +106,7 @@ public class TransactionStateTest {
     }
 
     @Test
-    public void testSerDeTxnStateNewFinish() throws IOException {
-        MetaContext metaContext = new MetaContext();
-        metaContext.setMetaVersion(FeMetaVersion.VERSION_83);
-        metaContext.setThreadLocalInfo();
-
-        ByteArrayOutputStream out = new ByteArrayOutputStream();
-        DataOutputStream dataOut = new DataOutputStream(out);
+    public void testSerDeTxnStateNewFinish() {
         UUID uuid = UUID.randomUUID();
         TransactionState transactionState = new TransactionState(1000L, Lists.newArrayList(20000L, 20001L),
                 3000, "label123", new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits()),
@@ -133,18 +119,52 @@ public class TransactionStateTest {
         transactionState.clearErrorMsg();
         transactionState.setNewFinish();
         transactionState.setTransactionStatus(TransactionStatus.VISIBLE);
-        transactionState.write(dataOut);
 
-        byte[] bytes = out.toByteArray();
-        System.out.printf("TransactionState size: %d\n", bytes.length);
-
-        DataInputStream in = new DataInputStream(new ByteArrayInputStream(bytes));
-        TransactionState readTransactionState = new TransactionState();
-        try {
-            readTransactionState.readFields(in);
-        } catch (Exception e) {
-            e.printStackTrace();
-        }
+        String json = GsonUtils.GSON.toJson(transactionState);
+        TransactionState readTransactionState = GsonUtils.GSON.fromJson(json, TransactionState.class);
         Assert.assertTrue(readTransactionState.isNewFinish());
+    }
+
+    @Test
+    public void testIsRunning() {
+        Set<TransactionStatus> nonRunningStatus = new HashSet<>();
+        nonRunningStatus.add(TransactionStatus.UNKNOWN);
+        nonRunningStatus.add(TransactionStatus.VISIBLE);
+        nonRunningStatus.add(TransactionStatus.ABORTED);
+
+        UUID uuid = UUID.randomUUID();
+        for (TransactionStatus status : TransactionStatus.values()) {
+            TransactionState transactionState = new TransactionState(1000L, Lists.newArrayList(20000L, 20001L),
+                    3000, "label123", new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits()),
+                    LoadJobSourceType.BACKEND_STREAMING, new TxnCoordinator(TxnSourceType.BE, "127.0.0.1"), 50000L,
+                    60 * 1000L);
+            transactionState.setTransactionStatus(status);
+            Assert.assertEquals(nonRunningStatus.contains(status), !transactionState.isRunning());
+        }
+    }
+
+    @Test
+    public void testCommitInfos() {
+        UUID uuid = UUID.randomUUID();
+        TransactionState transactionState = new TransactionState(1000L, Lists.newArrayList(20000L, 20001L),
+                3000, "label123", new TUniqueId(uuid.getMostSignificantBits(), uuid.getLeastSignificantBits()),
+                LoadJobSourceType.BACKEND_STREAMING, new TxnCoordinator(TxnSourceType.BE, "127.0.0.1"), 50000L,
+                60 * 1000L);
+        Assert.assertTrue(transactionState.tabletCommitInfosContainsReplica(1001, 1001, ReplicaState.NORMAL));
+        TabletCommitInfo info1 = new TabletCommitInfo(10001, 10001);
+        TabletCommitInfo info2 = new TabletCommitInfo(10001, 10002);
+        TabletCommitInfo info3 = new TabletCommitInfo(10002, 10002);
+        List<TabletCommitInfo> infos = new ArrayList<>();
+        infos.add(info1);
+        infos.add(info2);
+        infos.add(info3);
+        transactionState.setTabletCommitInfos(infos);
+        Assert.assertFalse(transactionState.tabletCommitInfosContainsReplica(1001, 1001, ReplicaState.NORMAL));
+        Assert.assertTrue(transactionState.tabletCommitInfosContainsReplica(10001, 10001, ReplicaState.NORMAL));
+        Assert.assertTrue(transactionState.tabletCommitInfosContainsReplica(10001, 10002, ReplicaState.NORMAL));
+        Assert.assertTrue(transactionState.tabletCommitInfosContainsReplica(10002, 10002, ReplicaState.NORMAL));
+        Assert.assertTrue(transactionState.tabletCommitInfosContainsReplica(1001, 1001, ReplicaState.ALTER));
+        Assert.assertTrue(transactionState.tabletCommitInfosContainsReplica(1001, 1001, ReplicaState.SCHEMA_CHANGE));
+        Assert.assertTrue(transactionState.tabletCommitInfosContainsReplica(1001, 1001, ReplicaState.CLONE));
     }
 }

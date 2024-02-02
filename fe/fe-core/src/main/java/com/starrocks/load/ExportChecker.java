@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/ExportChecker.java
 
@@ -24,21 +37,21 @@ package com.starrocks.load;
 import com.google.common.collect.Maps;
 import com.starrocks.common.Config;
 import com.starrocks.common.UserException;
-import com.starrocks.common.util.LeaderDaemon;
+import com.starrocks.common.util.FrontendDaemon;
 import com.starrocks.load.ExportJob.JobState;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.system.Backend;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.task.ExportExportingTask;
 import com.starrocks.task.ExportPendingTask;
-import com.starrocks.task.LeaderTask;
 import com.starrocks.task.LeaderTaskExecutor;
+import com.starrocks.task.PriorityLeaderTask;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 import java.util.Map;
 
-public final class ExportChecker extends LeaderDaemon {
+public final class ExportChecker extends FrontendDaemon {
     private static final Logger LOG = LogManager.getLogger(ExportChecker.class);
 
     // checkers for running job state
@@ -125,7 +138,7 @@ public final class ExportChecker extends LeaderDaemon {
 
         for (ExportJob job : pendingJobs) {
             try {
-                LeaderTask task = new ExportPendingTask(job);
+                PriorityLeaderTask task = new ExportPendingTask(job);
                 if (executors.get(JobState.PENDING).submit(task)) {
                     LOG.info("run pending export job. job: {}", job);
                 }
@@ -144,7 +157,7 @@ public final class ExportChecker extends LeaderDaemon {
                 continue;
             }
             try {
-                LeaderTask task = new ExportExportingTask(job);
+                PriorityLeaderTask task = new ExportExportingTask(job);
                 if (executors.get(JobState.EXPORTING).submit(task)) {
                     LOG.info("run exporting export job. job: {}", job);
                 }
@@ -158,25 +171,25 @@ public final class ExportChecker extends LeaderDaemon {
 
         boolean beHasErr = false;
         String errMsg = "";
-        for (Long beId : job.getBeStartTimeMap().keySet()) {
-            Backend be = GlobalStateMgr.getCurrentSystemInfo().getBackend(beId);
-            if (null == be) {
+        for (Long nodeId : job.getBeStartTimeMap().keySet()) {
+            ComputeNode node = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendOrComputeNode(nodeId);
+            if (null == node) {
                 // The current implementation, if the be in the job is not found, 
                 // the job will be cancelled
                 beHasErr = true;
-                errMsg = "be not found during exec export job. be:" + beId;
+                errMsg = "Be or cn not found during exec export job. Node:" + nodeId;
                 LOG.warn(errMsg + " job: {}", job);
                 break;
             }
-            if (!be.isAlive()) {
+            if (!node.isAlive()) {
                 beHasErr = true;
-                errMsg = "be not alive during exec export job. be:" + beId;
+                errMsg = "Be or cn not alive during exec export job. Node:" + nodeId;
                 LOG.warn(errMsg + " job: {}", job);
                 break;
             }
-            if (be.getLastStartTime() > job.getBeStartTimeMap().get(beId)) {
+            if (node.getLastStartTime() > job.getBeStartTimeMap().get(nodeId)) {
                 beHasErr = true;
-                errMsg = "be has rebooted during exec export job. be:" + beId;
+                errMsg = "Be or cn has rebooted during exec export job. Node:" + nodeId;
                 LOG.warn(errMsg + " job: {}", job);
                 break;
             }

@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.rule.tree;
 
@@ -25,7 +38,6 @@ import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CaseWhenOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CastOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
-import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rewrite.ReplaceColumnRefRewriter;
 import com.starrocks.sql.optimizer.task.TaskContext;
@@ -62,7 +74,7 @@ public class PreAggregateTurnOnRule implements TreeRewriteRule {
 
         @Override
         public Void visit(OptExpression opt, PreAggregationContext context) {
-            opt.getInputs().forEach(o -> process(o, context.clone()));
+            opt.getInputs().forEach(o -> process(o, context.copy()));
             return null;
         }
 
@@ -71,7 +83,7 @@ public class PreAggregateTurnOnRule implements TreeRewriteRule {
                 rewriteProject(opt, context);
             }
 
-            opt.getOp().accept(this, opt, context.clone());
+            opt.getOp().accept(this, opt, context.copy());
             return null;
         }
 
@@ -131,11 +143,11 @@ public class PreAggregateTurnOnRule implements TreeRewriteRule {
                 return null;
             }
             // check has value conjunct
-            boolean allKeyConjunct =
-                    Utils.extractColumnRef(
-                                    Utils.compoundAnd(scan.getPredicate(), Utils.compoundAnd(context.joinPredicates))).stream()
-                            .map(ref -> scan.getColRefToColumnMetaMap().get(ref)).filter(Objects::nonNull)
-                            .allMatch(Column::isKey);
+            List<ColumnRefOperator> predicateColRefs =
+                    Utils.extractColumnRef(Utils.compoundAnd(scan.getPredicate(), Utils.compoundAnd(context.joinPredicates)));
+            boolean allKeyConjunct = predicateColRefs.stream()
+                    .map(ref -> scan.getColRefToColumnMetaMap().get(ref)).filter(Objects::nonNull)
+                    .allMatch(Column::isKey);
             if (!allKeyConjunct) {
                 scan.setTurnOffReason("Predicates include the value column");
                 return null;
@@ -211,13 +223,16 @@ public class PreAggregateTurnOnRule implements TreeRewriteRule {
                     CaseWhenOperator cwo = (CaseWhenOperator) child;
 
                     for (int i = 0; i < cwo.getWhenClauseSize(); i++) {
-                        if (!cwo.getThenClause(i).isColumnRef()) {
+                        if (cwo.getThenClause(i).isColumnRef()) {
+                            conditions.addAll(Utils.extractColumnRef(cwo.getWhenClause(i)));
+                            returns.add((ColumnRefOperator) cwo.getThenClause(i));
+                        } else if (cwo.getThenClause(i).isConstantNull()
+                                || cwo.getThenClause(i).isConstantZero()) {
+                            // If then expr is NULL or Zero, open the preaggregation
+                        } else {
                             scan.setTurnOffReason("The result of THEN isn't value column");
                             return true;
                         }
-
-                        conditions.addAll(Utils.extractColumnRef(cwo.getWhenClause(i)));
-                        returns.add((ColumnRefOperator) cwo.getThenClause(i));
                     }
 
                     if (cwo.hasCase()) {
@@ -225,11 +240,11 @@ public class PreAggregateTurnOnRule implements TreeRewriteRule {
                     }
 
                     if (cwo.hasElse()) {
-                        if (OperatorType.VARIABLE.equals(cwo.getElseClause().getOpType())) {
+                        if (cwo.getElseClause().isColumnRef()) {
                             returns.add((ColumnRefOperator) cwo.getElseClause());
-                        } else if (OperatorType.CONSTANT.equals(cwo.getElseClause().getOpType())
-                                && ((ConstantOperator) cwo.getElseClause()).isNull()) {
-                            // NULL don't effect result, can open PreAggregate
+                        } else if (cwo.getElseClause().isConstantNull()
+                                || cwo.getElseClause().isConstantZero()) {
+                            // If else expr is NULL or Zero, open the preaggregation
                         } else {
                             scan.setTurnOffReason("The result of ELSE isn't value column");
                             return true;
@@ -331,7 +346,7 @@ public class PreAggregateTurnOnRule implements TreeRewriteRule {
                 context.aggregations.clear();
                 process(optExpression.inputAt(0), context);
                 // Avoid left child modify context will effect right child
-                process(optExpression.inputAt(1), context.clone());
+                process(optExpression.inputAt(1), context.copy());
                 return null;
             }
 
@@ -383,26 +398,21 @@ public class PreAggregateTurnOnRule implements TreeRewriteRule {
         }
     }
 
-    public static class PreAggregationContext implements Cloneable {
+    public static class PreAggregationContext {
         // Indicates that a pre-aggregation can not be turned on below the join
         public boolean notPreAggregationJoin = false;
         public List<ScalarOperator> aggregations = Lists.newArrayList();
         public List<ScalarOperator> groupings = Lists.newArrayList();
         public List<ScalarOperator> joinPredicates = Lists.newArrayList();
 
-        @Override
-        public PreAggregationContext clone() {
-            try {
-                PreAggregationContext context = (PreAggregationContext) super.clone();
-                // Just shallow copy
-                context.aggregations = Lists.newArrayList(aggregations);
-                context.groupings = Lists.newArrayList(groupings);
-                context.joinPredicates = Lists.newArrayList(joinPredicates);
-                return context;
-            } catch (CloneNotSupportedException ignored) {
-            }
-
-            return null;
+        public PreAggregationContext copy() {
+            PreAggregationContext context = new PreAggregationContext();
+            context.notPreAggregationJoin = this.notPreAggregationJoin;
+            // Just shallow copy
+            context.aggregations = Lists.newArrayList(aggregations);
+            context.groupings = Lists.newArrayList(groupings);
+            context.joinPredicates = Lists.newArrayList(joinPredicates);
+            return context;
         }
     }
 }

@@ -1,19 +1,30 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.ast;
 
-import com.starrocks.analysis.DdlStmt;
 import com.starrocks.analysis.RedirectStatus;
-import com.starrocks.common.AnalysisException;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.util.List;
-import java.util.Map;
 
 // ADMIN CHECK TABLET (id1, id2, ...) PROPERTIES ("type" = "check_consistency");
 public class AdminCheckTabletsStmt extends DdlStmt {
 
     private final List<Long> tabletIds;
-    private final Map<String, String> properties;
+    private final Property property;
     private CheckType type;
 
     public void setType(CheckType type) {
@@ -21,20 +32,13 @@ public class AdminCheckTabletsStmt extends DdlStmt {
     }
 
     public enum CheckType {
-        CONSISTENCY; // check the consistency of replicas of tablet
-
-        public static CheckType getTypeFromString(String str) throws AnalysisException {
-            try {
-                return CheckType.valueOf(str.toUpperCase());
-            } catch (Exception e) {
-                throw new AnalysisException("Unknown check type: " + str);
-            }
-        }
+        CONSISTENCY // check the consistency of replicas of tablet
     }
 
-    public AdminCheckTabletsStmt(List<Long> tabletIds, Map<String, String> properties) {
+    public AdminCheckTabletsStmt(List<Long> tabletIds, Property property, NodePosition pos) {
+        super(pos);
         this.tabletIds = tabletIds;
-        this.properties = properties;
+        this.property = property;
     }
 
     public List<Long> getTabletIds() {
@@ -45,8 +49,8 @@ public class AdminCheckTabletsStmt extends DdlStmt {
         return type;
     }
 
-    public Map<String, String> getProperties() {
-        return properties;
+    public Property getProperty() {
+        return property;
     }
 
     @Override
@@ -57,10 +61,5 @@ public class AdminCheckTabletsStmt extends DdlStmt {
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitAdminCheckTabletsStatement(this, context);
-    }
-
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
     }
 }

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/push_handler.h"
 
@@ -13,7 +25,7 @@
 #include "runtime/runtime_state.h"
 #include "storage/chunk_helper.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 class PushHandlerTest : public testing::Test {
 public:
@@ -32,11 +44,11 @@ private:
 
 Schema PushHandlerTest::_create_schema() {
     Fields fields;
-    fields.emplace_back(std::make_shared<Field>(0, "k1_int", get_type_info(OLAP_FIELD_TYPE_INT), true));
-    fields.emplace_back(std::make_shared<Field>(1, "k2_smallint", get_type_info(OLAP_FIELD_TYPE_SMALLINT), true));
-    fields.emplace_back(std::make_shared<Field>(2, "k3_varchar", get_type_info(OLAP_FIELD_TYPE_VARCHAR), true));
-    fields.emplace_back(std::make_shared<Field>(3, "k4_bigint", get_type_info(OLAP_FIELD_TYPE_BIGINT), true));
-    fields.back()->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
+    fields.emplace_back(std::make_shared<Field>(0, "k1_int", get_type_info(TYPE_INT), true));
+    fields.emplace_back(std::make_shared<Field>(1, "k2_smallint", get_type_info(TYPE_SMALLINT), true));
+    fields.emplace_back(std::make_shared<Field>(2, "k3_varchar", get_type_info(TYPE_VARCHAR), true));
+    fields.emplace_back(std::make_shared<Field>(3, "k4_bigint", get_type_info(TYPE_BIGINT), true));
+    fields.back()->set_aggregate_method(STORAGE_AGGREGATE_SUM);
     return Schema(fields);
 }
 
@@ -189,7 +201,6 @@ void PushHandlerTest::_create_expr_info() {
         slot_ref.__isset.slot_ref = true;
         slot_ref.slot_ref.slot_id = 4;
         slot_ref.slot_ref.tuple_id = 1;
-        slot_ref.__set_use_vectorized(true);
         slot_ref.__set_is_nullable(true);
 
         TExpr expr;
@@ -217,7 +228,6 @@ void PushHandlerTest::_create_expr_info() {
         slot_ref.__isset.slot_ref = true;
         slot_ref.slot_ref.slot_id = 5;
         slot_ref.slot_ref.tuple_id = 1;
-        slot_ref.__set_use_vectorized(true);
         slot_ref.__set_is_nullable(true);
 
         TExpr expr;
@@ -246,7 +256,6 @@ void PushHandlerTest::_create_expr_info() {
         slot_ref.__isset.slot_ref = true;
         slot_ref.slot_ref.slot_id = 6;
         slot_ref.slot_ref.tuple_id = 1;
-        slot_ref.__set_use_vectorized(true);
         slot_ref.__set_is_nullable(true);
 
         TExpr expr;
@@ -274,7 +283,6 @@ void PushHandlerTest::_create_expr_info() {
         slot_ref.__isset.slot_ref = true;
         slot_ref.slot_ref.slot_id = 7;
         slot_ref.slot_ref.tuple_id = 1;
-        slot_ref.__set_use_vectorized(true);
         slot_ref.__set_is_nullable(true);
 
         TExpr expr;
@@ -345,4 +353,4 @@ TEST_F(PushHandlerTest, PushBrokerReaderNormal) {
 
     reader.close();
 }
-} // namespace starrocks::vectorized
+} // namespace starrocks

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/Subquery.java
 
@@ -21,11 +34,13 @@
 
 package com.starrocks.analysis;
 
+import com.google.common.base.Objects;
 import com.starrocks.common.AnalysisException;
-import com.starrocks.sql.analyzer.AST2SQL;
+import com.starrocks.sql.analyzer.AstToStringBuilder;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.QueryStatement;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TExprNode;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -52,7 +67,11 @@ public class Subquery extends Expr {
     }
 
     public Subquery(QueryStatement queryStatement) {
-        super();
+        this(queryStatement, queryStatement.getPos());
+    }
+
+    public Subquery(QueryStatement queryStatement, NodePosition pos) {
+        super(pos);
         this.queryStatement = queryStatement;
     }
 
@@ -63,6 +82,11 @@ public class Subquery extends Expr {
     @Override
     protected boolean isConstantImpl() {
         return false;
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(super.hashCode(), queryStatement);
     }
 
     @Override
@@ -94,7 +118,7 @@ public class Subquery extends Expr {
 
     @Override
     public String toSqlImpl() {
-        return "(" + AST2SQL.toString(queryStatement) + ")";
+        return "(" + AstToStringBuilder.toString(queryStatement) + ")";
     }
 
     @Override

@@ -1,88 +1,58 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.connector;
 
 import com.google.common.base.Preconditions;
-import com.starrocks.common.DdlException;
-import com.starrocks.connector.hive.HiveConnectorFactory;
-import com.starrocks.connector.hudi.HudiConnectorFactory;
-import com.starrocks.connector.iceberg.IcebergConnectorFactory;
-import com.starrocks.connector.jdbc.JDBCConnectorFactory;
-import com.starrocks.server.MetadataMgr;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import com.starrocks.connector.exception.StarRocksConnectorException;
 
+import java.util.ArrayList;
+import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.locks.ReadWriteLock;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 // ConnectorMgr is responsible for managing all ConnectorFactory, and for creating Connector
 public class ConnectorMgr {
-    private static final Logger LOG = LogManager.getLogger(MetadataMgr.class);
-    private final ConcurrentHashMap<String, Connector> connectors = new ConcurrentHashMap<>();
-    private final ConcurrentHashMap<String, ConnectorFactory> connectorFactories = new ConcurrentHashMap<>();
+    private final ConcurrentHashMap<String, CatalogConnector> connectors = new ConcurrentHashMap<>();
     private final ReadWriteLock connectorLock = new ReentrantReadWriteLock();
 
-    private final MetadataMgr metadataMgr;
-
-    public ConnectorMgr(MetadataMgr metadataMgr) {
-        this.metadataMgr = metadataMgr;
-        init();
-    }
-
-    // TODO load jar by plugin
-    private void init() {
-        addConnectorFactory(new HiveConnectorFactory());
-        addConnectorFactory(new IcebergConnectorFactory());
-        addConnectorFactory(new HudiConnectorFactory());
-        addConnectorFactory(new JDBCConnectorFactory());
-    }
-
-    public void addConnectorFactory(ConnectorFactory connectorFactory) {
-        Preconditions.checkNotNull(connectorFactory, "connectorFactory is null");
-        ConnectorFactory existingConnectorFactory = connectorFactories.putIfAbsent(
-                connectorFactory.name(), connectorFactory);
-        Preconditions.checkArgument(existingConnectorFactory == null,
-                "ConnectorFactory '$s' is already registered", connectorFactory.name());
-    }
-
-    public Connector createConnector(ConnectorContext context) throws DdlException {
+    public CatalogConnector createConnector(ConnectorContext context) throws StarRocksConnectorException {
         String catalogName = context.getCatalogName();
-        String type = context.getType();
-        ConnectorFactory connectorFactory = connectorFactories.get(type);
-        Preconditions.checkNotNull(connectorFactory, "Cannot load %s connector factory", type);
+        CatalogConnector connector = null;
         readLock();
         try {
+            connector = ConnectorFactory.createConnector(context);
             Preconditions.checkState(!connectors.containsKey(catalogName),
                     "Connector of catalog '%s' already exists", catalogName);
+            if (connector == null) {
+                return null;
+            }
+        } catch (StarRocksConnectorException e) {
+            throw e;
         } finally {
             readUnlock();
         }
 
-        Connector connector = connectorFactory.createConnector(context);
-
         writeLock();
         try {
             connectors.put(catalogName, connector);
+            return connector;
         } finally {
             writeUnLock();
         }
-
-        // TODO (stephen): to test behavior that failed to create connector when fe starting.
-        try {
-            registerConnectorInternal(connector, context);
-        } catch (Exception e) {
-            writeLock();
-            try {
-                connectors.remove(catalogName);
-            } finally {
-                writeUnLock();
-            }
-            connector.shutdown();
-            throw new DdlException(String.format("Failed to create connector on [catalog : %s, type : %s]",
-                    catalogName, type), e);
-        }
-        return connector;
     }
 
     public void removeConnector(String catalogName) {
@@ -93,11 +63,10 @@ public class ConnectorMgr {
             readUnlock();
         }
 
-        removeConnectorInternal(catalogName);
         writeLock();
         try {
-            Connector connector = connectors.remove(catalogName);
-            connector.shutdown();
+            CatalogConnector catalogConnector = connectors.remove(catalogName);
+            catalogConnector.shutdown();
         } finally {
             writeUnLock();
         }
@@ -112,12 +81,17 @@ public class ConnectorMgr {
         }
     }
 
-    private void registerConnectorInternal(Connector connector, ConnectorContext context) throws Exception {
-        metadataMgr.addMetadata(context.getCatalogName(), connector.getMetadata());
+    public CatalogConnector getConnector(String catalogName) {
+        readLock();
+        try {
+            return connectors.get(catalogName);
+        } finally {
+            readUnlock();
+        }
     }
 
-    private void removeConnectorInternal(String catalogName) {
-        metadataMgr.removeMetadata(catalogName);
+    public List<CatalogConnector> listConnectors() {
+        return new ArrayList<>(connectors.values());
     }
 
     private void readLock() {

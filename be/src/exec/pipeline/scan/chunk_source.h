@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -17,13 +29,17 @@ class RuntimeProfile;
 
 namespace pipeline {
 
+class ScanOperator;
 class BalancedChunkBuffer;
 class ChunkBufferToken;
 using ChunkBufferTokenPtr = std::unique_ptr<ChunkBufferToken>;
 
 class ChunkSource {
 public:
-    ChunkSource(int32_t scan_operator_id, RuntimeProfile* runtime_profile, MorselPtr&& morsel,
+    inline static const std::string IO_TASK_EXEC_TIMER_NAME = "IOTaskExecTime";
+
+public:
+    ChunkSource(ScanOperator* op, RuntimeProfile* runtime_profile, MorselPtr&& morsel,
                 BalancedChunkBuffer& chunk_buffer);
 
     virtual ~ChunkSource() = default;
@@ -35,15 +51,13 @@ public:
     // Return true if eos is not reached
     // Return false if eos is reached or error occurred
     bool has_next_chunk() const { return _status.ok(); }
-    bool has_output() const;
-    bool has_shared_output() const;
 
-    StatusOr<vectorized::ChunkPtr> get_next_chunk_from_buffer();
     Status buffer_next_batch_chunks_blocking(RuntimeState* state, size_t batch_size,
                                              const workgroup::WorkGroup* running_wg);
 
     // Counters of scan
     int64_t get_cpu_time_spent() const { return _cpu_time_spent_ns; }
+    int64_t get_io_time_spent() const { return _io_time_spent_ns; }
     int64_t get_scan_rows() const { return _scan_rows_num; }
     int64_t get_scan_bytes() const { return _scan_bytes; }
 
@@ -54,18 +68,19 @@ public:
     void pin_chunk_token(ChunkBufferTokenPtr chunk_token);
     void unpin_chunk_token();
 
+    virtual bool reach_limit() { return false; }
+
+    // Used to print custom error msg in be.out when coredmp
+    // Don't do heavey work, it calls frequently
+    virtual const std::string get_custom_coredump_msg() const { return ""; }
+
 protected:
     // MUST be implemented by different ChunkSource
-    virtual Status _read_chunk(RuntimeState* state, vectorized::ChunkPtr* chunk) = 0;
+    virtual Status _read_chunk(RuntimeState* state, ChunkPtr* chunk) = 0;
     // The schedule entity of this workgroup for resource group.
     virtual const workgroup::WorkGroupScanSchedEntity* _scan_sched_entity(const workgroup::WorkGroup* wg) const = 0;
 
-    // Yield scan io task when maximum time in nano-seconds has spent in current execution round.
-    static constexpr int64_t YIELD_MAX_TIME_SPENT = 100'000'000L;
-    // Yield scan io task when maximum time in nano-seconds has spent in current execution round,
-    // if it runs in the worker thread owned by other workgroup, which has running drivers.
-    static constexpr int64_t YIELD_PREEMPT_MAX_TIME_SPENT = 5'000'000L;
-
+    ScanOperator* _scan_op;
     const int32_t _scan_operator_seq;
     RuntimeProfile* _runtime_profile;
     // The morsel will own by pipeline driver
@@ -75,10 +90,12 @@ protected:
     int64_t _cpu_time_spent_ns = 0;
     int64_t _scan_rows_num = 0;
     int64_t _scan_bytes = 0;
+    int64_t _io_time_spent_ns = 0;
 
     BalancedChunkBuffer& _chunk_buffer;
     Status _status = Status::OK();
     ChunkBufferTokenPtr _chunk_token;
+    std::atomic<bool> _reach_limit = false;
 
 private:
     // _scan_timer = _io_task_wait_timer + _io_task_exec_timer

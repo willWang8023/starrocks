@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.starrocks.catalog.Resource;
@@ -27,7 +40,6 @@ public class ResourceStmtTest {
     public void testCreateResource() {
         CreateResourceStmt stmt = (CreateResourceStmt) analyzeSuccess(
                 "create external resource 'spark0' PROPERTIES(\"type\"  =  \"spark\")");
-        Assert.assertTrue(stmt.isSupportNewPlanner());
         // spark resource
         Assert.assertEquals("spark0", stmt.getResourceName());
         Assert.assertEquals(Resource.ResourceType.SPARK, stmt.getResourceType());
@@ -57,7 +69,6 @@ public class ResourceStmtTest {
     @Test
     public void testShowResourcesTest() {
         ShowResourcesStmt stmt = (ShowResourcesStmt) analyzeSuccess("Show Resources");
-        Assert.assertTrue(stmt.isSupportNewPlanner());
         Assert.assertNotNull(stmt.getMetaData());
         Assert.assertNotNull(stmt.getRedirectStatus());
 
@@ -67,7 +78,6 @@ public class ResourceStmtTest {
     @Test
     public void testAlterResourceTest() {
         AlterResourceStmt stmt = (AlterResourceStmt) analyzeSuccess("alter RESOURCE hive0 SET PROPERTIES (\"hive.metastore.uris\" = \"thrift://10.10.44.91:9083\")");
-        Assert.assertTrue(stmt.isSupportNewPlanner());
         Assert.assertEquals("hive0", stmt.getResourceName());
         Assert.assertEquals("thrift://10.10.44.91:9083", stmt.getProperties().get("hive.metastore.uris"));
         // bad cases: name, type, properties
@@ -79,9 +89,29 @@ public class ResourceStmtTest {
     @Test
     public void testDropResourceTest() {
         DropResourceStmt stmt = (DropResourceStmt) analyzeSuccess("Drop Resource 'hive0'");
-        Assert.assertTrue(stmt.isSupportNewPlanner());
         Assert.assertEquals("hive0", stmt.getResourceName());
         // bad case for resource name
         analyzeFail("drop resource 01hive");
+    }
+
+    @Test
+    public void testCreateResourceStmtToString() {
+        CreateResourceStmt stmt = (CreateResourceStmt) analyzeSuccess(
+                "CREATE EXTERNAL RESOURCE \"spark0\" PROPERTIES " +
+                        "( \"type\" = \"spark\", \"spark.master\" = \"yarn\", \"spark.submit.deployMode\" = \"cluster\"," +
+                        " \"spark.jars\" = \"xxx.jar,yyy.jar\", \"spark.files\" = \"/tmp/aaa,/tmp/bbb\", " +
+                        "\"spark.executor.memory\" = \"1g\", \"spark.yarn.queue\" = \"queue0\"," +
+                        "\"spark.hadoop.yarn.resourcemanager.address\" = \"resourcemanager_host:8032\"," +
+                        "\"spark.hadoop.fs.defaultFS\" = \"hdfs://namenode_host:9000\", " +
+                        "\"working_dir\" = \"hdfs://namenode_host:9000/tmp/starrocks\", " +
+                        "\"broker\" = \"broker0\", \"broker.username\" = \"user0\", \"broker.password\" = \"password0\" )");
+
+        Assert.assertEquals("CREATE EXTERNAL RESOURCE spark0 PROPERTIES (\"spark.executor.memory\" = \"1g\"," +
+                " \"spark.master\" = \"yarn\", \"working_dir\" = \"hdfs://namenode_host:9000/tmp/starrocks\", \"broker.password\" = \"***\"," +
+                " \"spark.submit.deployMode\" = \"cluster\", \"type\" = \"spark\", \"broker\" = \"broker0\"," +
+                " \"spark.hadoop.yarn.resourcemanager.address\" = \"resourcemanager_host:8032\"," +
+                " \"spark.files\" = \"/tmp/aaa,/tmp/bbb\", \"spark.hadoop.fs.defaultFS\" = \"hdfs://namenode_host:9000\"," +
+                " \"spark.yarn.queue\" = \"queue0\", \"broker.username\" = \"user0\"," +
+                " \"spark.jars\" = \"xxx.jar,yyy.jar\")", AstToStringBuilder.toString(stmt));
     }
 }

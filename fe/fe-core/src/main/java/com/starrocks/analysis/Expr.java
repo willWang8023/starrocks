@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/Expr.java
 
@@ -28,25 +41,34 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.catalog.Function;
+import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.TreeNode;
 import com.starrocks.common.io.Writable;
+import com.starrocks.planner.FragmentNormalizer;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.analyzer.AstToSQLBuilder;
 import com.starrocks.sql.analyzer.ExpressionAnalyzer;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.LambdaFunctionExpr;
+import com.starrocks.sql.common.ErrorType;
+import com.starrocks.sql.common.StarRocksPlannerException;
 import com.starrocks.sql.common.UnsupportedException;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriter;
 import com.starrocks.sql.optimizer.transformer.SqlToScalarOperatorTranslator;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.sql.plan.ScalarOperatorToExpr;
 import com.starrocks.thrift.TExpr;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprOpcode;
+import com.starrocks.thrift.TFunction;
+import org.roaringbitmap.RoaringBitmap;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -54,6 +76,7 @@ import java.io.IOException;
 import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.Collection;
+import java.util.Collections;
 import java.util.Iterator;
 import java.util.LinkedList;
 import java.util.List;
@@ -64,7 +87,7 @@ import java.util.stream.Collectors;
 /**
  * Root of the expr node hierarchy.
  */
-abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneable, Writable {
+public abstract class Expr extends TreeNode<Expr> implements ParseNode, Cloneable, Writable {
     // Name of the function that needs to be implemented by every Expr that
     // supports negation.
     private static final String NEGATE_FN = "negate";
@@ -172,6 +195,9 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     // Set in analyze().
     protected Function fn;
 
+    // Ignore nulls.
+    private boolean ignoreNulls = false;
+
     // Cached value of IsConstant(), set during analyze() and valid if isAnalyzed_ is true.
     private boolean isConstant_;
 
@@ -179,8 +205,24 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     // Needed for properly capturing expr precedences in the SQL string.
     protected boolean printSqlInParens = false;
 
+    protected final NodePosition pos;
+
+    private List<String> hints = Collections.emptyList();
+
+    private RoaringBitmap cachedUsedSlotIds = null;
+
     protected Expr() {
-        super();
+        pos = NodePosition.ZERO;
+        type = Type.INVALID;
+        originType = Type.INVALID;
+        opcode = TExprOpcode.INVALID_OPCODE;
+        vectorOpcode = TExprOpcode.INVALID_OPCODE;
+        selectivity = -1.0;
+        numDistinctValues = -1;
+    }
+
+    protected Expr(NodePosition pos) {
+        this.pos = pos;
         type = Type.INVALID;
         originType = Type.INVALID;
         opcode = TExprOpcode.INVALID_OPCODE;
@@ -191,6 +233,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
     protected Expr(Expr other) {
         super();
+        pos = other.pos;
         id = other.id;
         isAuxExpr = other.isAuxExpr;
         type = other.type;
@@ -203,6 +246,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         fn = other.fn;
         printSqlInParens = other.printSqlInParens;
         children = Expr.cloneList(other.children);
+        hints = Lists.newArrayList(hints);
     }
 
     @SuppressWarnings("unchecked")
@@ -216,10 +260,6 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
 
     public ExprId getId() {
         return id;
-    }
-
-    protected void setId(ExprId id) {
-        this.id = id;
     }
 
     public Type getType() {
@@ -236,6 +276,11 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         if (originType == null || !originType.isValid()) {
             return type;
         }
+        return originType;
+    }
+
+    // Used to differ from getOriginType(), return originType directly.
+    public Type getTrueOriginType() {
         return originType;
     }
 
@@ -289,7 +334,8 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     /**
      * Does subclass-specific analysis. Subclasses should override analyzeImpl().
      */
-    abstract protected void analyzeImpl(Analyzer analyzer) throws AnalysisException;
+    protected void analyzeImpl(Analyzer analyzer) throws AnalysisException {
+    }
 
     /**
      * Set the expr to be analyzed and computes isConstant_.
@@ -300,6 +346,16 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         // the result, e.g. by resolving function.
         isConstant_ = isConstantImpl();
         isAnalyzed = true;
+    }
+
+    public RoaringBitmap getUsedSlotIds() {
+        if (cachedUsedSlotIds == null) {
+            cachedUsedSlotIds = new RoaringBitmap();
+            List<SlotRef> slotRefs = Lists.newArrayList();
+            this.collect(SlotRef.class, slotRefs);
+            slotRefs.stream().map(SlotRef::getSlotId).map(SlotId::asInt).forEach(cachedUsedSlotIds::add);
+        }
+        return cachedUsedSlotIds;
     }
 
     /**
@@ -403,8 +459,38 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         extractConjunctsImpl(cpe.getChild(1), conjuncts);
     }
 
+    public static List<Expr> flattenPredicate(Expr root) {
+        List<Expr> children = Lists.newArrayList();
+        if (null == root) {
+            return children;
+        }
+
+        flattenPredicate(root, children);
+        return children;
+    }
+
+    private static void flattenPredicate(Expr root, List<Expr> children) {
+        if (!(root instanceof CompoundPredicate)) {
+            children.add(root);
+            return;
+        }
+
+        CompoundPredicate cpe = (CompoundPredicate) root;
+        if (CompoundPredicate.Operator.AND.equals(cpe.getOp()) || CompoundPredicate.Operator.OR.equals(cpe.getOp())) {
+            extractConjunctsImpl(cpe.getChild(0), children);
+            extractConjunctsImpl(cpe.getChild(1), children);
+        } else {
+            children.add(root);
+        }
+    }
+
+
     public static Expr compoundAnd(Collection<Expr> conjuncts) {
         return createCompound(CompoundPredicate.Operator.AND, conjuncts);
+    }
+
+    public static Expr compoundOr(Collection<Expr> conjuncts) {
+        return createCompound(CompoundPredicate.Operator.OR, conjuncts);
     }
 
     // Build a compound tree by bottom up
@@ -669,8 +755,21 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         }
     }
 
+
+    /**
+     * toSql is an obsolete interface, because of historical reasons, the implementation of toSql is not rigorous enough.
+     * Newly developed code should use AstToSQLBuilder::toSQL instead
+     */
+    @Deprecated
     public String toSql() {
         return (printSqlInParens) ? "(" + toSqlImpl() + ")" : toSqlImpl();
+    }
+
+    /**
+     * `toSqlWithoutTbl` will return sql without table name for column name, so it can be easier to compare two expr.
+     */
+    public String toSqlWithoutTbl() {
+        return new AstToSQLBuilder.AST2SQLBuilderVisitor(false, true).visit(this);
     }
 
     public String explain() {
@@ -681,7 +780,9 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
      * Returns a SQL string representing this expr. Subclasses should override this method
      * instead of toSql() to ensure that parenthesis are properly added around the toSql().
      */
-    protected abstract String toSqlImpl();
+    protected String toSqlImpl() {
+        throw new StarRocksPlannerException("Not implement toSqlImpl function", ErrorType.INTERNAL_ERROR);
+    }
 
     protected String explainImpl() {
         return toSqlImpl();
@@ -691,60 +792,70 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         return toSql();
     }
 
-    public String toJDBCSQL(boolean isMySQL) {
-        return toSql();
-    }
-
-    /**
-     * Return a column label for the expression
-     */
-    public String toColumnLabel() {
+    public String toJDBCSQL() {
         return toSql();
     }
 
     // Convert this expr, including all children, to its Thrift representation.
     public TExpr treeToThrift() {
         TExpr result = new TExpr();
-        treeToThriftHelper(result);
+        treeToThriftHelper(result, Expr::toThrift);
         return result;
     }
 
-    // Append a flattened version of this expr, including all children, to 'container'.
-    protected void treeToThriftHelper(TExpr container) {
-        TExprNode msg = new TExprNode();
+    public void toNormalForm(TExprNode tExprNode, FragmentNormalizer normalizer) {
+        this.toThrift(tExprNode);
+    }
 
+    public TExpr normalize(FragmentNormalizer normalizer) {
+        TExpr result = new TExpr();
+        treeToThriftHelper(result, (expr, texprNode) -> expr.toNormalForm(texprNode, normalizer));
+        return result;
+    }
+
+    public interface ExprVisitor {
+        void visit(Expr expr, TExprNode texprNode);
+    }
+
+    // Append a flattened version of this expr, including all children, to 'container'.
+    final void treeToThriftHelper(TExpr container, ExprVisitor visitor) {
         if (type.isNull()) {
-            // Hack to ensure BE never sees TYPE_NULL. If an expr makes it this far without
-            // being cast to a non-NULL type, the type doesn't matter and we can cast it
-            // arbitrarily.
-            NullLiteral l = NullLiteral.create(ScalarType.BOOLEAN);
-            l.treeToThriftHelper(container);
+            Preconditions.checkState(this instanceof NullLiteral || this instanceof SlotRef);
+            NullLiteral.create(ScalarType.BOOLEAN).treeToThriftHelper(container, visitor);
             return;
         }
+
+        TExprNode msg = new TExprNode();
+
+        Preconditions.checkState(java.util.Objects.equals(type, AnalyzerUtils.replaceNullType2Boolean(type)),
+                "NULL_TYPE is illegal in thrift stage");
 
         msg.type = type.toThrift();
         msg.num_children = children.size();
         msg.setHas_nullable_child(hasNullableChild());
         msg.setIs_nullable(isNullable());
         if (fn != null) {
-            msg.setFn(fn.toThrift());
+            TFunction tfn = fn.toThrift();
+            tfn.setIgnore_nulls(getIgnoreNulls());
+            msg.setFn(tfn);
             if (fn.hasVarArgs()) {
                 msg.setVararg_start_idx(fn.getNumArgs() - 1);
             }
         }
         msg.output_scale = getOutputScale();
         msg.setIs_monotonic(isMonotonic());
-        toThrift(msg);
+        visitor.visit(this, msg);
         container.addToNodes(msg);
         for (Expr child : children) {
-            child.treeToThriftHelper(container);
+            child.treeToThriftHelper(container, visitor);
         }
-
     }
 
     // Convert this expr into msg (excluding children), which requires setting
     // msg.op as well as the expr-specific field.
-    protected abstract void toThrift(TExprNode msg);
+    protected void toThrift(TExprNode msg) {
+        throw new StarRocksPlannerException("Not implement toThrift function", ErrorType.INTERNAL_ERROR);
+    }
 
     public List<String> childrenToSql() {
         List<String> result = Lists.newArrayList();
@@ -928,6 +1039,9 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
     }
 
     /**
+     * Attention: if you just want check whether the expr is a constant literal, please consider
+     * use isLiteral()
+     *
      * Returns true if this expression should be treated as constant. I.e. if the frontend
      * and backend should assume that two evaluations of the expression within a query will
      * return the same value. Examples of constant expressions include:
@@ -1113,21 +1227,18 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         return this instanceof CastExpr && ((CastExpr) this).isImplicit();
     }
 
-    /**
-     * Looks up in the globalStateMgr the builtin for 'name' and 'argTypes'.
-     * Returns null if the function is not found.
-     */
-    protected Function getBuiltinFunction(
-            Analyzer analyzer, String name, Type[] argTypes, Function.CompareMode mode)
-            throws AnalysisException {
+    public static Function getBuiltinFunction(String name, Type[] argTypes, Function.CompareMode mode) {
         FunctionName fnName = new FunctionName(name);
         Function searchDesc = new Function(fnName, argTypes, Type.INVALID, false);
         return GlobalStateMgr.getCurrentState().getFunction(searchDesc, mode);
     }
 
-    public static Function getBuiltinFunction(String name, Type[] argTypes, Function.CompareMode mode) {
+    public static Function getBuiltinFunction(String name, Type[] argTypes, String[] argNames, Function.CompareMode mode) {
+        if (argNames == null) {
+            return getBuiltinFunction(name, argTypes, mode);
+        }
         FunctionName fnName = new FunctionName(name);
-        Function searchDesc = new Function(fnName, argTypes, Type.INVALID, false);
+        Function searchDesc = new Function(fnName, argTypes, argNames, Type.INVALID, false);
         return GlobalStateMgr.getCurrentState().getFunction(searchDesc, mode);
     }
 
@@ -1146,7 +1257,7 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
                 // otherwise we may recurse infinitely.
                 Method m = root.getChild(0).getClass().getDeclaredMethod(NEGATE_FN);
                 return pushNegationToOperands(root.getChild(0).negate());
-            } catch (NoSuchMethodException e) {
+            } catch (NoSuchMethodException | IllegalStateException e) {
                 // The 'negate' function is not implemented. Break the recursion.
                 return root;
             }
@@ -1169,6 +1280,11 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
      */
     public Expr negate() {
         return new CompoundPredicate(CompoundPredicate.Operator.NOT, this, null);
+    }
+
+    @Override
+    public NodePosition getPos() {
+        return pos;
     }
 
     @Override
@@ -1305,26 +1421,45 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
         this.fn = fn;
     }
 
+    public void setIgnoreNulls(boolean ignoreNulls) {
+        this.ignoreNulls = ignoreNulls;
+    }
+
+    public boolean getIgnoreNulls() {
+        return ignoreNulls;
+    }
+
     // only the first/last one can be lambda functions.
-    public boolean hasLambdaFunction() {
-        int pos = -1, num = 0;
+    public boolean hasLambdaFunction(Expr expression) {
+        int idx = -1;
+        int num = 0;
         for (int i = 0; i < children.size(); ++i) {
             if (children.get(i) instanceof LambdaFunctionExpr) {
                 num++;
-                pos = i;
+                idx = i;
             }
         }
-        if (num == 1 && (pos == 0 || pos == children.size() - 1)) {
+        if (num == 1 && (idx == 0 || idx == children.size() - 1)) {
             if (children.size() <= 1) {
-                throw new SemanticException("Lambda functions should work with inputs in high-order functions.");
+                throw new SemanticException("Lambda functions need array/map inputs in high-order functions");
             }
             return true;
         } else if (num > 1) {
-            throw new SemanticException("A high-order function can have one lambda function.");
-        } else if (pos > 0 && pos < children.size() - 1) {
+            throw new SemanticException("A high-order function should have only 1 lambda function, " +
+                    "but there are " + num + " lambda functions");
+        } else if (idx > 0 && idx < children.size() - 1) {
             throw new SemanticException(
-                    "Lambda functions can only be the first or last argument of any high-order function, " +
-                            "or lambda arguments should be in ().");
+                    "Lambda functions should only be the first or last argument of any high-order function, " +
+                            "or lambda arguments should be in () if there are more than one lambda arguments, " +
+                            "like (x,y)->x+y");
+        } else if (num == 0) {
+            if (expression instanceof FunctionCallExpr) {
+                String funcName = ((FunctionCallExpr) expression).getFnName().getFunction();
+                if (funcName.equals(FunctionSet.ARRAY_MAP) || funcName.equals(FunctionSet.TRANSFORM) ||
+                        funcName.equals(FunctionSet.MAP_APPLY)) {
+                    throw new SemanticException("There are no lambda functions in high-order function " + funcName);
+                }
+            }
         }
         return false;
     }
@@ -1359,4 +1494,13 @@ abstract public class Expr extends TreeNode<Expr> implements ParseNode, Cloneabl
             return expr;
         }
     }
+
+    public void setHints(List<String> hints) {
+        this.hints = hints;
+    }
+
+    public List<String> getHints() {
+        return hints;
+    }
+
 }

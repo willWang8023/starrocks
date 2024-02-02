@@ -1,18 +1,34 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.rule.tree;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.starrocks.analysis.JoinOperator;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptExpressionVisitor;
 import com.starrocks.sql.optimizer.base.ColumnRefFactory;
+import com.starrocks.sql.optimizer.base.DistributionCol;
 import com.starrocks.sql.optimizer.base.DistributionSpec;
 import com.starrocks.sql.optimizer.base.HashDistributionDesc;
 import com.starrocks.sql.optimizer.base.HashDistributionSpec;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.physical.PhysicalDistributionOperator;
+import com.starrocks.sql.optimizer.operator.physical.PhysicalJoinOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 import com.starrocks.sql.optimizer.statistics.Statistics;
@@ -106,20 +122,20 @@ public class PruneShuffleColumnRule implements TreeRewriteRule {
                     .map(s -> ((HashDistributionSpec) s.getDistributionSpec()).getHashDistributionDesc()).collect(
                             Collectors.toList());
 
-            Preconditions.checkState(descs.stream().mapToInt(d -> d.getColumns().size()).distinct().count() == 1);
+            Preconditions.checkState(descs.stream().mapToInt(d -> d.getDistributionCols().size()).distinct().count() == 1);
 
-            if (descs.stream().mapToInt(d -> d.getColumns().size()).min().orElse(0) < 2) {
+            if (descs.stream().mapToInt(d -> d.getDistributionCols().size()).min().orElse(0) < 2) {
                 return;
             }
 
             // choose high cardinality column
-            int columnSize = descs.get(0).getColumns().size();
+            int columnSize = descs.get(0).getDistributionCols().size();
             int maxColumnIndex = -1;
             double maxRatio = -1;
 
             for (int i = 0; i < columnSize; i++) {
                 for (int j = 0; j < descs.size(); j++) {
-                    ColumnRefOperator ref = factory.getColumnRef(descs.get(j).getColumns().get(i));
+                    ColumnRefOperator ref = factory.getColumnRef(descs.get(j).getDistributionCols().get(i).getColId());
                     ColumnStatistic cs = childContext.statistics.get(j).getColumnStatistic(ref);
 
                     if (cs.isUnknown()) {
@@ -143,9 +159,9 @@ public class PruneShuffleColumnRule implements TreeRewriteRule {
 
             if (maxColumnIndex > -1) {
                 for (HashDistributionDesc d : descs) {
-                    int x = d.getColumns().get(maxColumnIndex);
-                    d.getColumns().clear();
-                    d.getColumns().add(x);
+                    DistributionCol x = d.getDistributionCols().get(maxColumnIndex);
+                    d.getDistributionCols().clear();
+                    d.getDistributionCols().add(x);
                 }
             }
         }
@@ -164,7 +180,8 @@ public class PruneShuffleColumnRule implements TreeRewriteRule {
             optExpression.getInputs().get(0).getOp().accept(this, optExpression.getInputs().get(0), lc);
             optExpression.getInputs().get(1).getOp().accept(this, optExpression.getInputs().get(1), rc);
 
-            if (lc.distributionList.isEmpty() || rc.distributionList.isEmpty()) {
+            if (lc.distributionList.isEmpty() || rc.distributionList.isEmpty() ||
+                    ((PhysicalJoinOperator) optExpression.getOp()).getJoinHint().equals(JoinOperator.HINT_SKEW)) {
                 return optExpression;
             }
 

@@ -30,7 +30,9 @@ public enum CaseSensibility {
     LABEL(false),
     VARIABLES(true),
     RESOURCE(true),
-    CONFIG(true);
+    WAREHOUSE(true),
+    CONFIG(true),
+    STORAGEVOLUME(true);
 
     private boolean caseSensitive;
 

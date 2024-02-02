@@ -1,17 +1,30 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
 #include <queue>
 
+#include "column/column_helper.h"
+#include "exec/sorting/merge.h"
+#include "exec/sorting/sorting.h"
 #include "runtime/chunk_cursor.h"
 #include "util/runtime_profile.h"
 
 namespace starrocks {
 
 class SortExecExprs;
-
-namespace vectorized {
 
 // Merge a group of sorted Chunks to one Chunk in order.
 class SortedChunksMerger {
@@ -26,8 +39,6 @@ public:
                              const ChunkHasSuppliers& chunk_has_suppliers, const std::vector<ExprContext*>* sort_exprs,
                              const std::vector<bool>* is_asc, const std::vector<bool>* is_null_first);
     bool is_data_ready();
-    void init_for_min_heap();
-
     void set_profile(RuntimeProfile* profile);
 
     // Return the next sorted chunk from this merger.
@@ -35,30 +46,26 @@ public:
     Status get_next_for_pipeline(ChunkPtr* chunk, std::atomic<bool>* eos, bool* should_exit);
 
 private:
-    RuntimeState* _state;
+    struct CursorCmpGreater {
+        // if a is greater than b.
+        inline bool operator()(const ChunkCursor* a, const ChunkCursor* b) { return b->operator<(*a); }
+    };
+
+    void init_for_min_heap();
     void collect_merged_chunks(ChunkPtr* chunk);
     void move_cursor_and_adjust_min_heap(std::atomic<bool>* eos);
+
+    RuntimeState* _state;
+    bool _is_pipeline;
 
     ChunkSupplier _single_supplier;
     ChunkProbeSupplier _single_probe_supplier;
     ChunkHasSupplier _single_has_supplier;
 
-    bool _is_pipeline;
-
-public:
     std::vector<std::unique_ptr<ChunkCursor>> _cursors;
-
-private:
-    struct CursorCmpGreater {
-        // if a is greater than b.
-        inline bool operator()(const ChunkCursor* a, const ChunkCursor* b) { return b->operator<(*a); }
-    };
     CursorCmpGreater _cursor_cmp_greater;
-
-public:
     std::vector<ChunkCursor*> _min_heap;
 
-private:
     RuntimeProfile::Counter* _total_timer = nullptr;
 
     // for multiple suppliers.
@@ -73,7 +80,7 @@ private:
      * _wait_for_data: record is it need to blocking or non-blocking.
      */
     size_t _row_number = 0;
-    ChunkCursor* _cursor;
+    ChunkCursor* _cursor = nullptr;
     ChunkPtr _current_chunk;
     ChunkPtr _result_chunk;
     std::vector<uint32_t> _selective_values;
@@ -85,6 +92,62 @@ private:
     bool _wait_for_data = false;
 };
 
-} // namespace vectorized
+class ChunkMerger {
+public:
+    ChunkMerger(RuntimeState* state) : _state(state) {}
+    virtual ~ChunkMerger() = default;
+
+    virtual Status init(const std::vector<ChunkProvider>& has_suppliers, const std::vector<ExprContext*>* sort_exprs,
+                        const SortDescs& _sort_desc) = 0;
+    virtual Status init(const std::vector<ChunkProvider>& has_suppliers, const std::vector<ExprContext*>* sort_exprs,
+                        const std::vector<bool>* sort_orders, const std::vector<bool>* null_firsts) = 0;
+
+    virtual bool is_data_ready() = 0;
+    virtual Status get_next(ChunkUniquePtr* chunk, std::atomic<bool>* eos, bool* should_exit) = 0;
+
+protected:
+    RuntimeState* _state;
+};
+
+// TODO(murphy) refactor it with MergeCursorsCascade
+// Merge sorted chunks in cascade style
+class CascadeChunkMerger : public ChunkMerger {
+public:
+    CascadeChunkMerger(RuntimeState* state);
+    ~CascadeChunkMerger() = default;
+
+    Status init(const std::vector<ChunkProvider>& has_suppliers, const std::vector<ExprContext*>* sort_exprs,
+                const SortDescs& _sort_desc) override;
+    Status init(const std::vector<ChunkProvider>& has_suppliers, const std::vector<ExprContext*>* sort_exprs,
+                const std::vector<bool>* sort_orders, const std::vector<bool>* null_firsts) override;
+
+    bool is_data_ready() override;
+    Status get_next(ChunkUniquePtr* chunk, std::atomic<bool>* eos, bool* should_exit) override;
+
+private:
+    const std::vector<ExprContext*>* _sort_exprs;
+    SortDescs _sort_desc;
+    std::vector<std::unique_ptr<SimpleChunkSortCursor>> _cursors;
+
+    std::unique_ptr<MergeCursorsCascade> _merger;
+    ChunkSlice _current_chunk;
+};
+
+class ConstChunkMerger : public ChunkMerger {
+public:
+    ConstChunkMerger(RuntimeState* state);
+    ~ConstChunkMerger() = default;
+
+    Status init(const std::vector<ChunkProvider>& has_suppliers, const std::vector<ExprContext*>* sort_exprs,
+                const SortDescs& _sort_desc) override;
+    Status init(const std::vector<ChunkProvider>& has_suppliers, const std::vector<ExprContext*>* sort_exprs,
+                const std::vector<bool>* sort_orders, const std::vector<bool>* null_firsts) override;
+
+    bool is_data_ready() override;
+    Status get_next(ChunkUniquePtr* chunk, std::atomic<bool>* eos, bool* should_exit) override;
+
+private:
+    std::vector<ChunkProvider> _providers;
+};
 
 } // namespace starrocks

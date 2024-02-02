@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 /*
  * Copyright (c) Meta Platforms, Inc. and affiliates.
  *
@@ -23,6 +36,7 @@
 
 #include "common/status.h"
 #include "common/statusor.h"
+#include "util/moodycamel/concurrentqueue.h"
 #include "util/starrocks_metrics.h"
 
 namespace starrocks::compression {
@@ -69,7 +83,6 @@ public:
             : _creator(std::move(creator)),
               _deleter(std::move(deleter)),
               _resetter(std::move(resetter)),
-              _stack(),
               _created_counter(0) {
         auto metrics = StarRocksMetrics::instance()->metrics();
         std::string full_name = pool_name + "_context_pool_create_count";
@@ -79,16 +92,14 @@ public:
     }
 
     StatusOr<Ref> get() {
-        std::lock_guard<std::mutex> l(_stack_lock);
-        if (_stack.empty()) {
+        InternalRef ctx;
+        if (!_ctx_resources.try_dequeue(ctx)) {
             ASSIGN_OR_RETURN(T * t, _creator());
             _created_counter++;
             return Ref(t, get_deleter());
         }
-        auto ptr = std::move(_stack.back());
-        _stack.pop_back();
-        DCHECK(ptr);
-        return Ref(ptr.release(), get_deleter());
+        DCHECK(ctx != nullptr);
+        return Ref(ctx.release(), get_deleter());
     }
 
     size_t created_count() const { return _created_counter.load(); }
@@ -101,36 +112,23 @@ public:
 
     Resetter& get_resetter() { return _resetter; }
 
-    void flush_deep() {
-        flush_shallow();
-        // no backing stack, so deep == shallow
-    }
-
-    void flush_shallow() {
-        std::lock_guard<std::mutex> l(_stack_lock);
-        _stack->resize(0);
-    }
-
 private:
     void add(InternalRef ptr) {
         DCHECK(ptr);
-        _resetter(ptr.get());
         Status status = _resetter(ptr.get());
         // if reset fail, then delete this context
         if (!status.ok()) {
             return;
         }
 
-        std::lock_guard<std::mutex> l(_stack_lock);
-        _stack.push_back(std::move(ptr));
+        _ctx_resources.enqueue(std::move(ptr));
     }
 
     Creator _creator;
     Deleter _deleter;
     Resetter _resetter;
 
-    std::mutex _stack_lock;
-    std::vector<InternalRef> _stack;
+    moodycamel::ConcurrentQueue<InternalRef> _ctx_resources;
 
     std::unique_ptr<UIntGauge> _created_counter_metrics;
     std::atomic<size_t> _created_counter;

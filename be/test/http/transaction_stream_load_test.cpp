@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "http/action/transaction_stream_load.h"
 
@@ -15,7 +27,7 @@
 #include "runtime/stream_load/load_stream_mgr.h"
 #include "runtime/stream_load/stream_load_executor.h"
 #include "runtime/stream_load/transaction_mgr.h"
-#include "runtime/thread_resource_mgr.h"
+#include "testutil/sync_point.h"
 #include "util/brpc_stub_cache.h"
 #include "util/cpu_info.h"
 
@@ -23,28 +35,34 @@ class mg_connection;
 
 namespace starrocks {
 
-extern std::string k_response_str;
+extern void (*s_injected_send_reply)(HttpRequest*, HttpStatus, std::string_view);
+
+namespace {
+static std::string k_response_str;
+static void inject_send_reply(HttpRequest* request, HttpStatus status, std::string_view content) {
+    k_response_str = content;
+}
+} // namespace
 
 extern TLoadTxnBeginResult k_stream_load_begin_result;
 extern TLoadTxnCommitResult k_stream_load_commit_result;
 extern TLoadTxnRollbackResult k_stream_load_rollback_result;
 extern TStreamLoadPutResult k_stream_load_put_result;
-extern Status k_stream_load_plan_status;
 
 class TransactionStreamLoadActionTest : public testing::Test {
 public:
-    TransactionStreamLoadActionTest() {}
-    virtual ~TransactionStreamLoadActionTest() {}
+    TransactionStreamLoadActionTest() = default;
+    ~TransactionStreamLoadActionTest() override = default;
+    static void SetUpTestSuite() { s_injected_send_reply = inject_send_reply; }
+    static void TearDownTestSuite() { s_injected_send_reply = nullptr; }
     void SetUp() override {
         k_stream_load_begin_result = TLoadTxnBeginResult();
         k_stream_load_commit_result = TLoadTxnCommitResult();
         k_stream_load_rollback_result = TLoadTxnRollbackResult();
         k_stream_load_put_result = TStreamLoadPutResult();
-        k_stream_load_plan_status = Status::OK();
         k_response_str = "";
         config::streaming_load_max_mb = 1;
 
-        _env._thread_mgr = new ThreadResourceMgr();
         _env._load_stream_mgr = new LoadStreamMgr();
         _env._brpc_stub_cache = new BrpcStubCache();
         _env._stream_load_executor = new StreamLoadExecutor(&_env);
@@ -62,8 +80,6 @@ public:
         _env._brpc_stub_cache = nullptr;
         delete _env._load_stream_mgr;
         _env._load_stream_mgr = nullptr;
-        delete _env._thread_mgr;
-        _env._thread_mgr = nullptr;
         delete _env._stream_load_executor;
         _env._stream_load_executor = nullptr;
 
@@ -566,6 +582,9 @@ TEST_F(TransactionStreamLoadActionTest, txn_plan_fail) {
     }
 
     {
+        SyncPoint::GetInstance()->EnableProcessing();
+        SyncPoint::GetInstance()->SetCallBack("StreamLoadExecutor::execute_plan_fragment:1",
+                                              [](void* arg) { *(Status*)arg = Status::InternalError("TestFail"); });
         TransactionStreamLoadAction action(&_env);
 
         HttpRequest request(_evhttp_req);
@@ -577,13 +596,15 @@ TEST_F(TransactionStreamLoadActionTest, txn_plan_fail) {
         request._headers.emplace(HttpHeaders::AUTHORIZATION, "Basic cm9vdDo=");
         request._headers.emplace(HttpHeaders::CONTENT_LENGTH, "16");
         request._headers.emplace(HTTP_LABEL_KEY, "123");
-        k_stream_load_plan_status = Status::InternalError("TestFail");
         action.on_header(&request);
         action.handle(&request);
 
         rapidjson::Document doc;
         doc.Parse(k_response_str.c_str());
         ASSERT_STREQ("OK", doc["Status"].GetString());
+
+        SyncPoint::GetInstance()->ClearCallBack("StreamLoadExecutor::execute_plan_fragment:1");
+        SyncPoint::GetInstance()->DisableProcessing();
     }
 }
 

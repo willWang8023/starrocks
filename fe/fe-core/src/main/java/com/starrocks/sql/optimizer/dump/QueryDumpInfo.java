@@ -1,15 +1,32 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.dump;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Maps;
+import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.Resource;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.View;
 import com.starrocks.common.Pair;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.qe.VariableMgr;
+import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.optimizer.MaterializedViewOptimizer;
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 
 import java.util.ArrayList;
@@ -22,20 +39,21 @@ import java.util.Set;
 
 public class QueryDumpInfo implements DumpInfo {
     private String originStmt = "";
+
+    private StatementBase statementBase;
     private final Set<Resource> resourceSet = new HashSet<>();
     // tableId-><dbName, table>
-    private final Map<Long, Pair<String, Table>> tableMap = new HashMap<>();
+    private final Map<Long, Pair<String, Table>> tableMap = new LinkedHashMap<>();
     // resourceName->dbName->tableName->externalTable
     private final Map<String, Map<String, Map<String, HiveMetaStoreTableDumpInfo>>> hmsTableMap = new HashMap<>();
     // viewId-><dbName, view>
     private final Map<Long, Pair<String, View>> viewMap = new LinkedHashMap<>();
-    // tableName->partitionName->partitionRowCount
+    // dbName.tableName->partitionName->partitionRowCount
     private final Map<String, Map<String, Long>> partitionRowCountMap = new HashMap<>();
     // tableName->columnName->column statistics
     private final Map<String, Map<String, ColumnStatistic>> tableStatisticsMap = new HashMap<>();
-    private SessionVariable sessionVariable;
     // tableName->createTableStmt
-    private final Map<String, String> createTableStmtMap = new HashMap<>();
+    private final Map<String, String> createTableStmtMap = new LinkedHashMap<>();
     // viewName->createViewStmt
     private final Map<String, String> createViewStmtMap = new LinkedHashMap<>();
 
@@ -46,11 +64,20 @@ public class QueryDumpInfo implements DumpInfo {
     private int cachedAvgNumOfHardwareCores = -1;
     private Map<Long, Integer> numOfHardwareCoresPerBe = Maps.newHashMap();
 
-    public QueryDumpInfo(SessionVariable sessionVariable) {
-        this.sessionVariable = sessionVariable;
+    private SessionVariable sessionVariable;
+    private final ConnectContext connectContext;
+
+    private String explainInfo = "";
+
+    private boolean desensitizedInfo;
+
+    public QueryDumpInfo(ConnectContext context) {
+        this.connectContext = context;
+        this.sessionVariable = context.getSessionVariable();
     }
 
     public QueryDumpInfo() {
+        this.connectContext = null;
         this.sessionVariable = VariableMgr.newSessionVariable();
     }
 
@@ -63,6 +90,15 @@ public class QueryDumpInfo implements DumpInfo {
         return originStmt;
     }
 
+    @Override
+    public void setStatement(StatementBase statement) {
+        this.statementBase = statement;
+    }
+
+    public StatementBase getStatement() {
+        return statementBase;
+    }
+
     public SessionVariable getSessionVariable() {
         return sessionVariable;
     }
@@ -73,7 +109,26 @@ public class QueryDumpInfo implements DumpInfo {
 
     @Override
     public void addTable(String dbName, Table table) {
-        tableMap.put(table.getId(), new Pair<>(dbName, table));
+        if (tableMap.containsKey(table.getId())) {
+            return;
+        }
+
+        if (table instanceof MaterializedView) {
+            String queryExcludingMVNames = connectContext.getSessionVariable().getQueryExcludingMVNames();
+            // Disable mv rewrite just like `PartitionBasedMvRefreshProcessor`.
+            connectContext.getSessionVariable().setQueryExcludingMVNames(table.getName());
+            {
+                MaterializedViewOptimizer mvOptimizer = new MaterializedViewOptimizer();
+                // NOTE: Since materialized view support unique/foreign constraints, we use `optimize` here to visit
+                // all dependent tables again to add it into `dump info`.
+                // NOTE: The optimizer should not contain self to avoid stack overflow.
+                mvOptimizer.optimize((MaterializedView) table, connectContext);
+                tableMap.put(table.getId(), new Pair<>(dbName, table));
+            }
+            connectContext.getSessionVariable().setQueryExcludingMVNames(queryExcludingMVNames);
+        } else {
+            tableMap.put(table.getId(), new Pair<>(dbName, table));
+        }
     }
 
     @Override
@@ -137,8 +192,9 @@ public class QueryDumpInfo implements DumpInfo {
     }
 
     public HiveMetaStoreTableDumpInfo getHMSTable(String resourceName, String dbName, String tableName) {
-        return hmsTableMap.getOrDefault(resourceName, new HashMap<>()).getOrDefault(dbName, new HashMap<>()).
-                getOrDefault(tableName, new HiveTableDumpInfo());
+        return hmsTableMap.computeIfAbsent(resourceName, x -> new HashMap<>())
+                .computeIfAbsent(dbName, x -> new HashMap<>())
+                .computeIfAbsent(tableName, x -> new HiveTableDumpInfo());
     }
 
     @Override
@@ -155,7 +211,7 @@ public class QueryDumpInfo implements DumpInfo {
         hmsTableMap.putIfAbsent(resourceName, new HashMap<>());
         Map<String, Map<String, HiveMetaStoreTableDumpInfo>> dbTable = hmsTableMap.get(resourceName);
         dbTable.putIfAbsent(dbName, new HashMap<>());
-        Map<String, HiveMetaStoreTableDumpInfo> tableMap =  dbTable.get(dbName);
+        Map<String, HiveMetaStoreTableDumpInfo> tableMap = dbTable.get(dbName);
         tableMap.putIfAbsent(tableName, dumpInfo);
     }
 
@@ -229,5 +285,23 @@ public class QueryDumpInfo implements DumpInfo {
 
     public int getBeNum() {
         return this.beNum;
+    }
+
+    public boolean isDesensitizedInfo() {
+        return desensitizedInfo;
+    }
+
+    @Override
+    public void setDesensitizedInfo(boolean desensitizedInfo) {
+        this.desensitizedInfo = desensitizedInfo;
+    }
+
+    public String getExplainInfo() {
+        return explainInfo;
+    }
+
+    @Override
+    public void setExplainInfo(String explainInfo) {
+        this.explainInfo = explainInfo;
     }
 }

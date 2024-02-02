@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/mem_tracker.cpp
 
@@ -23,24 +36,23 @@
 
 #include <utility>
 
-#include "gutil/strings/substitute.h"
-#include "util/debug_util.h"
-#include "util/mem_info.h"
-#include "util/pretty_printer.h"
-#include "util/stack_util.h"
-#include "util/starrocks_metrics.h"
-#include "util/uid_util.h"
-
 namespace starrocks {
 
-const std::string MemTracker::COUNTER_NAME = "PeakMemoryUsage";
+const std::string MemTracker::PEAK_MEMORY_USAGE = "PeakMemoryUsage";
+const std::string MemTracker::ALLOCATED_MEMORY_USAGE = "AllocatedMemoryUsage";
+const std::string MemTracker::DEALLOCATED_MEMORY_USAGE = "DeallocatedMemoryUsage";
 
 MemTracker::MemTracker(int64_t byte_limit, std::string label, MemTracker* parent)
         : _limit(byte_limit),
           _label(std::move(label)),
           _parent(parent),
-          _consumption(&_local_counter),
-          _local_counter(TUnit::BYTES) {
+          _consumption(&_local_consumption_counter),
+          _local_consumption_counter(TUnit::BYTES,
+                                     RuntimeProfile::Counter::create_strategy(TCounterAggregateType::AVG)),
+          _allocation(&_local_allocation_counter),
+          _local_allocation_counter(TUnit::BYTES),
+          _deallocation(&_local_deallocation_counter),
+          _local_deallocation_counter(TUnit::BYTES) {
     if (parent != nullptr) _parent->add_child_tracker(this);
     Init();
 }
@@ -50,19 +62,40 @@ MemTracker::MemTracker(Type type, int64_t byte_limit, std::string label, MemTrac
           _limit(byte_limit),
           _label(std::move(label)),
           _parent(parent),
-          _consumption(&_local_counter),
-          _local_counter(TUnit::BYTES) {
+          _consumption(&_local_consumption_counter),
+          _local_consumption_counter(TUnit::BYTES,
+                                     RuntimeProfile::Counter::create_strategy(TCounterAggregateType::AVG)),
+          _allocation(&_local_allocation_counter),
+          _local_allocation_counter(TUnit::BYTES),
+          _deallocation(&_local_deallocation_counter),
+          _local_deallocation_counter(TUnit::BYTES) {
     if (parent != nullptr) _parent->add_child_tracker(this);
     Init();
 }
 
-MemTracker::MemTracker(RuntimeProfile* profile, int64_t byte_limit, std::string label, MemTracker* parent)
-        : _type(NO_SET),
-          _limit(byte_limit),
+MemTracker::MemTracker(RuntimeProfile* profile, std::tuple<bool, bool, bool> attaching_info,
+                       const std::string& counter_name_prefix, int64_t byte_limit, std::string label,
+                       MemTracker* parent)
+        : _limit(byte_limit),
           _label(std::move(label)),
           _parent(parent),
-          _consumption(profile->AddHighWaterMarkCounter(COUNTER_NAME, TUnit::BYTES)),
-          _local_counter(TUnit::BYTES) {
+          _consumption(std::get<0>(attaching_info)
+                               ? profile->AddHighWaterMarkCounter(
+                                         counter_name_prefix + PEAK_MEMORY_USAGE, TUnit::BYTES,
+                                         RuntimeProfile::Counter::create_strategy(TCounterAggregateType::AVG))
+                               : &_local_consumption_counter),
+          _local_consumption_counter(TUnit::BYTES,
+                                     RuntimeProfile::Counter::create_strategy(TCounterAggregateType::AVG)),
+          _allocation(std::get<1>(attaching_info)
+                              ? profile->add_counter(counter_name_prefix + ALLOCATED_MEMORY_USAGE, TUnit::BYTES,
+                                                     RuntimeProfile::Counter::create_strategy(TUnit::BYTES))
+                              : &_local_allocation_counter),
+          _local_allocation_counter(TUnit::BYTES),
+          _deallocation(std::get<2>(attaching_info)
+                                ? profile->add_counter(counter_name_prefix + DEALLOCATED_MEMORY_USAGE, TUnit::BYTES,
+                                                       RuntimeProfile::Counter::create_strategy(TUnit::BYTES))
+                                : &_local_deallocation_counter),
+          _local_deallocation_counter(TUnit::BYTES) {
     if (parent != nullptr) _parent->add_child_tracker(this);
     Init();
 }
@@ -107,7 +140,7 @@ std::string MemTracker::err_msg(const std::string& msg) const {
         break;
     case MemTracker::QUERY:
         str << "Mem usage has exceed the limit of single query, You can change the limit by "
-               "set session variable exec_mem_limit or query_mem_limit.";
+               "set session variable query_mem_limit.";
         break;
     case MemTracker::PROCESS:
         str << "Mem usage has exceed the limit of BE";
@@ -123,6 +156,19 @@ std::string MemTracker::err_msg(const std::string& msg) const {
         break;
     case MemTracker::SCHEMA_CHANGE_TASK:
         str << "You can change the limit by modify BE config [memory_limitation_per_thread_for_schema_change]";
+        break;
+    case MemTracker::RESOURCE_GROUP:
+        // TODO: make default_wg configuable.
+        if (label() == "default_wg") {
+            str << "Mem usage has exceed the limit of query pool";
+        } else {
+            str << "Mem usage has exceed the limit of the resource group [" << label() << "]. "
+                << "You can change the limit by modifying [mem_limit] of this group";
+        }
+        break;
+    case MemTracker::RESOURCE_GROUP_BIG_QUERY:
+        str << "Mem usage has exceed the big query limit of the resource group [" << label() << "]. "
+            << "You can change the limit by modifying [big_query_mem_limit] of this group";
         break;
     default:
         break;

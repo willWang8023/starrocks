@@ -1,27 +1,35 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.LikePredicate;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.analysis.OrderByElement;
 import com.starrocks.analysis.Predicate;
-import com.starrocks.analysis.SetType;
-import com.starrocks.analysis.ShowRoutineLoadStmt;
-import com.starrocks.analysis.ShowRoutineLoadTaskStmt;
-import com.starrocks.analysis.ShowStmt;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.TableName;
-import com.starrocks.analysis.UserIdentity;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.KeysType;
-import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.MysqlTable;
 import com.starrocks.catalog.OlapTable;
@@ -36,15 +44,17 @@ import com.starrocks.common.proc.ProcNodeInterface;
 import com.starrocks.common.proc.ProcService;
 import com.starrocks.common.proc.TableProcDir;
 import com.starrocks.common.util.OrderByPair;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.DescribeStmt;
 import com.starrocks.sql.ast.ShowAlterStmt;
-import com.starrocks.sql.ast.ShowAuthenticationStmt;
 import com.starrocks.sql.ast.ShowColumnStmt;
 import com.starrocks.sql.ast.ShowCreateDbStmt;
+import com.starrocks.sql.ast.ShowCreateExternalCatalogStmt;
 import com.starrocks.sql.ast.ShowCreateTableStmt;
 import com.starrocks.sql.ast.ShowDataStmt;
 import com.starrocks.sql.ast.ShowDbStmt;
@@ -54,13 +64,18 @@ import com.starrocks.sql.ast.ShowFunctionsStmt;
 import com.starrocks.sql.ast.ShowIndexStmt;
 import com.starrocks.sql.ast.ShowLoadStmt;
 import com.starrocks.sql.ast.ShowLoadWarningsStmt;
-import com.starrocks.sql.ast.ShowMaterializedViewStmt;
+import com.starrocks.sql.ast.ShowMaterializedViewsStmt;
 import com.starrocks.sql.ast.ShowPartitionsStmt;
 import com.starrocks.sql.ast.ShowProcStmt;
+import com.starrocks.sql.ast.ShowRoutineLoadStmt;
+import com.starrocks.sql.ast.ShowRoutineLoadTaskStmt;
+import com.starrocks.sql.ast.ShowStmt;
+import com.starrocks.sql.ast.ShowStreamLoadStmt;
 import com.starrocks.sql.ast.ShowTableStatusStmt;
 import com.starrocks.sql.ast.ShowTableStmt;
 import com.starrocks.sql.ast.ShowTabletStmt;
-import com.starrocks.sql.ast.ShowVariablesStmt;
+import com.starrocks.sql.ast.ShowTransactionStmt;
+import com.starrocks.sql.ast.ShowWarehousesStmt;
 import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -89,7 +104,17 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowTableStmt(ShowTableStmt node, ConnectContext context) {
+        public Void visitShowTableStatement(ShowTableStmt node, ConnectContext context) {
+            String catalogName;
+            if (node.getCatalogName() != null) {
+                catalogName = node.getCatalogName();
+            } else {
+                catalogName = context.getCurrentCatalog();
+            }
+
+            if (!GlobalStateMgr.getCurrentState().getCatalogMgr().catalogExists(catalogName)) {
+                ErrorReport.reportSemanticException(ErrorCode.ERR_BAD_CATALOG_ERROR, catalogName);
+            }
             String db = node.getDb();
             db = getDatabaseName(db, context);
             node.setDb(db);
@@ -97,21 +122,13 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowTabletStmt(ShowTabletStmt node, ConnectContext context) {
+        public Void visitShowTabletStatement(ShowTabletStmt node, ConnectContext context) {
             ShowTabletStmtAnalyzer.analyze(node, context);
             return null;
         }
 
         @Override
-        public Void visitShowVariablesStmt(ShowVariablesStmt node, ConnectContext context) {
-            if (node.getType() == null) {
-                node.setType(SetType.DEFAULT);
-            }
-            return null;
-        }
-
-        @Override
-        public Void visitShowColumnStmt(ShowColumnStmt node, ConnectContext context) {
+        public Void visitShowColumnStatement(ShowColumnStmt node, ConnectContext context) {
             node.init();
             String db = node.getTableName().getDb();
             db = getDatabaseName(db, context);
@@ -120,7 +137,7 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowTableStatusStmt(ShowTableStatusStmt node, ConnectContext context) {
+        public Void visitShowTableStatusStatement(ShowTableStatusStmt node, ConnectContext context) {
             String db = node.getDb();
             db = getDatabaseName(db, context);
             node.setDb(db);
@@ -128,15 +145,17 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowFunctions(ShowFunctionsStmt node, ConnectContext context) {
-            String dbName = node.getDbName();
-            if (Strings.isNullOrEmpty(dbName)) {
-                dbName = context.getDatabase();
+        public Void visitShowFunctionsStatement(ShowFunctionsStmt node, ConnectContext context) {
+            if (!node.getIsGlobal() && !node.getIsBuiltin()) {
+                String dbName = node.getDbName();
                 if (Strings.isNullOrEmpty(dbName)) {
-                    ErrorReport.reportSemanticException(ErrorCode.ERR_NO_DB_ERROR);
+                    dbName = context.getDatabase();
+                    if (Strings.isNullOrEmpty(dbName)) {
+                        ErrorReport.reportSemanticException(ErrorCode.ERR_NO_DB_ERROR);
+                    }
                 }
+                node.setDbName(dbName);
             }
-            node.setDbName(dbName);
 
             if (node.getExpr() != null) {
                 ErrorReport.reportSemanticException(ERR_UNSUPPORTED_SQL_PATTERN);
@@ -145,7 +164,7 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowMaterializedViewStmt(ShowMaterializedViewStmt node, ConnectContext context) {
+        public Void visitShowMaterializedViewStatement(ShowMaterializedViewsStmt node, ConnectContext context) {
             String db = node.getDb();
             db = getDatabaseName(db, context);
             node.setDb(db);
@@ -153,7 +172,7 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowCreateTableStmt(ShowCreateTableStmt node, ConnectContext context) {
+        public Void visitShowCreateTableStatement(ShowCreateTableStmt node, ConnectContext context) {
             if (node.getTbl() == null) {
                 ErrorReport.reportSemanticException(ErrorCode.ERR_NO_TABLES_USED);
             }
@@ -162,7 +181,12 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowDatabasesStmt(ShowDbStmt node, ConnectContext context) {
+        public Void visitShowWarehousesStatement(ShowWarehousesStmt node, ConnectContext context) {
+            return null;
+        }
+
+        @Override
+        public Void visitShowDatabasesStatement(ShowDbStmt node, ConnectContext context) {
             String catalogName;
             if (node.getCatalogName() != null) {
                 catalogName = node.getCatalogName();
@@ -198,13 +222,21 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowAlterStmt(ShowAlterStmt statement, ConnectContext context) {
+        public Void visitShowStreamLoadStatement(ShowStreamLoadStmt node, ConnectContext context) {
+            String dbName = node.getDbFullName();
+            dbName = getDatabaseName(dbName, context);
+            node.setDb(dbName);
+            return null;
+        }
+
+        @Override
+        public Void visitShowAlterStatement(ShowAlterStmt statement, ConnectContext context) {
             ShowAlterStmtAnalyzer.analyze(statement, context);
             return null;
         }
 
         @Override
-        public Void visitShowDeleteStmt(ShowDeleteStmt node, ConnectContext context) {
+        public Void visitShowDeleteStatement(ShowDeleteStmt node, ConnectContext context) {
             String dbName = node.getDbName();
             dbName = getDatabaseName(dbName, context);
             node.setDbName(dbName);
@@ -220,7 +252,7 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowIndexStmt(ShowIndexStmt node, ConnectContext context) {
+        public Void visitShowIndexStatement(ShowIndexStmt node, ConnectContext context) {
             node.init();
             String db = node.getTableName().getDb();
             db = getDatabaseName(db, context);
@@ -228,6 +260,12 @@ public class ShowStmtAnalyzer {
             if (Strings.isNullOrEmpty(node.getTableName().getCatalog())) {
                 node.getTableName().setCatalog(context.getCurrentCatalog());
             }
+            return null;
+        }
+
+        @Override
+        public Void visitShowTransactionStatement(ShowTransactionStmt statement, ConnectContext context) {
+            ShowTransactionStmtAnalyzer.analyze(statement, context);
             return null;
         }
 
@@ -250,7 +288,7 @@ public class ShowStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowDataStmt(ShowDataStmt node, ConnectContext context) {
+        public Void visitShowDataStatement(ShowDataStmt node, ConnectContext context) {
             String dbName = node.getDbName();
             dbName = getDatabaseName(dbName, context);
             node.setDbName(dbName);
@@ -275,19 +313,20 @@ public class ShowStmtAnalyzer {
             }
 
             if (CatalogMgr.isInternalCatalog(catalogName)) {
-                descInternalTbl(node, context);
+                descInternalCatalogTable(node, context);
             } else {
-                descExternalTbl(node, catalogName, dbName, tbl);
+                descExternalCatalogTable(node, catalogName, dbName, tbl);
             }
             return null;
         }
 
-        private void descInternalTbl(DescribeStmt node, ConnectContext context) {
+        private void descInternalCatalogTable(DescribeStmt node, ConnectContext context) {
             Database db = GlobalStateMgr.getCurrentState().getDb(node.getDb());
             if (db == null) {
                 ErrorReport.reportSemanticException(ErrorCode.ERR_BAD_DB_ERROR, node.getDb());
             }
-            db.readLock();
+            Locker locker = new Locker();
+            locker.lockDatabase(db, LockType.READ);
             try {
                 Table table = db.getTable(node.getTableName());
                 //if getTable not find table, may be is statement "desc materialized-view-name"
@@ -295,9 +334,9 @@ public class ShowStmtAnalyzer {
                     for (Table tb : db.getTables()) {
                         if (tb.getType() == Table.TableType.OLAP) {
                             OlapTable olapTable = (OlapTable) tb;
-                            for (MaterializedIndex mvIdx : olapTable.getVisibleIndex()) {
-                                if (olapTable.getIndexNameById(mvIdx.getId()).equalsIgnoreCase(node.getTableName())) {
-                                    List<Column> columns = olapTable.getIndexIdToSchema().get(mvIdx.getId());
+                            for (MaterializedIndexMeta mvMeta : olapTable.getVisibleIndexMetas()) {
+                                if (olapTable.getIndexNameById(mvMeta.getIndexId()).equalsIgnoreCase(node.getTableName())) {
+                                    List<Column> columns = olapTable.getIndexIdToSchema().get(mvMeta.getIndexId());
                                     for (Column column : columns) {
                                         // Extra string (aggregation and bloom filter)
                                         List<String> extras = Lists.newArrayList();
@@ -308,9 +347,12 @@ public class ShowStmtAnalyzer {
                                         String defaultStr = column.getMetaDefaultValue(extras);
                                         String extraStr = StringUtils.join(extras, ",");
                                         List<String> row = Arrays.asList(
-                                                column.getDisplayName(),
-                                                column.getType().canonicalName(),
-                                                column.isAllowNull() ? "Yes" : "No",
+                                                column.getName(),
+                                                // In Mysql, the Type column should lowercase, and the Null column should uppercase.
+                                                // If you do not follow this specification, it may cause the BI system,
+                                                // such as superset, to fail to recognize the column type.
+                                                column.getType().canonicalName().toLowerCase(),
+                                                column.isAllowNull() ? "YES" : "NO",
                                                 ((Boolean) column.isKey()).toString(),
                                                 defaultStr,
                                                 extraStr);
@@ -347,7 +389,7 @@ public class ShowStmtAnalyzer {
                         throw new SemanticException(String.format("Unknown proc node path: %s", procString));
                     }
                 } else {
-                    if (table.isNativeTable()) {
+                    if (table.isNativeTableOrMaterializedView()) {
                         node.setOlapTable(true);
                         OlapTable olapTable = (OlapTable) table;
                         Set<String> bfColumns = olapTable.getCopiedBfColumns();
@@ -384,9 +426,12 @@ public class ShowStmtAnalyzer {
                                 String extraStr = StringUtils.join(extras, ",");
                                 List<String> row = Arrays.asList("",
                                         "",
-                                        column.getDisplayName(),
-                                        column.getType().canonicalName(),
-                                        column.isAllowNull() ? "Yes" : "No",
+                                        column.getName(),
+                                        // In Mysql, the Type column should lowercase, and the Null column should uppercase.
+                                        // If you do not follow this specification, it may cause the BI system,
+                                        // such as superset, to fail to recognize the column type.
+                                        column.getType().canonicalName().toLowerCase(),
+                                        column.isAllowNull() ? "YES" : "NO",
                                         ((Boolean) column.isKey()).toString(),
                                         defaultStr,
                                         extraStr);
@@ -418,13 +463,14 @@ public class ShowStmtAnalyzer {
                     }
                 }
             } finally {
-                db.readUnlock();
+                locker.unLockDatabase(db, LockType.READ);
             }
         }
 
-        private void descExternalTbl(DescribeStmt node, String catalogName, String dbName, String tbl) {
+        private void descExternalCatalogTable(DescribeStmt node, String catalogName, String dbName, String tbl) {
             // show external table schema only
-            String procString = "/catalog/" + catalogName + "/" + dbName + "/" + tbl + "/" + ExternalTableProcDir.SCHEMA;
+            String procString =
+                    "/catalog/" + catalogName + "/" + dbName + "/" + tbl + "/" + ExternalTableProcDir.SCHEMA;
             try {
                 node.setNode(ProcService.getInstance().open(procString));
             } catch (AnalysisException e) {
@@ -457,13 +503,14 @@ public class ShowStmtAnalyzer {
             }
 
             BinaryPredicate binaryPredicate = (BinaryPredicate) predicate;
-            if (!(binaryPredicate.getChild(0) instanceof SlotRef && binaryPredicate.getChild(1) instanceof LiteralExpr)) {
+            if (!(binaryPredicate.getChild(0) instanceof SlotRef &&
+                    binaryPredicate.getChild(1) instanceof LiteralExpr)) {
                 throw new SemanticException("Only support column = \"string literal\" format predicate");
             }
         }
 
         @Override
-        public Void visitShowPartitionsStmt(ShowPartitionsStmt statement, ConnectContext context) {
+        public Void visitShowPartitionsStatement(ShowPartitionsStmt statement, ConnectContext context) {
             String dbName = statement.getDbName();
             dbName = getDatabaseName(dbName, context);
             statement.setDbName(dbName);
@@ -477,7 +524,8 @@ public class ShowStmtAnalyzer {
             }
             final String tableName = statement.getTableName();
             final boolean isTempPartition = statement.isTempPartition();
-            db.readLock();
+            Locker locker = new Locker();
+            locker.lockDatabase(db, LockType.READ);
             try {
                 Table table = db.getTable(tableName);
                 if (!(table instanceof OlapTable)) {
@@ -508,7 +556,7 @@ public class ShowStmtAnalyzer {
                         analyzeOrderBy(statement.getOrderByElements(), statement.getNode());
                 statement.setOrderByPairs(orderByPairs);
             } finally {
-                db.readUnlock();
+                locker.unLockDatabase(db, LockType.READ);
             }
             return null;
         }
@@ -555,7 +603,7 @@ public class ShowStmtAnalyzer {
 
         private void binaryPredicateHandler(Expr subExpr, String leftKey, boolean filter) {
             BinaryPredicate binaryPredicate = (BinaryPredicate) subExpr;
-            if (filter && binaryPredicate.getOp() != BinaryPredicate.Operator.EQ) {
+            if (filter && binaryPredicate.getOp() != BinaryType.EQ) {
                 throw new SemanticException(String.format("Only operator =|like are supported for %s", leftKey));
             }
             if (leftKey.equalsIgnoreCase(ShowPartitionsStmt.FILTER_LAST_CONSISTENCY_CHECK_TIME)) {
@@ -595,33 +643,24 @@ public class ShowStmtAnalyzer {
             return orderByPairs;
         }
 
-        public Void visitShowLoadStmt(ShowLoadStmt statement, ConnectContext context) {
+        public Void visitShowLoadStatement(ShowLoadStmt statement, ConnectContext context) {
             ShowLoadStmtAnalyzer.analyze(statement, context);
             return null;
         }
 
         @Override
-        public Void visitShowLoadWarningsStmt(ShowLoadWarningsStmt statement, ConnectContext context) {
+        public Void visitShowLoadWarningsStatement(ShowLoadWarningsStmt statement, ConnectContext context) {
             ShowLoadWarningsStmtAnalyzer.analyze(statement, context);
             return null;
         }
 
         @Override
-        public Void visitShowAuthenticationStatement(ShowAuthenticationStmt statement, ConnectContext context) {
-            UserIdentity user = statement.getUserIdent();
-            if (user != null) {
-                try {
-                    user.analyze();
-                } catch (AnalysisException e) {
-                    SemanticException exception = new SemanticException("failed to show authentication for " + user.toString());
-                    exception.initCause(e);
-                    throw exception;
-                }
-            } else if (!statement.isAll()) {
-                statement.setUserIdent(context.getCurrentUserIdentity());
+        public Void visitShowCreateExternalCatalogStatement(ShowCreateExternalCatalogStmt node, ConnectContext context) {
+            String catalogName = node.getCatalogName();
+            if (!GlobalStateMgr.getCurrentState().getCatalogMgr().catalogExists(catalogName)) {
+                ErrorReport.reportSemanticException(ErrorCode.ERR_BAD_CATALOG_ERROR, catalogName);
             }
             return null;
         }
-
     }
 }

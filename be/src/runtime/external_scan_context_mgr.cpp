@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/external_scan_context_mgr.cpp
 
@@ -26,6 +39,7 @@
 #include <memory>
 #include <vector>
 
+#include "exec/pipeline/query_context.h"
 #include "runtime/fragment_mgr.h"
 #include "runtime/result_queue_mgr.h"
 #include "util/starrocks_metrics.h"
@@ -93,17 +107,25 @@ Status ExternalScanContextMgr::clear_scan_context(const std::string& context_id)
             context = iter->second;
             if (context == nullptr) {
                 _active_contexts.erase(context_id);
-                Status::OK();
+                return Status::OK();
             }
             iter = _active_contexts.erase(iter);
         }
     }
     if (context != nullptr) {
-        // first cancel the fragment instance, just ignore return status
-        _exec_env->fragment_mgr()->cancel(context->fragment_instance_id);
+        // cancel pipeline
+        const auto& fragment_instance_id = context->fragment_instance_id;
+        if (auto query_ctx = _exec_env->query_context_mgr()->get(context->query_id); query_ctx != nullptr) {
+            if (auto fragment_ctx = query_ctx->fragment_mgr()->get(fragment_instance_id); fragment_ctx != nullptr) {
+                std::stringstream msg;
+                msg << "FragmentContext(id=" << print_id(fragment_instance_id) << ") cancelled by close_scanner";
+                fragment_ctx->cancel(Status::Cancelled(msg.str()));
+            }
+        }
+        LOG(INFO) << "close scan context: context id [ " << context_id << " ], fragment instance id [ "
+                  << print_id(fragment_instance_id) << " ]";
         // clear the fragment instance's related result queue
-        _exec_env->result_queue_mgr()->cancel(context->fragment_instance_id);
-        LOG(INFO) << "close scan context: context id [ " << context_id << " ]";
+        RETURN_IF_ERROR(_exec_env->result_queue_mgr()->cancel(fragment_instance_id));
     }
     return Status::OK();
 }
@@ -144,8 +166,12 @@ void ExternalScanContextMgr::gc_expired_context() {
         }
         for (const auto& expired_context : expired_contexts) {
             // must cancel the fragment instance, otherwise return thrift transport TTransportException
-            _exec_env->fragment_mgr()->cancel(expired_context->fragment_instance_id);
-            _exec_env->result_queue_mgr()->cancel(expired_context->fragment_instance_id);
+            WARN_IF_ERROR(
+                    _exec_env->fragment_mgr()->cancel(expired_context->fragment_instance_id),
+                    strings::Substitute("Fail to cancel fragment $0", print_id(expired_context->fragment_instance_id)));
+            WARN_IF_ERROR(_exec_env->result_queue_mgr()->cancel(expired_context->fragment_instance_id),
+                          strings::Substitute("Fail to cancel fragment $0 in result queue mgr",
+                                              print_id(expired_context->fragment_instance_id)));
         }
     }
 #endif

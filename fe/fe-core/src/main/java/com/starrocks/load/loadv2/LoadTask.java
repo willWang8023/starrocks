@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/loadv2/LoadTask.java
 
@@ -27,11 +40,11 @@ import com.starrocks.common.util.LogBuilder;
 import com.starrocks.common.util.LogKey;
 import com.starrocks.load.FailMsg;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.task.LeaderTask;
+import com.starrocks.task.PriorityLeaderTask;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
-public abstract class LoadTask extends LeaderTask {
+public abstract class LoadTask extends PriorityLeaderTask {
     public enum TaskType {
         PENDING,
         LOADING
@@ -43,9 +56,9 @@ public abstract class LoadTask extends LeaderTask {
     protected LoadTaskCallback callback;
     protected TaskAttachment attachment;
     protected FailMsg failMsg = new FailMsg();
-    protected int retryTime = 1;
 
-    public LoadTask(LoadTaskCallback callback, TaskType taskType) {
+    public LoadTask(LoadTaskCallback callback, TaskType taskType, int priority) {
+        super(priority);
         this.taskType = taskType;
         this.signature = GlobalStateMgr.getCurrentState().getNextId();
         this.callback = callback;
@@ -90,16 +103,6 @@ public abstract class LoadTask extends LeaderTask {
      * @throws UserException task is failed
      */
     abstract void executeTask() throws Exception;
-
-    public int getRetryTime() {
-        return retryTime;
-    }
-
-    // Derived class may need to override this.
-    public void updateRetryInfo() {
-        this.retryTime--;
-        this.signature = GlobalStateMgr.getCurrentState().getNextId();
-    }
 
     public TaskType getTaskType() {
         return taskType;

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/rowset.h
 
@@ -24,6 +37,7 @@
 #include <atomic>
 #include <memory>
 #include <mutex>
+#include <utility>
 #include <vector>
 
 #include "common/statusor.h"
@@ -48,11 +62,9 @@ class RowsetReadOptions;
 class TabletSchema;
 class KVStore;
 
-namespace vectorized {
 class Schema;
 class ChunkIterator;
 using ChunkIteratorPtr = std::shared_ptr<ChunkIterator>;
-} // namespace vectorized
 
 // the rowset state transfer graph:
 //    ROWSET_UNLOADED    <--|
@@ -121,13 +133,13 @@ private:
 
 class Rowset : public std::enable_shared_from_this<Rowset> {
 public:
-    Rowset(const TabletSchema* schema, std::string rowset_path, RowsetMetaSharedPtr rowset_meta);
+    Rowset(const TabletSchemaCSPtr&, std::string rowset_path, RowsetMetaSharedPtr rowset_meta);
     Rowset(const Rowset&) = delete;
     const Rowset& operator=(const Rowset&) = delete;
 
     virtual ~Rowset();
 
-    static std::shared_ptr<Rowset> create(const TabletSchema* schema, std::string rowset_path,
+    static std::shared_ptr<Rowset> create(const TabletSchemaCSPtr& schema, std::string rowset_path,
                                           RowsetMetaSharedPtr rowset_meta) {
         return std::make_shared<Rowset>(schema, std::move(rowset_path), std::move(rowset_meta));
     }
@@ -140,18 +152,21 @@ public:
 
     // reload this rowset after the underlying segment file is changed
     Status reload();
+    Status reload_segment(int32_t segment_id);
+    Status reload_segment_with_schema(int32_t segment_id, TabletSchemaCSPtr& schema);
+    int64_t total_segment_data_size();
 
-    const TabletSchema& schema() const { return *_schema; }
-    void set_schema(const TabletSchema* schema) { _schema = schema; }
+    const TabletSchema& schema_ref() const { return *_schema; }
+    const TabletSchemaCSPtr& schema() const { return _schema; }
+    void set_schema(const TabletSchemaCSPtr& schema) { _schema = schema; }
 
-    StatusOr<vectorized::ChunkIteratorPtr> new_iterator(const vectorized::Schema& schema,
-                                                        const RowsetReadOptions& options);
+    StatusOr<ChunkIteratorPtr> new_iterator(const Schema& schema, const RowsetReadOptions& options);
 
     // For each segment in this rowset, create a `ChunkIterator` for it and *APPEND* it into
     // |segment_iterators|. If segments in this rowset has no overlapping, a single `UnionIterator`,
     // instead of multiple `ChunkIterator`s, will be created and appended into |segment_iterators|.
-    Status get_segment_iterators(const vectorized::Schema& schema, const RowsetReadOptions& options,
-                                 std::vector<vectorized::ChunkIteratorPtr>* seg_iterators);
+    Status get_segment_iterators(const Schema& schema, const RowsetReadOptions& options,
+                                 std::vector<ChunkIteratorPtr>* seg_iterators);
 
     // estimate the number of compaction segment iterator
     StatusOr<int64_t> estimate_compaction_segment_iterator_num();
@@ -169,9 +184,30 @@ public:
     // return iterator list, an iterator for each segment,
     // if the segment is empty, put an empty pointer in list
     // caller is also responsible to call rowset's acquire/release
-    StatusOr<std::vector<vectorized::ChunkIteratorPtr>> get_segment_iterators2(const vectorized::Schema& schema,
-                                                                               KVStore* meta, int64_t version,
-                                                                               OlapReaderStatistics* stats);
+    StatusOr<std::vector<ChunkIteratorPtr>> get_segment_iterators2(const Schema& schema,
+                                                                   const TabletSchemaCSPtr& tablet_schema,
+                                                                   KVStore* meta, int64_t version,
+                                                                   OlapReaderStatistics* stats,
+                                                                   KVStore* dcg_meta = nullptr, size_t chunk_size = 0);
+
+    // only used for updatable tablets' rowset in column mode partial update
+    // simply get iterators to iterate all rows without complex options like predicates
+    // |schema| read schema
+    // |stats| used for iterator read stats
+    // return iterator list, an iterator for each segment,
+    // if the segment is empty, put an empty pointer in list
+    // caller is also responsible to call rowset's acquire/release
+    StatusOr<std::vector<ChunkIteratorPtr>> get_update_file_iterators(const Schema& schema,
+                                                                      OlapReaderStatistics* stats);
+
+    // only used for updatable tablets' rowset in column mode partial update
+    // get iterator by update file's id, and it iterate all rows without complex options like predicates
+    // |schema| read schema
+    // |update_file_id| the index of update file which we want to get iterator from
+    // |stats| used for iterator read stats
+    // if the segment is empty, return empty iterator
+    StatusOr<ChunkIteratorPtr> get_update_file_iterator(const Schema& schema, uint32_t update_file_id,
+                                                        OlapReaderStatistics* stats);
 
     // publish rowset to make it visible to read
     void make_visible(Version version);
@@ -180,6 +216,9 @@ public:
     // NOTE: only used for updatable tablet's rowset
     void make_commit(int64_t version, uint32_t rowset_seg_id);
 
+    // Used in commit compaction, record `max_compact_input_rowset_id` for pk recover
+    void make_commit(int64_t version, uint32_t rowset_seg_id, uint32_t max_compact_input_rowset_id);
+
     // helper class to access RowsetMeta
     int64_t start_version() const { return rowset_meta()->version().first; }
     int64_t end_version() const { return rowset_meta()->version().second; }
@@ -187,19 +226,29 @@ public:
     bool empty() const { return rowset_meta()->empty(); }
     size_t num_rows() const { return rowset_meta()->num_rows(); }
     size_t total_row_size() const { return rowset_meta()->total_row_size(); }
+    size_t total_update_row_size() const { return rowset_meta()->total_update_row_size(); }
     Version version() const { return rowset_meta()->version(); }
     RowsetId rowset_id() const { return rowset_meta()->rowset_id(); }
+    std::string rowset_id_str() const { return rowset_meta()->rowset_id().to_string(); }
     int64_t creation_time() const { return rowset_meta()->creation_time(); }
     PUniqueId load_id() const { return rowset_meta()->load_id(); }
     int64_t txn_id() const { return rowset_meta()->txn_id(); }
     int64_t partition_id() const { return rowset_meta()->partition_id(); }
     int64_t num_segments() const { return rowset_meta()->num_segments(); }
     uint32_t num_delete_files() const { return rowset_meta()->get_num_delete_files(); }
-    bool has_data_files() const { return num_segments() > 0 || num_delete_files() > 0; }
+    uint32_t num_update_files() const { return rowset_meta()->get_num_update_files(); }
+    bool has_data_files() const { return num_segments() > 0 || num_delete_files() > 0 || num_update_files() > 0; }
+    KeysType keys_type() const { return _keys_type; }
+
+    const TabletSchemaCSPtr tablet_schema() { return rowset_meta()->tablet_schema(); }
 
     // remove all files in this rowset
     // TODO should we rename the method to remove_files() to be more specific?
     Status remove();
+
+    Status remove_delta_column_group(KVStore* kvstore);
+
+    Status remove_delta_column_group();
 
     // close to clear the resource owned by rowset
     // including: open files, indexes and so on
@@ -232,15 +281,18 @@ public:
     }
 
     // hard link all files in this rowset to `dir` to form a new rowset with id `new_rowset_id`.
-    Status link_files_to(const std::string& dir, RowsetId new_rowset_id);
+    // `version` is used for link col files, default using INT64_MAX means link all col files
+    Status link_files_to(KVStore* kvstore, const std::string& dir, RowsetId new_rowset_id, int64_t version = INT64_MAX);
 
     // copy all files to `dir`
-    Status copy_files_to(const std::string& dir);
+    Status copy_files_to(KVStore* kvstore, const std::string& dir);
 
     static std::string segment_file_path(const std::string& segment_dir, const RowsetId& rowset_id, int segment_id);
     static std::string segment_temp_file_path(const std::string& dir, const RowsetId& rowset_id, int segment_id);
     static std::string segment_del_file_path(const std::string& segment_dir, const RowsetId& rowset_id, int segment_id);
-
+    static std::string segment_upt_file_path(const std::string& segment_dir, const RowsetId& rowset_id, int segment_id);
+    static std::string delta_column_group_path(const std::string& dir, const RowsetId& rowset_id, int segment_id,
+                                               int64_t version, int idx);
     // return an unique identifier string for this rowset
     std::string unique_id() const { return _rowset_path + "/" + rowset_id().to_string(); }
 
@@ -251,6 +303,10 @@ public:
     void set_need_delete_file() { _need_delete_file = true; }
 
     bool contains_version(Version version) const { return rowset_meta()->version().contains(version); }
+
+    void set_is_compacting(bool flag) { is_compacting.store(flag); }
+
+    bool get_is_compacting() { return is_compacting.load(); }
 
     static bool comparator(const RowsetSharedPtr& left, const RowsetSharedPtr& right) {
         return left->end_version() < right->end_version();
@@ -269,7 +325,9 @@ public:
                 if (_refs_by_reader == 0 && _rowset_state_machine.rowset_state() == ROWSET_UNLOADING) {
                     // first do close, then change state
                     do_close();
-                    _rowset_state_machine.on_release();
+                    WARN_IF_ERROR(_rowset_state_machine.on_release(),
+                                  strings::Substitute("rowset state on_release error, $0",
+                                                      _rowset_state_machine.rowset_state()));
                 }
             }
             if (_rowset_state_machine.rowset_state() == ROWSET_UNLOADED) {
@@ -280,10 +338,12 @@ public:
         }
     }
 
+    uint64_t refs_by_reader() { return _refs_by_reader; }
+
     static StatusOr<size_t> get_segment_num(const std::vector<RowsetSharedPtr>& rowsets) {
         size_t num_segments = 0;
-        for (int i = 0; i < rowsets.size(); i++) {
-            auto iterator_num_res = rowsets[i]->estimate_compaction_segment_iterator_num();
+        for (const auto& rowset : rowsets) {
+            auto iterator_num_res = rowset->estimate_compaction_segment_iterator_num();
             if (!iterator_num_res.ok()) {
                 return iterator_num_res.status();
             }
@@ -304,6 +364,13 @@ public:
         std::for_each(rowsets.begin(), rowsets.end(), [](const RowsetSharedPtr& rowset) { rowset->close(); });
     }
 
+    bool is_column_mode_partial_update() const { return _rowset_meta->is_column_mode_partial_update(); }
+
+    // only used in unit test
+    Status get_segment_sk_index(std::vector<std::string>* sk_index_values);
+
+    Status verify();
+
 protected:
     friend class RowsetFactory;
 
@@ -319,7 +386,7 @@ protected:
     // allow subclass to add custom logic when rowset is being published
     virtual void make_visible_extra(Version version) {}
 
-    const TabletSchema* _schema;
+    TabletSchemaCSPtr _schema;
     std::string _rowset_path;
     RowsetMetaSharedPtr _rowset_meta;
 
@@ -333,7 +400,17 @@ protected:
 private:
     int64_t _mem_usage() const { return sizeof(Rowset) + _rowset_path.length(); }
 
+    Status _remove_delta_column_group_files(const std::shared_ptr<FileSystem>& fs, KVStore* kvstore);
+
+    Status _link_delta_column_group_files(KVStore* kvstore, const std::string& dir, int64_t version);
+
+    Status _copy_delta_column_group_files(KVStore* kvstore, const std::string& dir, int64_t version);
+
     std::vector<SegmentSharedPtr> _segments;
+
+    std::atomic<bool> is_compacting{false};
+
+    KeysType _keys_type;
 };
 
 class RowsetReleaseGuard {
@@ -344,5 +421,6 @@ public:
 private:
     std::shared_ptr<Rowset> _rowset;
 };
+using TabletSchemaSPtr = std::shared_ptr<TabletSchema>;
 
 } // namespace starrocks

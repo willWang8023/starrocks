@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/page_cache.h
 
@@ -36,8 +49,8 @@ namespace starrocks {
 class PageCacheHandle;
 class MemTracker;
 
-// Page cache min size is 512MB
-static constexpr int64_t kcacheMinSize = 536870912;
+// Page cache min size is 256MB
+static constexpr int64_t kcacheMinSize = 268435456;
 
 // Warpper around Cache, and used for cache page of column datas
 // in Segment.
@@ -93,6 +106,18 @@ public:
 
     size_t memory_usage() const { return _cache->get_memory_usage(); }
 
+    void set_capacity(size_t capacity);
+
+    size_t get_capacity();
+
+    uint64_t get_lookup_count();
+
+    uint64_t get_hit_count();
+
+    bool adjust_capacity(int64_t delta, size_t min_capacity = 0);
+
+    void prune();
+
 private:
     static StoragePageCache* _s_instance;
 
@@ -111,7 +136,7 @@ public:
         if (_handle != nullptr) {
 #ifndef BE_TEST
             MemTracker* prev_tracker =
-                    tls_thread_status.set_mem_tracker(ExecEnv::GetInstance()->page_cache_mem_tracker());
+                    tls_thread_status.set_mem_tracker(GlobalEnv::GetInstance()->page_cache_mem_tracker());
             DeferOp op([&] { tls_thread_status.set_mem_tracker(prev_tracker); });
 #endif
             _cache->release(_handle);

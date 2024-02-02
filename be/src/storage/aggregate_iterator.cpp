@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/aggregate_iterator.h"
 
@@ -11,7 +23,7 @@
 #include "storage/chunk_helper.h"
 #include "util/defer_op.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 /**
  * Pre-Aggregate Iterator
@@ -24,7 +36,7 @@ public:
             : ChunkIterator(child->schema(), child->chunk_size()),
               _child(std::move(child)),
               _pre_aggregate_factor(factor),
-              _fetch_finish(false),
+
               _is_vertical_merge(is_vertical_merge),
               _is_key(is_key) {
         CHECK_LT(_schema.num_key_fields(), std::numeric_limits<uint16_t>::max());
@@ -33,9 +45,6 @@ public:
         // ensure that the key fields are the first |num_key_fields| and sorted by id.
         for (size_t i = 0; i < _schema.num_key_fields(); i++) {
             CHECK(_schema.field(i)->is_key());
-        }
-        for (size_t i = 0; i + 1 < _schema.num_key_fields(); i++) {
-            CHECK_LT(_schema.field(i)->id(), _schema.field(i + 1)->id());
         }
 #endif
     }
@@ -49,7 +58,7 @@ public:
 
     size_t merged_rows() const override { return _aggregator->merged_rows(); }
 
-    Status init_encoded_schema(ColumnIdToGlobalDictMap& dict_maps) override {
+    [[nodiscard]] Status init_encoded_schema(ColumnIdToGlobalDictMap& dict_maps) override {
         RETURN_IF_ERROR(ChunkIterator::init_encoded_schema(dict_maps));
         RETURN_IF_ERROR(_child->init_encoded_schema(dict_maps));
         _curr_chunk = ChunkHelper::new_chunk(encoded_schema(), _chunk_size);
@@ -58,8 +67,8 @@ public:
         return Status::OK();
     }
 
-    Status init_output_schema(const std::unordered_set<uint32_t>& unused_output_column_ids) override {
-        ChunkIterator::init_output_schema(unused_output_column_ids);
+    [[nodiscard]] Status init_output_schema(const std::unordered_set<uint32_t>& unused_output_column_ids) override {
+        RETURN_IF_ERROR(ChunkIterator::init_output_schema(unused_output_column_ids));
         RETURN_IF_ERROR(_child->init_output_schema(unused_output_column_ids));
         _curr_chunk = ChunkHelper::new_chunk(output_schema(), _chunk_size);
         _aggregator = std::make_unique<ChunkAggregator>(&output_schema(), _chunk_size, _pre_aggregate_factor / 100,
@@ -85,7 +94,7 @@ private:
 
     std::unique_ptr<ChunkAggregator> _aggregator;
 
-    bool _fetch_finish;
+    bool _fetch_finish{false};
 
     bool _is_vertical_merge;
     bool _is_key;
@@ -163,4 +172,4 @@ ChunkIteratorPtr new_aggregate_iterator(ChunkIteratorPtr child, bool is_key) {
     return std::make_shared<AggregateIterator>(std::move(child), 0, true, is_key);
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

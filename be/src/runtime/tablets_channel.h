@@ -1,7 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
+#include <atomic>
 #include <sstream>
 #include <string>
 
@@ -26,6 +39,7 @@ namespace starrocks {
 class LoadChannel;
 class OlapTableSchemaParam;
 class PTabletWriterOpenRequest;
+class PTabletWriterOpenResult;
 class PTabletWriterAddBatchResult;
 class PTabletWriterAddChunkRequest;
 class PTabletWriterAddSegmentRequest;
@@ -36,13 +50,29 @@ public:
     TabletsChannel() = default;
     virtual ~TabletsChannel() = default;
 
-    [[nodiscard]] virtual Status open(const PTabletWriterOpenRequest& params,
-                                      std::shared_ptr<OlapTableSchemaParam> schema) = 0;
+    [[nodiscard]] virtual Status open(const PTabletWriterOpenRequest& params, PTabletWriterOpenResult* result,
+                                      std::shared_ptr<OlapTableSchemaParam> schema, bool is_incremental) = 0;
 
-    virtual void add_chunk(vectorized::Chunk* chunk, const PTabletWriterAddChunkRequest& request,
+    virtual Status incremental_open(const PTabletWriterOpenRequest& params, PTabletWriterOpenResult* result,
+                                    std::shared_ptr<OlapTableSchemaParam> schema) = 0;
+
+    virtual void add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequest& request,
                            PTabletWriterAddBatchResult* response) = 0;
 
     virtual void cancel() = 0;
+
+    virtual void abort() = 0;
+
+    virtual void abort(const std::vector<int64_t>& tablet_ids, const std::string& reason) = 0;
+
+    // timeout: in microseconds
+    virtual bool drain_senders(int64_t timeout, const std::string& log_msg);
+
+protected:
+    // counter of remaining senders
+    std::atomic<int> _num_remaining_senders = 0;
+
+    std::unordered_map<int64_t, std::atomic<int>> _tablet_id_to_num_remaining_senders;
 };
 
 struct TabletsChannelKey {

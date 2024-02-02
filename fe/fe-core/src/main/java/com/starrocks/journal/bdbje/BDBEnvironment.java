@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/journal/bdbje/BDBEnvironment.java
 
@@ -52,6 +65,7 @@ import com.starrocks.ha.FrontendNodeType;
 import com.starrocks.ha.HAProtocol;
 import com.starrocks.journal.JournalException;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.system.Frontend;
 import org.apache.commons.lang.StringUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -61,11 +75,11 @@ import java.io.IOException;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.Collections;
-import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
 import java.util.concurrent.TimeUnit;
 import java.util.logging.Level;
+import java.util.stream.Collectors;
 
 /* this class contains the reference to bdb environment.
  * including all the opened databases and the replicationGroupAdmin.
@@ -77,7 +91,7 @@ public class BDBEnvironment {
     protected static int SLEEP_INTERVAL_SEC = 5;
     private static final int MEMORY_CACHE_PERCENT = 20;
     // wait at most 10 seconds after environment initialized for state change
-    private static final int INITAL_STATE_CHANGE_WAIT_SEC = 10;
+    private static final int INITIAL_STATE_CHANGE_WAIT_SEC = 10;
 
     public static final String STARROCKS_JOURNAL_GROUP = "PALO_JOURNAL_GROUP";
     private static final String BDB_DIR = "/bdb";
@@ -88,7 +102,6 @@ public class BDBEnvironment {
     private DatabaseConfig dbConfig;
     private TransactionConfig txnConfig;
     private CloseSafeDatabase epochDB = null;  // used for fencing
-    private ReplicationGroupAdmin replicationGroupAdmin = null;
 
     // mark whether environment is closing, if true, all calling to environment will fail
     private volatile boolean closing = false;
@@ -101,13 +114,10 @@ public class BDBEnvironment {
 
     /**
      * init & return bdb environment
-     * @param nodeName
-     * @return
-     * @throws JournalException
      */
     public static BDBEnvironment initBDBEnvironment(String nodeName) throws JournalException, InterruptedException {
         // check for port use
-        Pair<String, Integer> selfNode = GlobalStateMgr.getCurrentState().getSelfNode();
+        Pair<String, Integer> selfNode = GlobalStateMgr.getCurrentState().getNodeMgr().getSelfNode();
         try {
             if (NetUtils.isPortUsing(selfNode.first, selfNode.second)) {
                 String errMsg = String.format("edit_log_port %d is already in use. will exit.", selfNode.second);
@@ -130,7 +140,7 @@ public class BDBEnvironment {
             dbEnv.mkdirs();
         }
 
-        Pair<String, Integer> helperNode = GlobalStateMgr.getCurrentState().getHelperNode();
+        Pair<String, Integer> helperNode = GlobalStateMgr.getCurrentState().getNodeMgr().getHelperNode();
         String helperHostPort = helperNode.first + ":" + helperNode.second;
 
         BDBEnvironment bdbEnvironment = new BDBEnvironment(dbEnv, nodeName, selfNodeHostPort,
@@ -164,7 +174,7 @@ public class BDBEnvironment {
 
     protected void initConfigs(boolean isElectable) throws JournalException {
         // Almost never used, just in case the master can not restart
-        if (Config.metadata_failure_recovery.equals("true")) {
+        if (Config.bdbje_reset_election_group.equals("true")) {
             if (!isElectable) {
                 String errMsg = "Current node is not in the electable_nodes list. will exit";
                 LOG.error(errMsg);
@@ -189,7 +199,7 @@ public class BDBEnvironment {
         replicationConfig
                 .setConfigParam(ReplicationConfig.REPLICA_TIMEOUT, Config.bdbje_heartbeat_timeout_second + " s");
         replicationConfig
-                .setConfigParam(ReplicationConfig.FEEDER_TIMEOUT, Config.bdbje_heartbeat_timeout_second + " s");
+                .setConfigParam(ReplicationConfig.FEEDER_TIMEOUT, (10 + Config.bdbje_heartbeat_timeout_second) + " s");
         replicationConfig
                 .setConfigParam(ReplicationConfig.REPLAY_COST_PERCENT,
                         String.valueOf(Config.bdbje_replay_cost_percent));
@@ -215,6 +225,8 @@ public class BDBEnvironment {
         environmentConfig.setConfigParam(EnvironmentConfig.FILE_LOGGING_LEVEL, Config.bdbje_log_level);
         environmentConfig.setConfigParam(EnvironmentConfig.CLEANER_THREADS,
                 String.valueOf(Config.bdbje_cleaner_threads));
+        environmentConfig.setConfigParam(EnvironmentConfig.RESERVED_DISK,
+                String.valueOf(Config.bdbje_reserved_disk_size));
 
         if (isElectable) {
             Durability durability = new Durability(getSyncPolicy(Config.master_sync_policy),
@@ -248,30 +260,11 @@ public class BDBEnvironment {
         JournalException exception = null;
         for (int i = 0; i < RETRY_TIME; i++) {
             if (i > 0) {
-                Thread.sleep(SLEEP_INTERVAL_SEC * 1000);
+                Thread.sleep(SLEEP_INTERVAL_SEC * 1000L);
             }
             try {
                 LOG.info("start to setup bdb environment for {} times", i + 1);
                 replicatedEnvironment = new ReplicatedEnvironment(envHome, replicationConfig, environmentConfig);
-
-                // get replicationGroupAdmin object.
-                Set<InetSocketAddress> adminNodes = new HashSet<InetSocketAddress>();
-                // 1. add helper node
-                HostAndPort helperAddress = HostAndPort.fromString(helperHostPort);
-                InetSocketAddress helper = new InetSocketAddress(helperAddress.getHost(),
-                        helperAddress.getPort());
-                adminNodes.add(helper);
-                LOG.info("add helper[{}] as ReplicationGroupAdmin", helperHostPort);
-                // 2. add self if is electable
-                if (!selfNodeHostPort.equals(helperHostPort) && isElectable) {
-                    HostAndPort selfNodeAddress = HostAndPort.fromString(selfNodeHostPort);
-                    InetSocketAddress self = new InetSocketAddress(selfNodeAddress.getHost(),
-                            selfNodeAddress.getPort());
-                    adminNodes.add(self);
-                    LOG.info("add self[{}] as ReplicationGroupAdmin", selfNodeHostPort);
-                }
-
-                replicationGroupAdmin = new ReplicationGroupAdmin(STARROCKS_JOURNAL_GROUP, adminNodes);
 
                 // get a BDBHA object and pass the reference to GlobalStateMgr
                 HAProtocol protocol = new BDBHA(this, selfNodeName);
@@ -283,7 +276,7 @@ public class BDBEnvironment {
 
                 LOG.info("replicated environment is all set, wait for state change...");
                 // wait for master change, otherwise a ReplicaWriteException exception will be thrown
-                for (int j = 0; j < INITAL_STATE_CHANGE_WAIT_SEC; j++) {
+                for (int j = 0; j < INITIAL_STATE_CHANGE_WAIT_SEC; j++) {
                     if (FrontendNodeType.UNKNOWN != listener.getNewType()) {
                         break;
                     }
@@ -302,7 +295,7 @@ public class BDBEnvironment {
                     // environment with information about this node, if it's a new node and is joining the group for
                     // the first time.
                     LOG.warn(
-                            "failed to setup environment because of UnknowMasterException for the first time, ignore it.");
+                            "failed to setup environment because of UnknownMasterException for the first time, ignore it.");
                     continue;
                 }
                 String errMsg = String.format("failed to setup environment after retried %d times", i + 1);
@@ -330,7 +323,6 @@ public class BDBEnvironment {
      *    --> The new follower will run as a master in a standalone environment.
      * 2. User restarts this follower with a helper.
      *    --> Sometimes this new follower will join the group successfully, making master crash.
-     *
      * This method only init the replicated environment through a handshake.
      * It will not read or write any data.
      */
@@ -346,7 +338,7 @@ public class BDBEnvironment {
         }
 
         // Almost never used, just in case the master can not restart
-        if (Config.metadata_failure_recovery.equals("true")) {
+        if (Config.bdbje_reset_election_group.equals("true")) {
             LOG.info("skip check local environment because metadata_failure_recovery = true");
             return;
         }
@@ -361,7 +353,7 @@ public class BDBEnvironment {
         JournalException exception = null;
         for (int i = 0; i < RETRY_TIME; i++) {
             if (i > 0) {
-                Thread.sleep(SLEEP_INTERVAL_SEC * 1000);
+                Thread.sleep(SLEEP_INTERVAL_SEC * 1000L);
             }
 
             try {
@@ -421,11 +413,13 @@ public class BDBEnvironment {
     }
 
     public ReplicationGroupAdmin getReplicationGroupAdmin() {
-        return this.replicationGroupAdmin;
-    }
-
-    public void setNewReplicationGroupAdmin(Set<InetSocketAddress> newHelperNodes) {
-        this.replicationGroupAdmin = new ReplicationGroupAdmin(STARROCKS_JOURNAL_GROUP, newHelperNodes);
+        Set<InetSocketAddress> addrs = GlobalStateMgr.getCurrentState().getNodeMgr()
+                .getFrontends(FrontendNodeType.FOLLOWER)
+                .stream()
+                .filter(Frontend::isAlive)
+                .map(fe -> new InetSocketAddress(fe.getHost(), fe.getEditLogPort()))
+                .collect(Collectors.toSet());
+        return new ReplicationGroupAdmin(STARROCKS_JOURNAL_GROUP, addrs);
     }
 
     // Return a handle to the epochDB
@@ -458,7 +452,7 @@ public class BDBEnvironment {
         try {
             // the first parameter null means auto-commit
             replicatedEnvironment.removeDatabase(null, dbName);
-            LOG.info("remove database {} from replicatedEnviroment successfully", dbName);
+            LOG.info("remove database {} from replicatedEnvironment successfully", dbName);
         } catch (DatabaseNotFoundException e) {
             LOG.warn("Exception: {} does not exist", dbName, e);
         }
@@ -476,7 +470,7 @@ public class BDBEnvironment {
             return null;
         }
 
-        List<Long> ret = new ArrayList<Long>();
+        List<Long> ret = new ArrayList<>();
         List<String> names = replicatedEnvironment.getDatabaseNames();
         for (String name : names) {
             // We don't count epochDB

@@ -1,39 +1,59 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
 #include "column/type_traits.h"
 #include "exprs/agg/aggregate.h"
 #include "exprs/agg/sum.h"
-#include "exprs/vectorized/arithmetic_operation.h"
+#include "exprs/arithmetic_operation.h"
+#include "exprs/function_context.h"
 #include "gutil/casts.h"
+#include "types/logical_type.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-// AvgResultPT for final result
-template <PrimitiveType PT, typename = guard::Guard>
-inline constexpr PrimitiveType AvgResultPT = PT;
+// AvgResultLT for final result
+template <LogicalType LT, typename = guard::Guard>
+struct AvgResultTrait {
+    static const LogicalType value = LT;
+};
+template <LogicalType LT>
+struct AvgResultTrait<LT, ArithmeticLTGuard<LT>> {
+    static const LogicalType value = TYPE_DOUBLE;
+};
+template <LogicalType LT>
+struct AvgResultTrait<LT, DecimalLTGuard<LT>> {
+    static const LogicalType value = TYPE_DECIMAL128;
+};
 
-template <PrimitiveType PT>
-inline constexpr PrimitiveType AvgResultPT<PT, ArithmeticPTGuard<PT>> = TYPE_DOUBLE;
+template <LogicalType LT>
+inline constexpr LogicalType AvgResultLT = AvgResultTrait<LT>::value;
 
-// final result of avg on decimal32/64/128 is DECIMAL128
-template <PrimitiveType PT>
-inline constexpr PrimitiveType AvgResultPT<PT, DecimalPTGuard<PT>> = TYPE_DECIMAL128;
+// ImmediateAvgResultLT for immediate accumulated result
+template <LogicalType LT, typename = guard::Guard>
+inline constexpr LogicalType ImmediateAvgResultLT = LT;
 
-// ImmediateAvgResultPT for immediate accumulated result
-template <PrimitiveType PT, typename = guard::Guard>
-inline constexpr PrimitiveType ImmediateAvgResultPT = PT;
+template <LogicalType LT>
+inline constexpr LogicalType ImmediateAvgResultLT<LT, AvgDoubleLTGuard<LT>> = TYPE_DOUBLE;
 
-template <PrimitiveType PT>
-inline constexpr PrimitiveType ImmediateAvgResultPT<PT, AvgDoublePTGuard<PT>> = TYPE_DOUBLE;
-
-template <PrimitiveType PT>
-inline constexpr PrimitiveType ImmediateAvgResultPT<PT, AvgDecimal64PTGuard<PT>> = TYPE_DECIMAL64;
+template <LogicalType LT>
+inline constexpr LogicalType ImmediateAvgResultLT<LT, AvgDecimal64LTGuard<LT>> = TYPE_DECIMAL64;
 
 // Only for compile
-template <PrimitiveType PT>
-inline constexpr PrimitiveType ImmediateAvgResultPT<PT, BinaryPTGuard<PT>> = TYPE_DOUBLE;
+template <LogicalType LT>
+inline constexpr LogicalType ImmediateAvgResultLT<LT, StringLTGuard<LT>> = TYPE_DOUBLE;
 
 template <typename T>
 struct AvgAggregateState {
@@ -41,54 +61,54 @@ struct AvgAggregateState {
     int64_t count = 0;
 };
 
-template <PrimitiveType PT, typename T = RunTimeCppType<PT>, PrimitiveType ImmediatePT = ImmediateAvgResultPT<PT>,
-          typename ImmediateType = RunTimeCppType<ImmediatePT>>
+template <LogicalType LT, typename T = RunTimeCppType<LT>, LogicalType ImmediateLT = ImmediateAvgResultLT<LT>,
+          typename ImmediateType = RunTimeCppType<ImmediateLT>>
 class AvgAggregateFunction final
         : public AggregateFunctionBatchHelper<AvgAggregateState<ImmediateType>,
-                                              AvgAggregateFunction<PT, T, ImmediatePT, ImmediateType>> {
+                                              AvgAggregateFunction<LT, T, ImmediateLT, ImmediateType>> {
 public:
     void reset(FunctionContext* ctx, const Columns& args, AggDataPtr state) const override {
         this->data(state).sum = {};
         this->data(state).count = 0;
     }
 
-    using InputColumnType = RunTimeColumnType<PT>;
-    static constexpr auto ResultPT = AvgResultPT<PT>;
-    using ResultType = RunTimeCppType<ResultPT>;
-    using ResultColumnType = RunTimeColumnType<ResultPT>;
+    using InputColumnType = RunTimeColumnType<LT>;
+    static constexpr auto ResultLT = AvgResultLT<LT>;
+    using ResultType = RunTimeCppType<ResultLT>;
+    using ResultColumnType = RunTimeColumnType<ResultLT>;
 
     template <bool is_inc>
     void do_update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state, size_t row_num) const {
         DCHECK(!columns[0]->is_nullable());
-        [[maybe_unused]] const InputColumnType* column = down_cast<const InputColumnType*>(columns[0]);
+        [[maybe_unused]] const auto* column = down_cast<const InputColumnType*>(columns[0]);
         if constexpr (is_inc) {
-            if constexpr (pt_is_datetime<PT>) {
+            if constexpr (lt_is_datetime<LT>) {
                 this->data(state).sum += column->get_data()[row_num].to_unix_second();
-            } else if constexpr (pt_is_date<PT>) {
+            } else if constexpr (lt_is_date<LT>) {
                 this->data(state).sum += column->get_data()[row_num].julian();
-            } else if constexpr (pt_is_decimalv2<PT>) {
+            } else if constexpr (lt_is_decimalv2<LT>) {
                 this->data(state).sum += column->get_data()[row_num];
-            } else if constexpr (pt_is_arithmetic<PT>) {
+            } else if constexpr (lt_is_arithmetic<LT>) {
                 this->data(state).sum += column->get_data()[row_num];
-            } else if constexpr (pt_is_decimal<PT>) {
+            } else if constexpr (lt_is_decimal<LT>) {
                 this->data(state).sum += column->get_data()[row_num];
             } else {
-                DCHECK(false) << "Invalid PrimitiveTypes for avg function";
+                DCHECK(false) << "Invalid LogicalTypes for avg function";
             }
             this->data(state).count++;
         } else {
-            if constexpr (pt_is_datetime<PT>) {
+            if constexpr (lt_is_datetime<LT>) {
                 this->data(state).sum -= column->get_data()[row_num].to_unix_second();
-            } else if constexpr (pt_is_date<PT>) {
+            } else if constexpr (lt_is_date<LT>) {
                 this->data(state).sum -= column->get_data()[row_num].julian();
-            } else if constexpr (pt_is_decimalv2<PT>) {
+            } else if constexpr (lt_is_decimalv2<LT>) {
                 this->data(state).sum -= column->get_data()[row_num];
-            } else if constexpr (pt_is_arithmetic<PT>) {
+            } else if constexpr (lt_is_arithmetic<LT>) {
                 this->data(state).sum -= column->get_data()[row_num];
-            } else if constexpr (pt_is_decimal<PT>) {
+            } else if constexpr (lt_is_decimal<LT>) {
                 this->data(state).sum -= column->get_data()[row_num];
             } else {
-                DCHECK(false) << "Invalid PrimitiveTypes for avg function";
+                DCHECK(false) << "Invalid LogicalTypes for avg function";
             }
             this->data(state).count--;
         }
@@ -97,6 +117,15 @@ public:
     void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
                 size_t row_num) const override {
         do_update<true>(ctx, columns, state, row_num);
+    }
+
+    AggStateTableKind agg_state_table_kind(bool is_append_only) const override {
+        return AggStateTableKind::INTERMEDIATE;
+    }
+
+    void retract(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
+                 size_t row_num) const override {
+        do_update<false>(ctx, columns, state, row_num);
     }
 
     void update_batch_single_state_with_frame(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
@@ -156,22 +185,22 @@ public:
         bytes.resize(one_element_size * chunk_size);
         dst_column->get_offset().resize(chunk_size + 1);
 
-        [[maybe_unused]] const InputColumnType* src_column = down_cast<const InputColumnType*>(src[0].get());
+        [[maybe_unused]] const auto* src_column = down_cast<const InputColumnType*>(src[0].get());
         int64_t count = 1;
         ImmediateType result = {};
         for (size_t i = 0; i < chunk_size; ++i) {
-            if constexpr (pt_is_datetime<PT>) {
+            if constexpr (lt_is_datetime<LT>) {
                 result = src_column->get_data()[i].to_unix_second();
-            } else if constexpr (pt_is_date<PT>) {
+            } else if constexpr (lt_is_date<LT>) {
                 result = src_column->get_data()[i].julian();
-            } else if constexpr (pt_is_decimalv2<PT>) {
+            } else if constexpr (lt_is_decimalv2<LT>) {
                 result = src_column->get_data()[i];
-            } else if constexpr (pt_is_arithmetic<PT>) {
+            } else if constexpr (lt_is_arithmetic<LT>) {
                 result = src_column->get_data()[i];
-            } else if constexpr (pt_is_decimal<PT>) {
+            } else if constexpr (lt_is_decimal<LT>) {
                 result = src_column->get_data()[i];
             } else {
-                DCHECK(false) << "Invalid PrimitiveTypes for avg function";
+                DCHECK(false) << "Invalid LogicalTypes for avg function";
             }
             memcpy(bytes.data() + old_size, &result, sizeof(ImmediateType));
             memcpy(bytes.data() + old_size + sizeof(ImmediateType), &count, sizeof(int64_t));
@@ -188,23 +217,23 @@ public:
             return;
         }
 
-        ResultColumnType* column = down_cast<ResultColumnType*>(to);
+        auto* column = down_cast<ResultColumnType*>(to);
         ResultType result;
-        if constexpr (pt_is_decimalv2<PT>) {
+        if constexpr (lt_is_decimalv2<LT>) {
             result = this->data(state).sum / DecimalV2Value(this->data(state).count, 0);
-        } else if constexpr (pt_is_datetime<PT>) {
+        } else if constexpr (lt_is_datetime<LT>) {
             result.from_unix_second(this->data(state).sum / this->data(state).count);
-        } else if constexpr (pt_is_date<PT>) {
+        } else if constexpr (lt_is_date<LT>) {
             result._julian = this->data(state).sum / this->data(state).count;
-        } else if constexpr (pt_is_arithmetic<PT>) {
+        } else if constexpr (lt_is_arithmetic<LT>) {
             result = this->data(state).sum / this->data(state).count;
-        } else if constexpr (pt_is_decimal<PT>) {
-            static_assert(pt_is_decimal128<ResultPT>, "Result type of avg on decimal32/64/128 is decimal 128");
-            ResultType sum = ResultType(this->data(state).sum);
-            ResultType count = ResultType(this->data(state).count);
+        } else if constexpr (lt_is_decimal<LT>) {
+            static_assert(lt_is_decimal128<ResultLT>, "Result type of avg on decimal32/64/128 is decimal 128");
+            auto sum = ResultType(this->data(state).sum);
+            auto count = ResultType(this->data(state).count);
             result = decimal_div_integer<ResultType>(sum, count, ctx->get_arg_type(0)->scale);
         } else {
-            DCHECK(false) << "Invalid PrimitiveTypes for avg function";
+            DCHECK(false) << "Invalid LogicalTypes for avg function";
         }
         column->append(result);
     }
@@ -213,24 +242,24 @@ public:
                     size_t end) const override {
         DCHECK_GT(end, start);
 
-        ResultColumnType* column = down_cast<ResultColumnType*>(dst);
+        auto* column = down_cast<ResultColumnType*>(dst);
         ResultType result;
 
-        if constexpr (pt_is_decimalv2<PT>) {
+        if constexpr (lt_is_decimalv2<LT>) {
             result = this->data(state).sum / DecimalV2Value(this->data(state).count, 0);
-        } else if constexpr (pt_is_datetime<PT>) {
+        } else if constexpr (lt_is_datetime<LT>) {
             result.from_unix_second(this->data(state).sum / this->data(state).count);
-        } else if constexpr (pt_is_date<PT>) {
+        } else if constexpr (lt_is_date<LT>) {
             result._julian = this->data(state).sum / this->data(state).count;
-        } else if constexpr (pt_is_arithmetic<PT>) {
+        } else if constexpr (lt_is_arithmetic<LT>) {
             result = this->data(state).sum / this->data(state).count;
-        } else if constexpr (pt_is_decimal<PT>) {
-            static_assert(pt_is_decimal128<ResultPT>, "Result type of avg on decimal32/64/128 is decimal 128");
-            ResultType sum = ResultType(this->data(state).sum);
-            ResultType count = ResultType(this->data(state).count);
+        } else if constexpr (lt_is_decimal<LT>) {
+            static_assert(lt_is_decimal128<ResultLT>, "Result type of avg on decimal32/64/128 is decimal 128");
+            auto sum = ResultType(this->data(state).sum);
+            auto count = ResultType(this->data(state).count);
             result = decimal_div_integer<ResultType>(sum, count, ctx->get_arg_type(0)->scale);
         } else {
-            DCHECK(false) << "Invalid PrimitiveTypes for avg function";
+            DCHECK(false) << "Invalid LogicalTypes for avg function";
         }
         for (size_t i = start; i < end; ++i) {
             column->get_data()[i] = result;
@@ -239,8 +268,8 @@ public:
 
     std::string get_name() const override { return "avg"; }
 };
-template <PrimitiveType PT, typename = DecimalPTGuard<PT>>
+template <LogicalType LT, typename = DecimalLTGuard<LT>>
 using DecimalAvgAggregateFunction =
-        AvgAggregateFunction<PT, RunTimeCppType<PT>, TYPE_DECIMAL128, RunTimeCppType<TYPE_DECIMAL128>>;
+        AvgAggregateFunction<LT, RunTimeCppType<LT>, TYPE_DECIMAL128, RunTimeCppType<TYPE_DECIMAL128>>;
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

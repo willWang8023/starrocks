@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/task/ExportPendingTask.java
 
@@ -24,13 +37,13 @@ package com.starrocks.task;
 import com.starrocks.catalog.Database;
 import com.starrocks.common.Pair;
 import com.starrocks.common.Status;
-import com.starrocks.lake.proto.LockTabletMetadataRequest;
 import com.starrocks.load.ExportFailMsg;
 import com.starrocks.load.ExportJob;
+import com.starrocks.proto.LockTabletMetadataRequest;
 import com.starrocks.rpc.BrpcProxy;
 import com.starrocks.rpc.LakeService;
 import com.starrocks.server.GlobalStateMgr;
-import com.starrocks.system.Backend;
+import com.starrocks.system.ComputeNode;
 import com.starrocks.thrift.TAgentResult;
 import com.starrocks.thrift.TInternalScanRange;
 import com.starrocks.thrift.TNetworkAddress;
@@ -45,7 +58,7 @@ import org.apache.logging.log4j.Logger;
 
 import java.util.List;
 
-public class ExportPendingTask extends LeaderTask {
+public class ExportPendingTask extends PriorityLeaderTask {
     private static final Logger LOG = LogManager.getLogger(ExportPendingTask.class);
 
     protected final ExportJob job;
@@ -78,11 +91,13 @@ public class ExportPendingTask extends LeaderTask {
             return;
         }
 
-        // make snapshots
-        Status snapshotStatus = makeSnapshots();
-        if (!snapshotStatus.ok()) {
-            job.cancelInternal(ExportFailMsg.CancelType.RUN_FAIL, snapshotStatus.getErrorMsg());
-            return;
+        if (!job.exportOlapTable()) {
+            // make snapshots
+            Status snapshotStatus = makeSnapshots();
+            if (!snapshotStatus.ok()) {
+                job.cancelInternal(ExportFailMsg.CancelType.RUN_FAIL, snapshotStatus.getErrorMsg());
+                return;
+            }
         }
 
         if (job.updateState(ExportJob.JobState.EXPORTING)) {
@@ -109,18 +124,17 @@ public class ExportPendingTask extends LeaderTask {
                 TNetworkAddress address = location.getServer();
                 String host = address.getHostname();
                 int port = address.getPort();
-                Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackendWithBePort(host, port);
-                if (backend == null) {
+                ComputeNode node = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo()
+                        .getBackendOrComputeNodeWithBePort(host, port);
+                if (!GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().checkNodeAvailable(node)) {
                     return Status.CANCELLED;
                 }
-                long backendId = backend.getId();
-                if (!GlobalStateMgr.getCurrentSystemInfo().checkBackendAvailable(backendId)) {
-                    return Status.CANCELLED;
-                }
-                this.job.setBeStartTime(backendId, backend.getLastStartTime());
+
+                long nodeId = node.getId();
+                this.job.setBeStartTime(nodeId, node.getLastStartTime());
                 Status status;
                 if (job.exportLakeTable()) {
-                    status = lockTabletMetadata(internalScanRange, backend);
+                    status = lockTabletMetadata(internalScanRange, node);
                 } else {
                     status = makeSnapshot(internalScanRange, address);
                 }
@@ -132,7 +146,7 @@ public class ExportPendingTask extends LeaderTask {
         return Status.OK;
     }
 
-    private Status lockTabletMetadata(TInternalScanRange internalScanRange, Backend backend) {
+    private Status lockTabletMetadata(TInternalScanRange internalScanRange, ComputeNode backend) {
         try {
             LakeService lakeService = BrpcProxy.getLakeService(backend.getHost(), backend.getBrpcPort());
             LockTabletMetadataRequest request = new LockTabletMetadataRequest();

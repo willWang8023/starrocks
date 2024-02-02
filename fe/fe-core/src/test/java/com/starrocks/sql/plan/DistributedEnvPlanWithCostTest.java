@@ -1,24 +1,55 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.plan;
 
 import com.starrocks.catalog.OlapTable;
+import com.starrocks.catalog.Table;
+import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
 import com.starrocks.common.Pair;
 import com.starrocks.planner.AggregationNode;
+import com.starrocks.planner.PlanFragment;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.optimizer.OptExpression;
+import com.starrocks.sql.optimizer.OptimizerContext;
+import com.starrocks.sql.optimizer.rule.transformation.DeriveRangeJoinPredicateRule;
 import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.utframe.UtFrameUtils;
 import mockit.Expectations;
+import mockit.Mock;
+import mockit.MockUp;
+import org.junit.After;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
+
+import java.util.List;
+import java.util.stream.Collectors;
 
 public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
     @BeforeClass
     public static void beforeClass() throws Exception {
         DistributedEnvPlanTestBase.beforeClass();
         FeConstants.runningUnitTest = true;
+        Config.tablet_sched_disable_colocate_overall_balance = true;
+    }
+
+    @After
+    public void after() {
+        connectContext.getSessionVariable().setNewPlanerAggStage(0);
     }
 
     //  agg
@@ -41,11 +72,10 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         connectContext.getSessionVariable().setNewPlanerAggStage(2);
         String sql = "select count(distinct P_TYPE) from part group by P_BRAND;";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "1:AGGREGATE (update serialize)\n"
-                + "  |  STREAMING\n"
-                + "  |  output: multi_distinct_count(5: P_TYPE)");
-        assertContains(plan, "3:AGGREGATE (merge finalize)\n"
-                + "  |  output: multi_distinct_count(11: count)");
+        assertContains(plan, "  1:AGGREGATE (update serialize)\n" +
+                "  |  STREAMING\n" +
+                "  |  output: multi_distinct_count(5: P_TYPE)\n" +
+                "  |  group by: 4: P_BRAND");
         connectContext.getSessionVariable().setNewPlanerAggStage(0);
     }
 
@@ -54,16 +84,12 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         connectContext.getSessionVariable().setNewPlanerAggStage(2);
         String sql = "select count(distinct P_PARTKEY) from part group by P_BRAND;";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  3:AGGREGATE (update serialize)\n" +
+        assertContains(plan, "2:AGGREGATE (update serialize)\n" +
                 "  |  STREAMING\n" +
                 "  |  output: count(1: P_PARTKEY)\n" +
                 "  |  group by: 4: P_BRAND\n" +
                 "  |  \n" +
-                "  2:AGGREGATE (merge finalize)\n" +
-                "  |  group by: 4: P_BRAND, 1: P_PARTKEY\n" +
-                "  |  \n" +
-                "  1:AGGREGATE (update serialize)\n" +
-                "  |  STREAMING\n" +
+                "  1:AGGREGATE (update finalize)\n" +
                 "  |  group by: 4: P_BRAND, 1: P_PARTKEY");
         connectContext.getSessionVariable().setNewPlanerAggStage(0);
     }
@@ -261,8 +287,8 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         String sql =
                 "select count(*) from lineorder_new_l where LO_ORDERDATE not in ('1998-04-10', '1994-04-11', '1994-04-12');";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "3:AGGREGATE (merge finalize)");
-        assertContains(plan, "1:AGGREGATE (update serialize)");
+        assertContains(plan, "4:AGGREGATE (merge finalize)");
+        assertContains(plan, "2:AGGREGATE (update serialize)");
         connectContext.getSessionVariable().setNewPlanerAggStage(0);
     }
 
@@ -273,8 +299,8 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
                 "select count(*) from lineorder_new_l where LO_ORDERDATE > '1994-01-01' " +
                         "and LO_ORDERDATE < '1995-01-01' and LO_ORDERDATE != '1994-04-11'";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "3:AGGREGATE (merge finalize)");
-        assertContains(plan, "1:AGGREGATE (update serialize)");
+        assertContains(plan, "4:AGGREGATE (merge finalize)");
+        assertContains(plan, "2:AGGREGATE (update serialize)");
         connectContext.getSessionVariable().setNewPlanerAggStage(0);
     }
 
@@ -387,8 +413,7 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
                 + "'FRANCE') ) and l_shipdate between date '1995-01-01' and date '1996-12-31' ) as shipping "
                 + "group by supp_nation, cust_nation, l_year order by supp_nation, cust_nation, l_year;";
         String plan = getCostExplain(sql);
-        assertContains(plan, "     probe runtime filters:\n" +
-                "     - filter_id = 2, probe_expr = (11: L_SUPPKEY)");
+        assertContains(plan, "build_expr = (1: S_SUPPKEY)");
     }
 
     @Test
@@ -484,12 +509,12 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
     public void testCountPruneJoinByProject() throws Exception {
         String sql = "select count(*) from customer join orders on C_CUSTKEY = O_CUSTKEY";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "5:AGGREGATE (update serialize)\n" +
+        assertContains(plan, "6:AGGREGATE (update serialize)\n" +
                 "  |  output: count(*)\n" +
                 "  |  group by: \n" +
                 "  |  \n" +
-                "  4:Project\n" +
-                "  |  <slot 1> : 1: C_CUSTKEY");
+                "  5:Project\n" +
+                "  |  <slot 22> : 1");
         checkTwoPhaseAgg(plan);
     }
 
@@ -512,20 +537,24 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         String plan = getCostExplain(sql);
         assertContains(plan, "6:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (PARTITIONED)\n" +
-                "  |  equal join conjunct: [29: cast, BIGINT, true] = [30: add, BIGINT, true]\n" +
+                "  |  equal join conjunct: [29: cast, BIGINT, false] = [30: add, BIGINT, false]\n" +
                 "  |  output columns: 14, 15, 20, 22\n" +
                 "  |  cardinality: 600000000");
-        assertContains(plan, "|----5:EXCHANGE\n" +
+        assertContains(plan, "  |----5:EXCHANGE\n" +
+                "  |       distribution type: SHUFFLE\n" +
+                "  |       partition exprs: [30: add, BIGINT, false]\n" +
                 "  |       cardinality: 150000000\n" +
                 "  |    \n" +
                 "  2:EXCHANGE\n" +
+                "     distribution type: SHUFFLE\n" +
+                "     partition exprs: [29: cast, BIGINT, false]\n" +
                 "     cardinality: 600000000");
         sql =
                 "SELECT COUNT(*)  FROM lineitem JOIN orders ON l_orderkey * 2 = o_orderkey + 1 " +
                         "GROUP BY l_shipmode, l_shipinstruct, o_orderdate, o_orderstatus;";
         plan = getCostExplain(sql);
         Assert.assertTrue(
-                plan.contains("equal join conjunct: [29: multiply, BIGINT, true] = [30: add, BIGINT, true]\n" +
+                plan.contains("equal join conjunct: [29: multiply, BIGINT, false] = [30: add, BIGINT, false]\n" +
                         "  |  output columns: 14, 15, 20, 22\n" +
                         "  |  cardinality: 600000000"));
     }
@@ -640,17 +669,17 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         String plan = getCostExplain(sql);
 
         // eval predicate cardinality in scan node
-        assertContains(plan, "0:OlapScanNode\n" +
+        assertContains(plan, "4:OlapScanNode\n" +
                 "     table: nation, rollup: nation\n" +
                 "     preAggregation: on\n" +
                 "     Predicates: 23: N_NATIONKEY IN (2, 1)\n" +
                 "     partitionsRatio=1/1, tabletsRatio=1/1");
         // eval predicate cardinality in join node
-        assertContains(plan, "3:NESTLOOP JOIN\n" +
+        assertContains(plan, "6:NESTLOOP JOIN\n" +
                 "  |  join op: INNER JOIN\n" +
                 "  |  other join predicates: ((18: N_NATIONKEY = 1) AND (23: N_NATIONKEY = 2)) " +
                 "OR ((18: N_NATIONKEY = 2) AND (23: N_NATIONKEY = 1))\n" +
-                "  |  cardinality: 2");
+                "  |  cardinality: 1");
     }
 
     @Test
@@ -676,8 +705,12 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
                 "      ) t1\n" +
                 "  ) t2;";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, " 11:AGGREGATE (update finalize)");
-        assertContains(plan, "10:Project");
+        assertContains(plan, "12:AGGREGATE (update finalize)\n" +
+                "  |  output: sum(11: count)\n" +
+                "  |  group by: \n" +
+                "  |  \n" +
+                "  11:Project\n" +
+                "  |  <slot 11> : 11: count");
     }
 
     @Test
@@ -700,7 +733,7 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
                 "  |  join op: LEFT OUTER JOIN (BUCKET_SHUFFLE)\n" +
                 "  |  equal join conjunct: [1: PS_PARTKEY, INT, false] = [7: P_PARTKEY, INT, true]\n" +
                 "  |  other predicates: 7: P_PARTKEY IS NULL\n" +
-                "  |  output columns: 1, 2\n" +
+                "  |  output columns: 1, 2, 7\n" +
                 "  |  cardinality: 8000000");
         // test right outer join
         sql = "select ps_partkey,ps_suppkey from partsupp right outer join part on " +
@@ -901,7 +934,7 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         OlapTable lineitem =
                 (OlapTable) connectContext.getGlobalStateMgr().getDb("test").getTable("lineitem");
 
-        MockTpchStatisticStorage mock = new MockTpchStatisticStorage(100);
+        MockTpchStatisticStorage mock = new MockTpchStatisticStorage(connectContext, 100);
         connectContext.getGlobalStateMgr().setStatisticStorage(mock);
 
         // ===========================
@@ -959,7 +992,7 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         assertContains(plan, "     column statistics: \n" +
                 "     * L_SHIPDATE-->[-Infinity, Infinity, 0.0, 8.0, 20000.0] ESTIMATE");
 
-        connectContext.getGlobalStateMgr().setStatisticStorage(new MockTpchStatisticStorage(100));
+        connectContext.getGlobalStateMgr().setStatisticStorage(new MockTpchStatisticStorage(connectContext, 100));
     }
 
     @Test
@@ -977,7 +1010,7 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         sql = "select * from lineitem where L_LINENUMBER in (L_RETURNFLAG+1,2+1)";
         plan = getCostExplain(sql);
         Assert.assertTrue("plan is " + plan,
-                plan.contains("* L_LINENUMBER-->[1.0, 7.0, 0.0, 4.0, 3.0] ESTIMATE"));
+                plan.contains("* L_LINENUMBER-->[1.0, 7.0, 0.0, 4.0, 7.0] ESTIMATE"));
 
         sql = "select * from lineitem where L_LINENUMBER + 1 in (L_RETURNFLAG+1,2+1)";
         plan = getCostExplain(sql);
@@ -1015,19 +1048,20 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
     public void testPruneAggNode() throws Exception {
         ConnectContext.get().getSessionVariable().setNewPlanerAggStage(3);
         String sql = "select count(distinct C_NAME) from customer group by C_CUSTKEY;";
-        String plan = getFragmentPlan(sql);
-
-        assertContains(plan, "2:AGGREGATE (update finalize)\n" +
-                "  |  output: count(2: C_NAME)\n" +
-                "  |  group by: 1: C_CUSTKEY\n" +
+        ExecPlan plan = getExecPlan(sql);
+        Assert.assertTrue(plan.getFragments().get(1).isAssignScanRangesPerDriverSeq());
+        assertContains(plan.getExplainString(TExplainLevel.NORMAL), "2:Project\n" +
+                "  |  <slot 10> : 10: count\n" +
                 "  |  \n" +
-                "  1:AGGREGATE (update serialize)\n" +
-                "  |  group by: 1: C_CUSTKEY, 2: C_NAME");
+                "  1:AGGREGATE (update finalize)\n" +
+                "  |  output: multi_distinct_count(2: C_NAME)\n" +
+                "  |  group by: 1: C_CUSTKEY");
 
         ConnectContext.get().getSessionVariable().setNewPlanerAggStage(4);
         sql = "select count(distinct C_CUSTKEY) from customer;";
-        plan = getFragmentPlan(sql);
-        assertContains(plan, " 2:AGGREGATE (update serialize)\n" +
+        plan = getExecPlan(sql);
+        Assert.assertTrue(plan.getFragments().get(1).isAssignScanRangesPerDriverSeq());
+        assertContains(plan.getExplainString(TExplainLevel.NORMAL), " 2:AGGREGATE (update serialize)\n" +
                 "  |  output: count(1: C_CUSTKEY)\n" +
                 "  |  group by: \n" +
                 "  |  \n" +
@@ -1037,8 +1071,9 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         ConnectContext.get().getSessionVariable().setNewPlanerAggStage(0);
 
         sql = "select count(distinct C_CUSTKEY, C_NAME) from customer;";
-        plan = getFragmentPlan(sql);
-        assertContains(plan, " 2:AGGREGATE (update serialize)\n" +
+        plan = getExecPlan(sql);
+        Assert.assertTrue(plan.getFragments().get(1).isAssignScanRangesPerDriverSeq());
+        assertContains(plan.getExplainString(TExplainLevel.NORMAL), " 2:AGGREGATE (update serialize)\n" +
                 "  |  output: count(if(1: C_CUSTKEY IS NULL, NULL, 2: C_NAME))\n" +
                 "  |  group by: \n" +
                 "  |  \n" +
@@ -1046,13 +1081,77 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
                 "  |  group by: 1: C_CUSTKEY, 2: C_NAME");
 
         sql = "select count(distinct C_CUSTKEY, C_NAME) from customer group by C_CUSTKEY;";
-        plan = getFragmentPlan(sql);
-        assertContains(plan, "  2:AGGREGATE (update finalize)\n" +
+        plan = getExecPlan(sql);
+        Assert.assertTrue(plan.getFragments().get(1).isAssignScanRangesPerDriverSeq());
+        assertContains(plan.getExplainString(TExplainLevel.NORMAL), "  2:AGGREGATE (update finalize)\n" +
                 "  |  output: count(if(1: C_CUSTKEY IS NULL, NULL, 2: C_NAME))\n" +
                 "  |  group by: 1: C_CUSTKEY\n" +
                 "  |  \n" +
                 "  1:AGGREGATE (update serialize)\n" +
                 "  |  group by: 1: C_CUSTKEY, 2: C_NAME");
+    }
+
+    @Test
+    public void testAggNodeAndBucketDistribution() throws Exception {
+        // For the local one-phase aggregation, enable AssignScanRangesPerDriverSeq and disable SharedScan.
+        String sql = "select count(1) from customer group by C_CUSTKEY";
+        ExecPlan plan = getExecPlan(sql);
+        PlanFragment fragment = plan.getFragments().get(1);
+        Assert.assertTrue(fragment.isAssignScanRangesPerDriverSeq());
+        assertContains(fragment.getExplainString(TExplainLevel.NORMAL), "  1:AGGREGATE (update finalize)\n" +
+                "  |  output: count(1)\n" +
+                "  |  group by: 1: C_CUSTKEY\n" +
+                "  |  \n" +
+                "  0:OlapScanNode");
+
+        // For the none-local one-phase aggregation, disable AssignScanRangesPerDriverSeq and enable SharedScan.
+        ConnectContext.get().getSessionVariable().setNewPlanerAggStage(1);
+        sql = "select count(1) from customer group by C_NAME";
+        plan = getExecPlan(sql);
+        fragment = plan.getFragments().get(2);
+        Assert.assertFalse(fragment.isAssignScanRangesPerDriverSeq());
+        assertContains(fragment.getExplainString(TExplainLevel.NORMAL), "  STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 01\n" +
+                "    HASH_PARTITIONED: 2: C_NAME\n" +
+                "\n" +
+                "  0:OlapScanNode");
+
+        // For the two-phase aggregation, disable AssignScanRangesPerDriverSeq and enable SharedScan.
+        ConnectContext.get().getSessionVariable().setNewPlanerAggStage(2);
+        sql = "select count(1) from customer group by C_NAME";
+        plan = getExecPlan(sql);
+        fragment = plan.getFragments().get(2);
+        Assert.assertFalse(fragment.isAssignScanRangesPerDriverSeq());
+        assertContains(fragment.getExplainString(TExplainLevel.NORMAL), "  1:AGGREGATE (update serialize)\n" +
+                "  |  STREAMING\n" +
+                "  |  output: count(1)\n" +
+                "  |  group by: 2: C_NAME\n" +
+                "  |  \n" +
+                "  0:OlapScanNode");
+
+        // For the none-pruned four-phase aggregation, disable AssignScanRangesPerDriverSeq and enable SharedScan.
+        ConnectContext.get().getSessionVariable().setNewPlanerAggStage(0);
+        sql = "select count(distinct C_ADDRESS) from customer group by C_NAME";
+        plan = getExecPlan(sql);
+        fragment = plan.getFragments().get(2);
+        Assert.assertFalse(fragment.isAssignScanRangesPerDriverSeq());
+        assertContains(fragment.getExplainString(TExplainLevel.NORMAL), "  1:AGGREGATE (update serialize)\n" +
+                "  |  STREAMING\n" +
+                "  |  group by: 2: C_NAME, 3: C_ADDRESS\n" +
+                "  |  \n" +
+                "  0:OlapScanNode");
+
+        // For the none-pruned three-phase aggregation, disable AssignScanRangesPerDriverSeq and enable SharedScan.
+        sql = "select count(distinct C_ADDRESS) from customer";
+        plan = getExecPlan(sql);
+        System.out.println(plan.getExplainString(TExplainLevel.NORMAL));
+        fragment = plan.getFragments().get(2);
+        Assert.assertFalse(fragment.isAssignScanRangesPerDriverSeq());
+        assertContains(fragment.getExplainString(TExplainLevel.NORMAL), "  1:AGGREGATE (update serialize)\n" +
+                "  |  STREAMING\n" +
+                "  |  group by: 3: C_ADDRESS\n" +
+                "  |  \n" +
+                "  0:OlapScanNode");
     }
 
     @Test
@@ -1140,11 +1239,11 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         String sql = "select * from t0 j0 join " +
                 "(select v3, sum(v2) as x2 from t0 group by v3) j1 on j0.v3 = j1.v3 and j0.v2 = j1.x2";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 05\n" +
-                "    UNPARTITIONED\n" +
+        assertContains(plan, "STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 06\n" +
+                "    HASH_PARTITIONED: 6: v3, 7: sum\n" +
                 "\n" +
-                "  4:AGGREGATE (merge finalize)");
+                "  5:AGGREGATE (merge finalize)");
     }
 
     @Test
@@ -1189,7 +1288,8 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         assertContains(costPlan, "* min-->[-Infinity, Infinity, 0.0, 25.0, 7500000.0] ESTIMATE\n" +
                 "  |  * max-->[-Infinity, Infinity, 0.0, 25.0, 7500000.0] ESTIMATE");
 
-        sql = "select C_CUSTKEY, Min(C_NAME) as min, Max(C_NAME) as max from customer group by C_CUSTKEY having max < '1234'";
+        sql =
+                "select C_CUSTKEY, Min(C_NAME) as min, Max(C_NAME) as max from customer group by C_CUSTKEY having max < '1234'";
         costPlan = getCostExplain(sql);
         assertContains(costPlan, " * min-->[-Infinity, Infinity, 0.0, 25.0, 7500000.0] ESTIMATE\n" +
                 "  |  * max-->[-Infinity, Infinity, 0.0, 25.0, 7500000.0] ESTIMATE");
@@ -1211,7 +1311,7 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
                 "          ref_0.id_datetime as c2\n" +
                 "        from \n" +
                 "          test_all_type as ref_0\n" +
-                "        where cast(null as DOUBLE) <= ref_0.t1f) as subq_0\n" +
+                "        where cast(1 as DOUBLE) <= ref_0.t1f) as subq_0\n" +
                 "    left join part as ref_1\n" +
                 "    on (subq_0.c0 = ref_1.P_RETAILPRICE )\n" +
                 "where subq_0.c1 <> subq_0.c1\n" +
@@ -1219,7 +1319,7 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         ExecPlan execPlan = getExecPlan(sql);
         String plan = execPlan.getExplainString(TExplainLevel.NORMAL);
         // check without error
-        assertContains(plan, "  4:HASH JOIN\n" +
+        assertContains(plan, "  5:HASH JOIN\n" +
                 "  |  join op: RIGHT OUTER JOIN (PARTITIONED)\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 18: P_RETAILPRICE = 21: cast\n" +
@@ -1251,24 +1351,22 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
                 "        from \n" +
                 "          orders as ref_0 \n" +
                 "        where \n" +
-                "          ref_0.o_totalprice > ref_0.o_totalprice\n" +
+                "          ref_0.o_totalprice >= ref_0.o_totalprice\n" +
                 "      ) as subq_0 \n" +
-                "    where \n" +
-                "      null\n" +
                 "  ) as subq_1 \n" +
                 "  left join customer as ref_1 on (subq_1.c2 = ref_1.c_custkey) \n" +
                 "where \n" +
                 "  subq_1.c4 >= subq_1.c4;";
         String plan = getFragmentPlan(sql);
         assertContains(plan, "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 09\n" +
+                "    EXCHANGE ID: 10\n" +
                 "    UNPARTITIONED\n" +
                 "\n" +
-                "  8:Project\n" +
+                "  9:Project\n" +
                 "  |  <slot 2> : 2: O_CUSTKEY\n" +
                 "  |  <slot 14> : 14: C_ADDRESS\n" +
                 "  |  \n" +
-                "  7:HASH JOIN\n" +
+                "  8:HASH JOIN\n" +
                 "  |  join op: RIGHT OUTER JOIN (BUCKET_SHUFFLE)\n" +
                 "  |  colocate: false, reason: \n" +
                 "  |  equal join conjunct: 12: C_CUSTKEY = 2: O_CUSTKEY");
@@ -1294,5 +1392,195 @@ public class DistributedEnvPlanWithCostTest extends DistributedEnvPlanTestBase {
         assertContains(plan, "1:AGGREGATE (update serialize)\n" +
                 "  |  STREAMING\n" +
                 "  |  group by: 2: P_NAME");
+    }
+
+    @Test
+    public void testManyCrossJoin() throws Exception {
+        connectContext.getSessionVariable().setOptimizerExecuteTimeout(300000000);
+        String sql = "select t1.LO_ORDERKEY from lineorder_new_l t1 join lineorder_new_l t2 " +
+                "join lineorder_new_l t3 join lineorder_new_l t4 join lineorder_new_l t5 join lineorder_new_l t6 " +
+                "join lineorder_new_l t7 join lineorder_new_l t8 join lineorder_new_l t9 join lineorder_new_l t10 " +
+                "join lineorder_new_l t11 join lineorder_new_l t12 join lineorder_new_l t13 join lineorder_new_l t14 " +
+                "join lineorder_new_l t15 join lineorder_new_l t16 join lineorder_new_l t17 join lineorder_new_l t18 " +
+                "join lineorder_new_l t19 join lineorder_new_l t20 join lineorder_new_l t21 join lineorder_new_l t22 " +
+                "join lineorder_new_l t23 join lineorder_new_l t24 join lineorder_new_l t25 join lineorder_new_l t26 " +
+                "join lineorder_new_l t27 join lineorder_new_l t28 join lineorder_new_l t29 join lineorder_new_l t30 " +
+                "join lineorder_new_l t31 join lineorder_new_l t32 join lineorder_new_l t33 join lineorder_new_l t34 " +
+                "join lineorder_new_l t35 join lineorder_new_l t36 join lineorder_new_l t37 join lineorder_new_l t38";
+        String plan = getCostExplain(sql);
+        assertContains(plan, "185:Project\n" +
+                "  |  output columns:\n" +
+                "  |  1 <-> [1: LO_ORDERKEY, INT, false]\n" +
+                "  |  cardinality: 9223372036854775807");
+    }
+
+    @Test
+    public void testAggExecuteInOneTablet() throws Exception {
+        String sql;
+        String plan;
+
+        // dates_n only contains one tablet.
+        sql = "select count(d_datekey), d_date from dates_n group by d_date";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "LocalShuffleColumns");
+        assertContains(plan, "  1:AGGREGATE (update finalize)");
+        assertContains(plan, "  0:OlapScanNode");
+
+        // dates_n only contains one tablet.
+        sql = "select count(d_date), d_datekey from dates_n group by d_datekey";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "LocalShuffleColumns");
+        assertContains(plan, "  1:AGGREGATE (update finalize)");
+        assertContains(plan, "  0:OlapScanNode");
+
+        // dates_n only contains one tablet.
+        //       HashJoin(Colocate)
+        //      /               \
+        // OlapScanNode       BlockingAgg
+        //                       |
+        //                    OlapScanNode
+        sql = "WITH w1 as (SELECT count(d_date) as cnt, d_datekey FROM dates_n group by d_datekey) " +
+                "SELECT * from dates_n join [colocate] w1 using(d_datekey)";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "LocalShuffleColumns");
+        assertContains(plan, "  3:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (COLOCATE)\n" +
+                "  |  colocate: true\n" +
+                "  |  equal join conjunct: [1: d_datekey, INT, true] = [18: d_datekey, INT, true]\n" +
+                "  |  build runtime filters:\n" +
+                "  |  - filter_id = 0, build_expr = (18: d_datekey), remote = false\n" +
+                "  |  cardinality: 2300\n" +
+                "  |  \n" +
+                "  |----2:AGGREGATE (update finalize)");
+
+        // lineorder_new_l contains more than one tablet.
+        sql = "select count(P_TYPE), LO_ORDERKEY from lineorder_new_l group by LO_ORDERKEY";
+        plan = getVerboseExplain(sql);
+        assertNotContains(plan, "     LocalShuffleColumns:\n" +
+                "     - 1: LO_ORDERKEY");
+        assertContains(plan, "  1:AGGREGATE (update finalize)");
+        assertContains(plan, "  0:OlapScanNode");
+    }
+
+    @Test
+    public void testValidateJoinReorderPlan() throws Exception {
+        String sql = "select  \n" +
+                "  ref_0.N_NAME as c0, \n" +
+                "  case when ref_3.C_NATIONKEY > ref_3.C_ACCTBAL then ref_1.O_ORDERPRIORITY else " +
+                "ref_1.O_SHIPPRIORITY end as c1\n" +
+                "from \n" +
+                "  nation as ref_0 inner join nation n1 on ref_0.N_NAME = n1.N_NAME" +
+                "  join nation n2 on ref_0.N_NAME = n2.N_NAME join nation n3 on ref_0.N_NAME = n3.N_NAME" +
+                "  join nation n4 on ref_0.N_NAME = n4.N_NAME" +
+                "            inner join orders as ref_1\n" +
+                "            on (ref_0.N_REGIONKEY = ref_1.O_CUSTKEY )\n" +
+                "          left join t2 as ref_2\n" +
+                "          on (ref_0.N_NATIONKEY = ref_2.v8 )\n" +
+                "        inner join customer as ref_3\n" +
+                "        on (ref_1.O_ORDERPRIORITY = ref_3.C_NAME )\n" +
+                "      inner join supplier as ref_4\n" +
+                "      on (ref_1.O_CLERK = ref_4.S_PHONE )\n" +
+                "    left join supplier as ref_5\n" +
+                "    on (ref_2.v9 = ref_5.S_SUPPKEY )\n" +
+                "where cast(coalesce(ref_3.C_MKTSEGMENT, ref_0.N_NAME) as VARCHAR) = ref_5.S_ADDRESS";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "39:Project\n" +
+                "  |  <slot 2> : 2: N_NAME\n" +
+                "  |  <slot 64> : if(CAST(42: C_NATIONKEY AS DOUBLE) > 44: C_ACCTBAL, 31: O_ORDERPRIORITY, " +
+                "CAST(33: O_SHIPPRIORITY AS VARCHAR(15)))\n" +
+                "  |  \n" +
+                "  38:HASH JOIN\n" +
+                "  |  join op: INNER JOIN (BROADCAST)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 65: cast = 38: v9\n" +
+                "  |  equal join conjunct: 58: S_ADDRESS = 66: coalesce");
+    }
+
+    @Test
+    public void testRnagePredicateJoin() throws Exception {
+        new MockUp<DeriveRangeJoinPredicateRule>() {
+            @Mock
+            public boolean check(OptExpression input, OptimizerContext context) {
+                return true;
+            }
+        };
+
+        new MockUp<MockTpchStatisticStorage>() {
+            @Mock
+            ColumnStatistic getColumnStatistic(Table table, String column) {
+                ColumnStatistic c;
+                c = new ColumnStatistic(1, 2, 3, 4, 5);
+                c.setMaxString("test_max_" + column);
+                c.setMinString("test_min_" + column);
+                return c;
+            }
+
+            @Mock
+            List<ColumnStatistic> getColumnStatistics(Table table, List<String> columns) {
+                return columns.stream().map(column -> getColumnStatistic(table, column)).collect(Collectors.toList());
+            }
+        };
+
+        String sql = "select * from t0 left outer join t1 on t0.v1 = t1.v4 and t1.v5 < t0.v2 and t0.v2 < t1.v6";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "     TABLE: t1\n" +
+                "     PREAGGREGATION: ON\n" +
+                "     PREDICATES: 5: v5 <= CAST('test_max_v2' AS BIGINT), 6: v6 >= CAST('test_min_v2' AS BIGINT)");
+
+        sql = "select * from t0 left outer join t1 on t0.v1 = t1.v4 and t1.v5 > t0.v2 and t0.v2 > t1.v6";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "     TABLE: t1\n" +
+                "     PREAGGREGATION: ON\n" +
+                "     PREDICATES: 5: v5 >= CAST('test_min_v2' AS BIGINT), 6: v6 <= CAST('test_max_v2' AS BIGINT)");
+
+        sql = "select * from t0 left outer join t1 on t0.v1 = t1.v4 and t1.v5 > t0.v2 and t0.v2 > t1.v6" +
+                " and t0.v2 > t1.v4";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "TABLE: t1\n" +
+                "     PREAGGREGATION: ON\n" +
+                "     PREDICATES: 5: v5 >= CAST('test_min_v2' AS BIGINT), 6: v6 <= CAST('test_max_v2' AS BIGINT), " +
+                "4: v4 <= CAST('test_max_v2' AS BIGINT)");
+
+        sql = "select * from t0 left outer join t2 on t0.v1 = t2.v7 left outer join t1 on t0.v1 = t1.v4 and " +
+                "t1.v5 > t0.v2 and t0.v2 > t1.v6" +
+                " and t0.v2 > t1.v4";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "TABLE: t1\n" +
+                "     PREAGGREGATION: ON\n" +
+                "     PREDICATES: 8: v5 >= CAST('test_min_v2' AS BIGINT), 9: v6 <= CAST('test_max_v2' AS BIGINT), " +
+                "7: v4 <= CAST('test_max_v2' AS BIGINT)\n" +
+                "     partitions=1/1");
+
+        sql = "select * from t0 left outer join t1 on t0.v1 = t1.v4 + t1.v5  and t1.v4 + t1.v5 < t0.v2 and " +
+                "t0.v2 < t1.v4 + t1.v6";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "0:OlapScanNode\n" +
+                "     TABLE: t1\n" +
+                "     PREAGGREGATION: ON\n" +
+                "     PREDICATES: 4: v4 + 5: v5 <= CAST('test_max_v2' AS BIGINT), " +
+                "4: v4 + 6: v6 >= CAST('test_min_v2' AS BIGINT)\n" +
+                "     partitions=1/1");
+    }
+
+    @Test
+    public void testNotAlwaysNullProjection() throws Exception {
+        String sql = "select * from (select c.*, ifnull(p_name, 0) from customer c left join part n on C_ADDRESS = P_NAME) " +
+                "t join nation on C_CUSTKEY = n_nationkey;";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "|  <slot 20> : ifnull(11: P_NAME, '0')\n" +
+                "  |  \n" +
+                "  4:HASH JOIN\n" +
+                "  |  join op: LEFT OUTER JOIN (PARTITIONED)\n" +
+                "  |  colocate: false, reason: \n" +
+                "  |  equal join conjunct: 3: C_ADDRESS = 11: P_NAME");
+
+    }
+
+    @Test
+    public void testNdvInOrPredicate() throws Exception {
+        String sql = "select count(*) from customer where C_NAME = 'b' or C_NATIONKEY = 1";
+        String plan = getCostExplain(sql);
+        assertCContains(plan, "C_NAME-->[-Infinity, Infinity, 0.0, 25.0, 600000.0] ESTIMATE",
+                "C_NATIONKEY-->[0.0, 24.0, 0.0, 4.0, 25.0] ESTIMATE");
     }
 }

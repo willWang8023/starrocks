@@ -1,184 +1,222 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.service;
 
-import com.starrocks.analysis.UserIdentity;
-import com.starrocks.catalog.Column;
-import com.starrocks.catalog.Database;
-import com.starrocks.catalog.HashDistributionInfo;
-import com.starrocks.catalog.KeysType;
-import com.starrocks.catalog.MaterializedIndex;
-import com.starrocks.catalog.MaterializedIndex.IndexState;
-import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.Partition;
-import com.starrocks.catalog.RangePartitionInfo;
-import com.starrocks.catalog.TableProperty;
-import com.starrocks.catalog.Type;
-import com.starrocks.catalog.View;
-import com.starrocks.common.PatternMatcher;
-import com.starrocks.common.util.PropertyAnalyzer;
-import com.starrocks.mysql.privilege.Auth;
-import com.starrocks.mysql.privilege.PrivPredicate;
-import com.starrocks.server.GlobalStateMgr;
+import com.google.gson.Gson;
+import com.starrocks.catalog.system.information.InfoSchemaDb;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.thrift.TAuthInfo;
+import com.starrocks.thrift.TGetPartitionsMetaRequest;
+import com.starrocks.thrift.TGetPartitionsMetaResponse;
+import com.starrocks.thrift.TGetTablesConfigRequest;
+import com.starrocks.thrift.TGetTablesConfigResponse;
 import com.starrocks.thrift.TGetTablesInfoRequest;
 import com.starrocks.thrift.TGetTablesInfoResponse;
+import com.starrocks.thrift.TPartitionMetaInfo;
+import com.starrocks.thrift.TTableConfigInfo;
 import com.starrocks.thrift.TTableInfo;
-import mockit.Mock;
-import mockit.MockUp;
-import mockit.Mocked;   
-import org.apache.thrift.TException;
+import com.starrocks.thrift.TUserIdentity;
+import com.starrocks.utframe.StarRocksAssert;
+import com.starrocks.utframe.UtFrameUtils;
+import mockit.Mocked;
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
-import java.lang.reflect.Field;
-import java.util.ArrayList;
-import java.util.Arrays;
 import java.util.HashMap;
-import java.util.List;
 import java.util.Map;
 
 public class InformationSchemaDataSourceTest {
-    
+
     @Mocked
     ExecuteEnv exeEnv;
+    private static StarRocksAssert starRocksAssert;
 
-    @Mocked
-    GlobalStateMgr globalStateMgr;
+    @BeforeClass
+    public static void beforeClass() throws Exception {
+        UtFrameUtils.createMinStarRocksCluster();
+        UtFrameUtils.addMockBackend(10002);
+        UtFrameUtils.addMockBackend(10003);
+        starRocksAssert = new StarRocksAssert(UtFrameUtils.initCtxForNewPrivilege(UserIdentity.ROOT));
+    }
 
-    @Mocked
-    Auth auth;
-    
     @Test
-    public void testGenerateTablesInfo() throws TException, NoSuchFieldException, 
-        SecurityException, IllegalArgumentException, IllegalAccessException {
+    public void testGetTablesConfig() throws Exception {
 
-        
-        Database db = new Database(1, "test_db");
+        starRocksAssert.withEnableMV().withDatabase("db1").useDatabase("db1");
 
-        List<Column> partitionsColumns = new ArrayList<>();
-        partitionsColumns.add(new Column("p_c1", Type.ARRAY_BOOLEAN));
-        partitionsColumns.add(new Column("p_c2", Type.ARRAY_BOOLEAN));
+        String createTblStmtStr = "CREATE TABLE db1.tbl1 (`k1` int,`k2` int,`k3` int,`v1` int,`v2` int,`v3` int) " +
+                "ENGINE=OLAP " + "PRIMARY KEY(`k1`, `k2`, `k3`) " +
+                "COMMENT \"OLAP\" " +
+                "DISTRIBUTED BY HASH(`k1`, `k2`, `k3`) BUCKETS 3 " +
+                "ORDER BY(`v2`, `v3`) " +
+                "PROPERTIES ('replication_num' = '1');";
+        starRocksAssert.withTable(createTblStmtStr);
 
-        List<Column> dColumns = new ArrayList<>();
-        dColumns.add(new Column("d_c1", Type.ARRAY_BOOLEAN));
-        dColumns.add(new Column("d_c2", Type.ARRAY_BOOLEAN));
-    
-        List<Column> keyColumns = new ArrayList<>();
-        Column keyC1 = new Column("key_c1", Type.ARRAY_BOOLEAN);
-        keyC1.setIsKey(true);
-        Column keyC2 = new Column("key_c2", Type.ARRAY_BOOLEAN);            
-        keyC2.setIsKey(true);
-        keyColumns.add(keyC1);
-        keyColumns.add(keyC2);
-    
-        Map<String, String> properties = new HashMap<>();
-        properties.put(PropertyAnalyzer.PROPERTIES_STORAGE_TYPE, "test_type");
-        TableProperty tProperties = new TableProperty(properties);
-    
-    
-        // OlapTable
-        RangePartitionInfo partitionInfo = new RangePartitionInfo(partitionsColumns);
-        HashDistributionInfo distributionInfo = new HashDistributionInfo(10, dColumns);
-    
-        // PK
-        OlapTable tablePk = new OlapTable(1, "test_table_pk", keyColumns, KeysType.PRIMARY_KEYS, partitionInfo, distributionInfo);
-        MaterializedIndex index = new MaterializedIndex(2, IndexState.NORMAL);
-        index.setRowCount(2000L);
-        Partition partition = new Partition(1, "test_p", index, distributionInfo);
-        
-        Field pvisibleVersionTime = partition.getClass().getDeclaredField("visibleVersionTime");
-        pvisibleVersionTime.setAccessible(true);
-        pvisibleVersionTime.set(partition, 4000L);
+        String createMvStmtStr = "CREATE MATERIALIZED VIEW db1.mv1 " +
+                "DISTRIBUTED BY HASH(k1) BUCKETS 10 " +
+                "REFRESH ASYNC " +
+                "AS SELECT k1, k2 " +
+                "FROM db1.tbl1 ";
 
-        tablePk.addPartition(partition);
-        tablePk.setTableProperty(tProperties);
-        tablePk.setColocateGroup("test_group");
-        tablePk.setComment("test_comment");
-        tablePk.setLastCheckTime(2000L);
-        
-        // View
-        View view = new View(2, "test_view", keyColumns); 
-        db.createTable(tablePk);
-        db.createTable(view);
+        starRocksAssert.withMaterializedView(createMvStmtStr);
 
-    
-        Field field = globalStateMgr.getClass().getDeclaredField("auth");
-        field.setAccessible(true);
-        field.set(globalStateMgr, auth);
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TGetTablesConfigRequest req = new TGetTablesConfigRequest();
+        TAuthInfo authInfo = new TAuthInfo();
+        authInfo.setPattern("db1");
+        authInfo.setUser("root");
+        authInfo.setUser_ip("%");
+        req.setAuth_info(authInfo);
+        TGetTablesConfigResponse response = impl.getTablesConfig(req);
+        TTableConfigInfo tableConfig = response.getTables_config_infos().stream()
+                .filter(t -> t.getTable_name().equals("tbl1")).findFirst()
+                .orElseGet(null);
+        Assert.assertEquals("db1", tableConfig.getTable_schema());
+        Assert.assertEquals("tbl1", tableConfig.getTable_name());
+        Assert.assertEquals("OLAP", tableConfig.getTable_engine());
+        Assert.assertEquals("PRIMARY_KEYS", tableConfig.getTable_model());
+        Assert.assertEquals("`k1`, `k2`, `k3`", tableConfig.getPrimary_key());
+        Assert.assertEquals("", tableConfig.getPartition_key());
+        Assert.assertEquals("`k1`, `k2`, `k3`", tableConfig.getDistribute_key());
+        Assert.assertEquals("HASH", tableConfig.getDistribute_type());
+        Assert.assertEquals(3, tableConfig.getDistribute_bucket());
+        Assert.assertEquals("`v2`, `v3`", tableConfig.getSort_key());
 
-        new MockUp<GlobalStateMgr>() {
-            @Mock
-            public List<String> getDbNames() {
-                return Arrays.asList("test_db");
-            }
-        };
+        TTableConfigInfo mvConfig = response.getTables_config_infos().stream()
+                .filter(t -> t.getTable_engine().equals("MATERIALIZED_VIEW")).findFirst()
+                .orElseGet(null);
+        Assert.assertEquals("MATERIALIZED_VIEW", mvConfig.getTable_engine());
+        Map<String, String> propsMap = new HashMap<>();
+        propsMap = new Gson().fromJson(mvConfig.getProperties(), propsMap.getClass());
+        Assert.assertEquals("1", propsMap.get("replication_num"));
+        Assert.assertEquals("HDD", propsMap.get("storage_medium"));
 
-        new MockUp<Auth>() {
-            @Mock
-            public boolean checkDbPriv(UserIdentity currentUser, String db, PrivPredicate wanted) {
-                return true;
-            }
-        };
+    }
 
-        new MockUp<PatternMatcher>() {
-            @Mock
-            public boolean match(String candidate) {
-                return true;
-            }
-        };
+    @Test
+    public void testGetTablesConfigBasic() throws Exception {
+        starRocksAssert.withEnableMV().withDatabase("db2").useDatabase("db2");
+        String createTblStmtStr = "CREATE TABLE db2.`unique_table_with_null` (\n" +
+                "  `k1` date  COMMENT \"\",\n" +
+                "  `k2` datetime  COMMENT \"\",\n" +
+                "  `k3` varchar(20)  COMMENT \"\",\n" +
+                "  `k4` varchar(20)  COMMENT \"\",\n" +
+                "  `k5` boolean  COMMENT \"\",\n" +
+                "  `v1` tinyint(4)  COMMENT \"\",\n" +
+                "  `v2` smallint(6)  COMMENT \"\",\n" +
+                "  `v3` int(11)  COMMENT \"\",\n" +
+                "  `v4` bigint(20)  COMMENT \"\",\n" +
+                "  `v5` largeint(40)  COMMENT \"\",\n" +
+                "  `v6` float  COMMENT \"\",\n" +
+                "  `v7` double  COMMENT \"\",\n" +
+                "  `v8` decimal128(27, 9)  COMMENT \"\"\n" +
+                ") ENGINE=OLAP\n" +
+                "UNIQUE KEY(`k1`, `k2`, `k3`, `k4`, `k5`)\n" +
+                "COMMENT \"OLAP\"\n" +
+                "DISTRIBUTED BY HASH(`k1`, `k2`, `k3`, `k4`, `k5`) BUCKETS 3\n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\",\n" +
+                "\"in_memory\" = \"false\",\n" +
+                "\"enable_persistent_index\" = \"false\",\n" +
+                "\"compression\" = \"LZ4\"\n" +
+                ");";
+        starRocksAssert.withTable(createTblStmtStr);
 
-        new MockUp<GlobalStateMgr>() {
-            @Mock
-            public Database getDb(String name) {
-                return db;
-            }
-        };
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TGetTablesConfigRequest req = new TGetTablesConfigRequest();
+        TAuthInfo authInfo = new TAuthInfo();
+        authInfo.setPattern("db2");
+        authInfo.setUser("root");
+        authInfo.setUser_ip("%");
+        req.setAuth_info(authInfo);
+        TGetTablesConfigResponse response = impl.getTablesConfig(req);
+        TTableConfigInfo tableConfig = response.getTables_config_infos().stream()
+                .filter(t -> t.getTable_name().equals("unique_table_with_null")).findFirst().orElseGet(null);
+        Assert.assertEquals("db2", tableConfig.getTable_schema());
+        Assert.assertEquals("unique_table_with_null", tableConfig.getTable_name());
+        Assert.assertEquals("OLAP", tableConfig.getTable_engine());
+        Assert.assertEquals("UNIQUE_KEYS", tableConfig.getTable_model());
+        Assert.assertEquals("`k1`, `k2`, `k3`, `k4`, `k5`", tableConfig.getPrimary_key());
+        Assert.assertEquals("", tableConfig.getPartition_key());
+        Assert.assertEquals("`k1`, `k2`, `k3`, `k4`, `k5`", tableConfig.getDistribute_key());
+        Assert.assertEquals("HASH", tableConfig.getDistribute_type());
+        Assert.assertEquals(3, tableConfig.getDistribute_bucket());
+        Assert.assertEquals("`k1`, `k2`, `k3`, `k4`, `k5`", tableConfig.getSort_key());
 
-        new MockUp<MaterializedIndex>() {
-            @Mock
-            public long getDataSize() {
-                return 4000L;
-            }
-        };
-        
+    }
+    @Test
+    public void testGetInformationSchemaTable() throws Exception {
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
         TGetTablesInfoRequest request = new TGetTablesInfoRequest();
         TAuthInfo authInfo = new TAuthInfo();
-        authInfo.setPattern("test parttern");
+        TUserIdentity userIdentity = new TUserIdentity();
+        userIdentity.setUsername("root");
+        userIdentity.setHost("%");
+        userIdentity.setIs_domain(false);
+        authInfo.setCurrent_user_ident(userIdentity);
+        authInfo.setPattern(InfoSchemaDb.DATABASE_NAME);
         request.setAuth_info(authInfo);
-        TGetTablesInfoResponse response = InformationSchemaDataSource.generateTablesInfoResponse(request);
-        
-        List<TTableInfo> infos = response.getTables_infos();
-        infos.forEach(info -> {
-            if (info.getTable_name().equals("test_table_pk")) {
-                Assert.assertTrue(info.getTable_catalog().equals("def"));
-                Assert.assertTrue(info.getTable_schema().equals("test_db"));
-                Assert.assertTrue(info.getTable_name().equals("test_table_pk"));
-                Assert.assertTrue(info.getTable_type().equals("OLAP"));
-                Assert.assertTrue(info.getEngine().equals("StarRocks"));
-                Assert.assertTrue(info.getVersion() == -1L);
-                Assert.assertTrue(info.getRow_format().equals("NULL"));
-                Assert.assertTrue(info.getTable_rows() == 2000L);
-                Assert.assertTrue(info.getAvg_row_length() == 2L);
-                Assert.assertTrue(info.getData_length() == 4000L);
-                Assert.assertTrue(info.getMax_data_length() == -1L);
-                Assert.assertTrue(info.getIndex_length() == -1L);
-                Assert.assertTrue(info.getData_free() == -1L);
-                Assert.assertTrue(info.getAuto_increment() == -1L);
-                // create time
-                Assert.assertTrue(info.getUpdate_time() == 4L);
-                Assert.assertTrue(info.getCheck_time() == 2000L);
-                Assert.assertTrue(info.getTable_collation().equals("utf8_general_ci"));
-                Assert.assertTrue(info.getChecksum() == -1L);
-                Assert.assertTrue(info.getCreate_options().equals("NULL"));
-                Assert.assertTrue(info.getTable_comment().equals("test_comment"));
-            } 
-            if (info.getTable_name().equals("test_view")) {
-                Assert.assertTrue(info.getTable_rows() == -1L);
-                Assert.assertTrue(info.getAvg_row_length() == -1L);
-                Assert.assertTrue(info.getData_length() == -1L);
-                Assert.assertTrue(info.getUpdate_time() == -1L);
+        TGetTablesInfoResponse response = impl.getTablesInfo(request);
+        boolean checkTables = false;
+        for (TTableInfo tablesInfo : response.tables_infos) {
+            if (tablesInfo.getTable_name().equalsIgnoreCase("tables")) {
+                checkTables = true;
+                Assert.assertEquals("SYSTEM VIEW", tablesInfo.getTable_type());
             }
-        });
+        }
+        Assert.assertTrue(checkTables);
+    }
+
+    @Test
+    public void testGetPartitionsMeta() throws Exception {
+        starRocksAssert.withEnableMV().withDatabase("db3").useDatabase("db3");
+        String createTblStmtStr = "CREATE TABLE db3.`duplicate_table_with_null` (\n" +
+                "  `k1` date  COMMENT \"\",\n" +
+                "  `k2` int COMMENT \"\",\n" +
+                "  `k3` varchar(20)  COMMENT \"\",\n" +
+                "  `k4` varchar(20)  COMMENT \"\"\n" +
+                ") ENGINE=OLAP\n" +
+                "DUPLICATE KEY(`k1`, `k2`)\n" +
+                "PARTITION BY RANGE(`k2`)\n" +
+                "(PARTITION p1 VALUES [(\"-2147483648\"), (\"19930101\")))\n" +
+                "DISTRIBUTED BY HASH(`k1`) BUCKETS 3\n" +
+                "PROPERTIES (\n" +
+                "\"replication_num\" = \"1\",\n" +
+                "\"in_memory\" = \"false\",\n" +
+                "\"enable_persistent_index\" = \"false\",\n" +
+                "\"compression\" = \"LZ4\"\n" +
+                ");";
+        starRocksAssert.withTable(createTblStmtStr);
+
+        String ddlStr = "ALTER TABLE db3.`duplicate_table_with_null`\n" +
+                "add TEMPORARY partition p2 VALUES [(\"19930101\"), (\"19940101\"))\n" +
+                "DISTRIBUTED BY HASH(`k1`);";
+        starRocksAssert.ddl(ddlStr);
+
+        FrontendServiceImpl impl = new FrontendServiceImpl(exeEnv);
+        TGetPartitionsMetaRequest req = new TGetPartitionsMetaRequest();
+        TAuthInfo authInfo = new TAuthInfo();
+        authInfo.setPattern("db3");
+        authInfo.setUser("root");
+        authInfo.setUser_ip("%");
+        req.setAuth_info(authInfo);
+        TGetPartitionsMetaResponse response = impl.getPartitionsMeta(req);
+        TPartitionMetaInfo partitionMeta = response.getPartitions_meta_infos().stream()
+                .filter(t -> t.getTable_name().equals("duplicate_table_with_null")).findFirst().orElseGet(null);
+        Assert.assertEquals("db3", partitionMeta.getDb_name());
+        Assert.assertEquals("duplicate_table_with_null", partitionMeta.getTable_name());
     }
 }

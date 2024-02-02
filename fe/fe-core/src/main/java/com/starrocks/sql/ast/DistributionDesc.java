@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.ast;
 
@@ -9,6 +21,7 @@ import com.starrocks.catalog.DistributionInfo.DistributionInfoType;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.sql.parser.NodePosition;
 import org.apache.commons.lang.NotImplementedException;
 
 import java.io.DataInput;
@@ -20,12 +33,22 @@ import java.util.Set;
 public class DistributionDesc implements ParseNode, Writable {
     protected DistributionInfoType type;
 
-    public DistributionDesc() {
+    protected final NodePosition pos;
 
+    public DistributionDesc() {
+        this(NodePosition.ZERO);
+    }
+
+    public DistributionDesc(NodePosition pos) {
+        this.pos = pos;
     }
 
     public void analyze(Set<String> colSet) {
         throw new NotImplementedException();
+    }
+
+    public DistributionInfoType getType() {
+        return type;
     }
 
     public int getBuckets() {
@@ -42,8 +65,12 @@ public class DistributionDesc implements ParseNode, Writable {
             DistributionDesc desc = new HashDistributionDesc();
             desc.readFields(in);
             return desc;
+        } else if (type == DistributionInfoType.RANDOM) {
+            DistributionDesc desc = new RandomDistributionDesc();
+            desc.readFields(in);
+            return desc;
         } else {
-            throw new IOException("Unknow distribution type: " + type);
+            throw new IOException("Unknown distribution type: " + type);
         }
     }
 
@@ -54,5 +81,10 @@ public class DistributionDesc implements ParseNode, Writable {
 
     public void readFields(DataInput in) throws IOException {
         throw new NotImplementedException();
+    }
+
+    @Override
+    public NodePosition getPos() {
+        return pos;
     }
 }

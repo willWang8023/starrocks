@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -24,8 +36,6 @@ public:
     // The result should be guaranteed to not end with "/"
     virtual std::string root_location(int64_t tablet_id) const = 0;
 
-    virtual Status list_root_locations(std::set<std::string>* groups) const = 0;
-
     std::string metadata_root_location(int64_t tablet_id) const {
         return join_path(root_location(tablet_id), kMetadataDirectoryName);
     }
@@ -46,6 +56,10 @@ public:
         return join_path(txn_log_root_location(tablet_id), txn_log_filename(tablet_id, txn_id));
     }
 
+    std::string txn_slog_location(int64_t tablet_id, int64_t txn_id) const {
+        return join_path(txn_log_root_location(tablet_id), txn_slog_filename(tablet_id, txn_id));
+    }
+
     std::string txn_vlog_location(int64_t tablet_id, int64_t version) const {
         return join_path(txn_log_root_location(tablet_id), txn_vlog_filename(tablet_id, version));
     }
@@ -54,9 +68,16 @@ public:
         return join_path(segment_root_location(tablet_id), segment_name);
     }
 
-    std::string tablet_metadata_lock_location(int64_t tablet_id, int64_t version, int64_t expire_time) const {
-        return join_path(metadata_root_location(tablet_id),
-                         tablet_metadata_lock_filename(tablet_id, version, expire_time));
+    std::string del_location(int64_t tablet_id, std::string_view del_name) const {
+        return join_path(segment_root_location(tablet_id), del_name);
+    }
+
+    std::string delvec_location(int64_t tablet_id, std::string_view delvec_name) const {
+        return join_path(segment_root_location(tablet_id), delvec_name);
+    }
+
+    std::string schema_file_location(int64_t tablet_id, int64_t schema_id) const {
+        return join_path(root_location(tablet_id), schema_filename(schema_id));
     }
 
 private:

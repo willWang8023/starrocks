@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "runtime/decimalv3.h"
 
@@ -122,6 +134,21 @@ TEST_F(TestDecimalV3, testFloatDecimal32Cast) {
             {0.001953125, 9, 9, false, 0.001953125},
             {100.001953125, 9, 9, true, 100.001953125},
             {1000.001953125, 9, 9, true, 1000.001953125},
+    };
+    test_float_decimal_cast<float, int32_t>(cases);
+    test_float_decimal_cast<double, int32_t>(cases);
+}
+
+TEST_F(TestDecimalV3, testFloatDecimal32CastRound) {
+    FloatDecimalCaseCases cases = {
+            {3.2519, 9, 2, false, 3.25},
+            {3.2549, 9, 2, false, 3.25},
+            {3.2550, 9, 2, false, 3.26},
+            {-3.2519, 9, 2, false, -3.25},
+            {-3.2549, 9, 2, false, -3.25},
+            {-3.2550, 9, 2, false, -3.26},
+            {100.0019531254, 9, 9, true, 100.001953125},
+            {1000.0019531255, 9, 9, true, 1000.001953125},
     };
     test_float_decimal_cast<float, int32_t>(cases);
     test_float_decimal_cast<double, int32_t>(cases);

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -6,10 +18,7 @@
 // clang-format off
 #include "common/compiler_util.h" // DIAGNOSTIC_PUSH
 
-DIAGNOSTIC_PUSH
-DIAGNOSTIC_IGNORE("-Wclass-memaccess")
 #include <bthread/execution_queue.h>
-DIAGNOSTIC_POP
 
 // clang-format on
 
@@ -25,7 +34,7 @@ class ThreadPool;
 namespace starrocks::bthreads {
 
 // Used to run bthread::ExecutionQueue task in pthread instead of bthread.
-// Reference: https://github.com/apache/incubator-brpc/blob/master/docs/cn/execution_queue.md
+// Reference: https://github.com/apache/brpc/blob/master/docs/cn/execution_queue.md
 class ThreadPoolExecutor : public bthread::Executor {
 public:
     constexpr static int64_t kDefaultBusySleepMs = 50;
@@ -43,6 +52,8 @@ public:
         assert(_thread_pool == nullptr);
         _thread_pool = thread_pool;
     }
+
+    ThreadPool* get_thread_pool() { return _thread_pool; }
 
     void set_ownership(Ownership ownership) { _ownership = ownership; }
 

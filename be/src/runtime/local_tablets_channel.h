@@ -1,17 +1,28 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
-#include "common/compiler_util.h"
-DIAGNOSTIC_PUSH
-DIAGNOSTIC_IGNORE("-Wclass-memaccess")
 #include <brpc/controller.h>
 #include <bthread/condition_variable.h>
 #include <bthread/mutex.h>
-DIAGNOSTIC_POP
+
+#include "common/compiler_util.h"
 #include "runtime/tablets_channel.h"
 #include "service/backend_options.h"
 #include "storage/async_delta_writer.h"
+#include "util/bthreads/bthread_shared_mutex.h"
 #include "util/countdown_latch.h"
 
 namespace brpc {
@@ -23,12 +34,6 @@ namespace starrocks {
 class MemTracker;
 
 class LocalTabletsChannel : public TabletsChannel {
-    using AsyncDeltaWriter = vectorized::AsyncDeltaWriter;
-    using AsyncDeltaWriterCallback = vectorized::AsyncDeltaWriterCallback;
-    using AsyncDeltaWriterRequest = vectorized::AsyncDeltaWriterRequest;
-    using AsyncDeltaWriterSegmentRequest = vectorized::AsyncDeltaWriterSegmentRequest;
-    using CommittedRowsetInfo = vectorized::CommittedRowsetInfo;
-
 public:
     LocalTabletsChannel(LoadChannel* load_channel, const TabletsChannelKey& key, MemTracker* mem_tracker);
     ~LocalTabletsChannel() override;
@@ -40,17 +45,23 @@ public:
 
     const TabletsChannelKey& key() const { return _key; }
 
-    Status open(const PTabletWriterOpenRequest& params, std::shared_ptr<OlapTableSchemaParam> schema) override;
+    Status open(const PTabletWriterOpenRequest& params, PTabletWriterOpenResult* result,
+                std::shared_ptr<OlapTableSchemaParam> schema, bool is_incremental) override;
 
-    void add_chunk(vectorized::Chunk* chunk, const PTabletWriterAddChunkRequest& request,
+    void add_chunk(Chunk* chunk, const PTabletWriterAddChunkRequest& request,
                    PTabletWriterAddBatchResult* response) override;
+
+    Status incremental_open(const PTabletWriterOpenRequest& params, PTabletWriterOpenResult* result,
+                            std::shared_ptr<OlapTableSchemaParam> schema) override;
 
     void add_segment(brpc::Controller* cntl, const PTabletWriterAddSegmentRequest* request,
                      PTabletWriterAddSegmentResult* response, google::protobuf::Closure* done);
 
     void cancel() override;
 
-    void cancel(int64_t tablet_id);
+    void abort() override;
+
+    void abort(const std::vector<int64_t>& tablet_ids, const std::string& reason) override;
 
     MemTracker* mem_tracker() { return _mem_tracker; }
 
@@ -66,6 +77,7 @@ private:
         std::set<int64_t> success_sliding_window;
 
         int64_t last_sliding_packet_seq = -1;
+        bool has_incremental_open = false;
     };
 
     class WriteContext {
@@ -73,12 +85,12 @@ private:
         explicit WriteContext(PTabletWriterAddBatchResult* response)
                 : _response_lock(),
                   _response(response),
-                  _latch(nullptr),
+
                   _chunk(),
                   _row_indexes(),
                   _channel_row_idx_start_points() {}
 
-        ~WriteContext() {
+        ~WriteContext() noexcept {
             if (_latch) _latch->count_down();
         }
 
@@ -102,6 +114,22 @@ private:
             _response->add_tablet_vec()->Swap(tablet_info);
         }
 
+        void add_failed_tablet_info(PTabletInfo* tablet_info) {
+            DCHECK(_response != nullptr);
+            std::lock_guard l(_response_lock);
+            _response->add_failed_tablet_vec()->Swap(tablet_info);
+        }
+
+        void add_failed_replica_node_id(int64_t node_id, int64_t tablet_id) {
+            DCHECK(_response != nullptr);
+            std::lock_guard l(_response_lock);
+            (*_node_id_to_abort_tablets)[node_id].emplace_back(tablet_id);
+        }
+
+        void set_node_id_to_abort_tablets(std::unordered_map<int64_t, std::vector<int64_t>>* node_id_to_abort_tablets) {
+            _node_id_to_abort_tablets = node_id_to_abort_tablets;
+        }
+
         void set_count_down_latch(BThreadCountDownLatch* latch) { _latch = latch; }
 
     private:
@@ -109,11 +137,12 @@ private:
 
         mutable bthread::Mutex _response_lock;
         PTabletWriterAddBatchResult* _response;
-        BThreadCountDownLatch* _latch;
+        BThreadCountDownLatch* _latch{nullptr};
 
-        vectorized::Chunk _chunk;
+        Chunk _chunk;
         std::unique_ptr<uint32_t[]> _row_indexes;
         std::unique_ptr<uint32_t[]> _channel_row_idx_start_points;
+        std::unordered_map<int64_t, std::vector<int64_t>>* _node_id_to_abort_tablets;
     };
 
     class WriteCallback : public AsyncDeltaWriterCallback {
@@ -122,7 +151,7 @@ private:
 
         ~WriteCallback() override = default;
 
-        void run(const Status& st, const CommittedRowsetInfo* info) override;
+        void run(const Status& st, const CommittedRowsetInfo* info, const FailedRowsetInfo* failed_info) override;
 
         WriteCallback(const WriteCallback&) = delete;
         void operator=(const WriteCallback&) = delete;
@@ -135,11 +164,19 @@ private:
 
     Status _open_all_writers(const PTabletWriterOpenRequest& params);
 
-    StatusOr<std::shared_ptr<WriteContext>> _create_write_context(vectorized::Chunk* chunk,
+    StatusOr<std::shared_ptr<WriteContext>> _create_write_context(Chunk* chunk,
                                                                   const PTabletWriterAddChunkRequest& request,
                                                                   PTabletWriterAddBatchResult* response);
 
     int _close_sender(const int64_t* partitions, size_t partitions_size);
+
+    void _commit_tablets(const PTabletWriterAddChunkRequest& request,
+                         const std::shared_ptr<LocalTabletsChannel::WriteContext>& context);
+
+    void _abort_replica_tablets(const PTabletWriterAddChunkRequest& request, const std::string& abort_reason,
+                                const std::unordered_map<int64_t, std::vector<int64_t>>& node_id_to_abort_tablets);
+
+    void _flush_stale_memtables();
 
     LoadChannel* _load_channel;
 
@@ -154,22 +191,34 @@ private:
     std::shared_ptr<OlapTableSchemaParam> _schema;
     TupleDescriptor* _tuple_desc = nullptr;
 
-    // next sequence we expect
-    std::atomic<int> _num_remaining_senders;
     std::vector<Sender> _senders;
     size_t _max_sliding_window_size = config::max_load_dop * 3;
 
     mutable bthread::Mutex _partitions_ids_lock;
     std::unordered_set<int64_t> _partition_ids;
 
+    // rw mutex to protect the following two maps
+    mutable bthreads::BThreadSharedMutex _rw_mtx;
     std::unordered_map<int64_t, uint32_t> _tablet_id_to_sorted_indexes;
     // tablet_id -> TabletChannel
     std::unordered_map<int64_t, std::unique_ptr<AsyncDeltaWriter>> _delta_writers;
 
-    vectorized::GlobalDictByNameMaps _global_dicts;
+    GlobalDictByNameMaps _global_dicts;
     std::unique_ptr<MemPool> _mem_pool;
 
     bool _is_replicated_storage = false;
+
+    std::unordered_map<int64_t, PNetworkAddress> _node_id_to_endpoint;
+
+    // Initially load tablets are not present on this node, so there will be no TabletsChannel.
+    // After the partition is created during data loading, there are some tablets of the new partitions on this node,
+    // so a TabletsChannel needs to be created, such that _is_incremental_channel=true
+    bool _is_incremental_channel = false;
+
+    mutable bthread::Mutex _status_lock;
+    Status _status = Status::OK();
+
+    std::set<int64_t> _immutable_partition_ids;
 };
 
 std::shared_ptr<TabletsChannel> new_local_tablets_channel(LoadChannel* load_channel, const TabletsChannelKey& key,

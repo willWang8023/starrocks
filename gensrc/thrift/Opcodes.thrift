@@ -83,4 +83,16 @@ enum TExprOpcode {
     FACTORIAL,
     LAST_OPCODE,
     EQ_FOR_NULL,
+    BIT_SHIFT_LEFT,
+    BIT_SHIFT_RIGHT,
+    BIT_SHIFT_RIGHT_LOGICAL,
+    JIT,
+}
+
+// Stream Operation Types
+enum TStreamOpType {
+    INSERT = 0,
+    UPDATE_BEFORE = 1,
+    UPDATE_AFTER = 2,
+    DELETE = 3,
 }

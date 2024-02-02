@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/async_delta_writer.h"
 
@@ -8,7 +20,7 @@
 #include "storage/segment_flush_executor.h"
 #include "storage/storage_engine.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 AsyncDeltaWriter::~AsyncDeltaWriter() {
     _close();
@@ -20,6 +32,7 @@ int AsyncDeltaWriter::_execute(void* meta, bthread::TaskIterator<AsyncDeltaWrite
         return 0;
     }
     auto writer = static_cast<DeltaWriter*>(meta);
+    bool flush_after_write = false;
     for (; iter; ++iter) {
         Status st;
         if (iter->abort) {
@@ -29,26 +42,44 @@ int AsyncDeltaWriter::_execute(void* meta, bthread::TaskIterator<AsyncDeltaWrite
         if (iter->chunk != nullptr && iter->indexes_size > 0) {
             st = writer->write(*iter->chunk, iter->indexes, 0, iter->indexes_size);
         }
+
+        if (iter->flush_after_write) {
+            flush_after_write = true;
+            continue;
+        }
+        FailedRowsetInfo failed_info{.tablet_id = writer->tablet()->tablet_id(),
+                                     .replicate_token = writer->replicate_token()};
         if (st.ok() && iter->commit_after_write) {
             if (st = writer->close(); !st.ok()) {
-                iter->write_cb->run(st, nullptr);
+                LOG(WARNING) << "Fail to write or commit. txn_id: " << writer->txn_id()
+                             << " tablet_id: " << writer->tablet()->tablet_id() << ": " << st;
+                iter->write_cb->run(st, nullptr, &failed_info);
                 continue;
             }
             if (st = writer->commit(); !st.ok()) {
-                iter->write_cb->run(st, nullptr);
+                LOG(WARNING) << "Fail to write or commit. txn_id: " << writer->txn_id()
+                             << " tablet_id: " << writer->tablet()->tablet_id() << ": " << st;
+                iter->write_cb->run(st, nullptr, &failed_info);
                 continue;
             }
             CommittedRowsetInfo info{.tablet = writer->tablet(),
                                      .rowset = writer->committed_rowset(),
                                      .rowset_writer = writer->committed_rowset_writer(),
                                      .replicate_token = writer->replicate_token()};
-            iter->write_cb->run(st, &info);
+            iter->write_cb->run(st, &info, nullptr);
+        } else if (st.ok()) {
+            iter->write_cb->run(st, nullptr, nullptr);
         } else {
-            iter->write_cb->run(st, nullptr);
+            iter->write_cb->run(st, nullptr, &failed_info);
         }
         // Do NOT touch |iter->commit_cb| since here, it may have been deleted.
-        LOG_IF(ERROR, !st.ok()) << "Fail to write or commit. txn_id=" << writer->txn_id()
-                                << " tablet_id=" << writer->tablet()->tablet_id() << ": " << st;
+        LOG_IF(ERROR, !st.ok()) << "Fail to write or commit. txn_id: " << writer->txn_id()
+                                << " tablet_id: " << writer->tablet()->tablet_id() << ": " << st;
+    }
+    if (flush_after_write) {
+        auto st = writer->flush_memtable_async(false);
+        LOG_IF(WARNING, !st.ok()) << "Fail to flush. txn_id: " << writer->txn_id()
+                                  << " tablet_id: " << writer->tablet()->tablet_id() << ": " << st;
     }
     return 0;
 }
@@ -76,11 +107,6 @@ Status AsyncDeltaWriter::_init() {
     if (int r = bthread::execution_queue_start(&_queue_id, &opts, _execute, _writer.get()); r != 0) {
         return Status::InternalError(fmt::format("fail to create bthread execution queue: {}", r));
     }
-    _segment_flush_executor =
-            std::move(StorageEngine::instance()->segment_flush_executor()->create_flush_token(_writer));
-    if (_segment_flush_executor == nullptr) {
-        return Status::InternalError("SegmentFlushExecutor init failed");
-    }
     return Status::OK();
 }
 
@@ -95,12 +121,25 @@ void AsyncDeltaWriter::write(const AsyncDeltaWriterRequest& req, AsyncDeltaWrite
     int r = bthread::execution_queue_execute(_queue_id, task);
     if (r != 0) {
         LOG(WARNING) << "Fail to execution_queue_execute: " << r;
-        task.write_cb->run(Status::InternalError("fail to call execution_queue_execute"), nullptr);
+        FailedRowsetInfo failed_info{.tablet_id = _writer->tablet()->tablet_id(), .replicate_token = nullptr};
+        task.write_cb->run(Status::InternalError("fail to call execution_queue_execute"), nullptr, &failed_info);
+    }
+}
+
+void AsyncDeltaWriter::flush() {
+    Task task;
+    task.chunk = nullptr;
+    task.indexes = nullptr;
+    task.indexes_size = 0;
+    task.flush_after_write = true;
+    if (int r = bthread::execution_queue_execute(_queue_id, task); r != 0) {
+        LOG(WARNING) << "Fail to execution_queue_execute tablet_id: " << _writer->tablet()->tablet_id()
+                     << " ret: " << r;
     }
 }
 
 void AsyncDeltaWriter::write_segment(const AsyncDeltaWriterSegmentRequest& req) {
-    auto st = _segment_flush_executor->submit(req.cntl, req.request, req.response, req.done);
+    auto st = _writer->segment_flush_token()->submit(_writer.get(), req.cntl, req.request, req.response, req.done);
     if (!st.ok()) {
         LOG(WARNING) << "Failed to submit write segment, err=" << st;
     }
@@ -117,8 +156,13 @@ void AsyncDeltaWriter::commit(AsyncDeltaWriterCallback* cb) {
     int r = bthread::execution_queue_execute(_queue_id, task);
     if (r != 0) {
         LOG(WARNING) << "Fail to execution_queue_execute: " << r;
-        task.write_cb->run(Status::InternalError("fail to call execution_queue_execute"), nullptr);
+        FailedRowsetInfo failed_info{.tablet_id = _writer->tablet()->tablet_id(), .replicate_token = nullptr};
+        task.write_cb->run(Status::InternalError("fail to call execution_queue_execute"), nullptr, &failed_info);
     }
+}
+
+void AsyncDeltaWriter::cancel(const Status& st) {
+    _writer->cancel(st);
 }
 
 void AsyncDeltaWriter::abort(bool with_log) {
@@ -127,13 +171,8 @@ void AsyncDeltaWriter::abort(bool with_log) {
     task.abort_with_log = with_log;
 
     bthread::TaskOptions options;
-    options.high_priority = true;
     int r = bthread::execution_queue_execute(_queue_id, task, &options);
     LOG_IF(WARNING, r != 0) << "Fail to execution_queue_execute: " << r;
-
-    if (_segment_flush_executor != nullptr) {
-        _segment_flush_executor->cancel();
-    }
 
     // Wait until all background tasks finished
     // https://github.com/StarRocks/starrocks/issues/8906
@@ -151,10 +190,6 @@ void AsyncDeltaWriter::_close() {
         r = bthread::execution_queue_join(_queue_id);
         LOG_IF(WARNING, r != 0) << "Fail to join execution queue: " << r;
     }
-    // wait is thread-safe
-    if (_segment_flush_executor != nullptr) {
-        _segment_flush_executor->wait();
-    }
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

@@ -1,12 +1,24 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.lake.backup;
 
 import autovalue.shaded.com.google.common.common.collect.Maps;
-import com.clearspring.analytics.util.Lists;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Range;
-import com.staros.proto.ShardStorageInfo;
+import com.staros.proto.FilePathInfo;
 import com.starrocks.backup.BackupJobInfo;
 import com.starrocks.backup.BackupJobInfo.BackupIndexInfo;
 import com.starrocks.backup.BackupJobInfo.BackupTabletInfo;
@@ -15,6 +27,7 @@ import com.starrocks.backup.RestoreFileMapping.IdChain;
 import com.starrocks.backup.RestoreJob;
 import com.starrocks.backup.SnapshotInfo;
 import com.starrocks.backup.Status;
+import com.starrocks.backup.mv.MvRestoreContext;
 import com.starrocks.catalog.DataProperty;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FsBroker;
@@ -23,6 +36,7 @@ import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.PartitionKey;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.RangePartitionInfo;
 import com.starrocks.catalog.Tablet;
 import com.starrocks.catalog.TabletMeta;
@@ -33,12 +47,13 @@ import com.starrocks.common.io.Text;
 import com.starrocks.lake.LakeTable;
 import com.starrocks.lake.LakeTablet;
 import com.starrocks.lake.StorageInfo;
-import com.starrocks.lake.proto.RestoreInfo;
-import com.starrocks.lake.proto.RestoreSnapshotsRequest;
-import com.starrocks.lake.proto.RestoreSnapshotsResponse;
 import com.starrocks.persist.gson.GsonUtils;
+import com.starrocks.proto.RestoreInfo;
+import com.starrocks.proto.RestoreSnapshotsRequest;
+import com.starrocks.proto.RestoreSnapshotsResponse;
 import com.starrocks.rpc.BrpcProxy;
 import com.starrocks.rpc.LakeService;
+import com.starrocks.rpc.RpcException;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.system.Backend;
 import com.starrocks.thrift.THdfsProperties;
@@ -64,13 +79,15 @@ public class LakeRestoreJob extends RestoreJob {
 
     private Map<Long, Future<RestoreSnapshotsResponse>> responses = Maps.newHashMap();
 
-    public LakeRestoreJob() {}
+    public LakeRestoreJob() {
+    }
 
     public LakeRestoreJob(String label, String backupTs, long dbId, String dbName, BackupJobInfo jobInfo,
                           boolean allowLoad, int restoreReplicationNum, long timeoutMs,
-                          GlobalStateMgr globalStateMgr, long repoId, BackupMeta backupMeta) {
+                          GlobalStateMgr globalStateMgr, long repoId, BackupMeta backupMeta,
+                          MvRestoreContext mvRestoreContext) {
         super(label, backupTs, dbId, dbName, jobInfo, allowLoad, restoreReplicationNum, timeoutMs,
-                globalStateMgr, repoId, backupMeta);
+                globalStateMgr, repoId, backupMeta, mvRestoreContext);
         this.type = JobType.LAKE_RESTORE;
     }
 
@@ -111,7 +128,8 @@ public class LakeRestoreJob extends RestoreJob {
                 Partition part = tbl.getPartition(idChain.getPartId());
                 MaterializedIndex index = part.getIndex(idChain.getIdxId());
                 tablet = (LakeTablet) index.getTablet(idChain.getTabletId());
-                Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackend(tablet.getPrimaryBackendId());
+                Backend backend = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo()
+                        .getBackend(tablet.getPrimaryComputeNodeId());
                 LakeTableSnapshotInfo info = new LakeTableSnapshotInfo(db.getId(), idChain.getTblId(),
                         idChain.getPartId(), idChain.getIdxId(), idChain.getTabletId(),
                         backend.getId(), tbl.getSchemaHashByIndexId(index.getId()), -1);
@@ -190,8 +208,13 @@ public class LakeRestoreJob extends RestoreJob {
     @Override
     protected void sendDownloadTasks() {
         for (Map.Entry<Long, RestoreSnapshotsRequest> entry : requests.entrySet()) {
-            Backend backend = GlobalStateMgr.getCurrentSystemInfo().getBackend(entry.getKey());
-            LakeService lakeService = BrpcProxy.getLakeService(backend.getHost(), backend.getBrpcPort());
+            Backend backend = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackend(entry.getKey());
+            LakeService lakeService = null;
+            try {
+                lakeService = BrpcProxy.getLakeService(backend.getHost(), backend.getBrpcPort());
+            } catch (RpcException e) {
+                throw new RuntimeException(e);
+            }
             Future<RestoreSnapshotsResponse> response = lakeService.restoreSnapshots(entry.getValue());
             responses.put(entry.getKey(), response);
         }
@@ -229,7 +252,7 @@ public class LakeRestoreJob extends RestoreJob {
     }
 
     @Override
-    protected void updateTablets(MaterializedIndex idx, Partition part) {
+    protected void updateTablets(MaterializedIndex idx, PhysicalPartition part) {
         // It is no need to update tablets for lake table.
     }
 
@@ -257,7 +280,7 @@ public class LakeRestoreJob extends RestoreJob {
             TabletMeta tabletMeta = new TabletMeta(dbId, restoreTbl.getId(), restorePart.getId(),
                     restoredIdx.getId(), indexMeta.getSchemaHash(), medium, true);
             for (Tablet restoreTablet : restoredIdx.getTablets()) {
-                GlobalStateMgr.getCurrentInvertedIndex().addTablet(restoreTablet.getId(), tabletMeta);
+                GlobalStateMgr.getCurrentState().getTabletInvertedIndex().addTablet(restoreTablet.getId(), tabletMeta);
             }
         }
     }
@@ -278,7 +301,7 @@ public class LakeRestoreJob extends RestoreJob {
             localPartitionInfo.addPartition(restorePart.getId(), false, remoteRange,
                     remoteDataProperty, (short) restoreReplicationNum,
                     remotePartitionInfo.getIsInMemory(remotePartId),
-                    remotePartitionInfo.getStorageCacheInfo(remotePartId));
+                    remotePartitionInfo.getDataCacheInfo(remotePartId));
             localTbl.addPartition(restorePart);
             if (modify) {
                 // modify tablet inverted index
@@ -290,12 +313,11 @@ public class LakeRestoreJob extends RestoreJob {
     @Override
     protected Status resetTableForRestore(OlapTable remoteOlapTbl, Database db) {
         try {
-            ShardStorageInfo shardStorageInfo = globalStateMgr.getStarOSAgent().getServiceShardStorageInfo();
+            FilePathInfo pathInfo = globalStateMgr.getStarOSAgent().allocateFilePath(db.getId(), remoteOlapTbl.getId());
             LakeTable remoteLakeTbl = (LakeTable) remoteOlapTbl;
             StorageInfo storageInfo = remoteLakeTbl.getTableProperty().getStorageInfo();
-            remoteLakeTbl.setStorageInfo(shardStorageInfo, storageInfo.isEnableStorageCache(),
-                    storageInfo.getStorageCacheTtlS(), storageInfo.isAllowAsyncWriteBack());
-            remoteLakeTbl.resetIdsForRestore(globalStateMgr, db, restoreReplicationNum);
+            remoteLakeTbl.setStorageInfo(pathInfo, storageInfo.getDataCacheInfo());
+            remoteLakeTbl.resetIdsForRestore(globalStateMgr, db, restoreReplicationNum, new MvRestoreContext());
         } catch (DdlException e) {
             return new Status(Status.ErrCode.COMMON_ERROR, e.getMessage());
         }

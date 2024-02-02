@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 #include <memory>
@@ -6,9 +18,10 @@
 
 #include "common/status.h"
 #include "common/statusor.h"
+#include "exprs/function_context.h"
 #include "jni.h"
-#include "runtime/primitive_type.h"
-#include "udf/udf.h"
+#include "types/logical_type.h"
+#include "util/slice.h"
 
 // implements by libhdfs
 // hadoop-hdfs-native-client/src/main/native/libhdfs/jni_helper.c
@@ -28,7 +41,7 @@ extern "C" JNIEnv* getJNIEnv(void);
     jobject new##CLAZZ(TYPE value);  \
     TYPE val##TYPE(jobject obj);
 
-namespace starrocks::vectorized {
+namespace starrocks {
 class DirectByteBuffer;
 class AggBatchCallStub;
 class BatchEvaluateStub;
@@ -85,12 +98,12 @@ public:
     // return: jobject int[]
     jobject int_batch_call(FunctionContext* ctx, jobject callers, jobject method, int rows);
 
-    // type: PrimitiveType
+    // type: LogicalType
     // col: result column
     // jcolumn: Integer[]/String[]
     void get_result_from_boxed_array(FunctionContext* ctx, int type, Column* col, jobject jcolumn, int rows);
 
-    Status get_result_from_boxed_array(int type, Column* col, jobject jcolumn, int rows);
+    [[nodiscard]] Status get_result_from_boxed_array(int type, Column* col, jobject jcolumn, int rows);
 
     // convert int handle to jobject
     // return a local ref
@@ -147,9 +160,9 @@ private:
     jclass _object_class;
     jclass _object_array_class;
     jclass _string_class;
-    jclass _throwable_class;
     jclass _jarrays_class;
     jclass _list_class;
+    jclass _exception_util_class;
 
     jmethodID _string_construct_with_bytes;
 
@@ -161,7 +174,6 @@ private:
 
     jclass _udf_helper_class;
     jmethodID _create_boxed_array;
-    jmethodID _batch_update_single;
     jmethodID _batch_update;
     jmethodID _batch_update_if_not_null;
     jmethodID _batch_update_state;
@@ -225,7 +237,7 @@ public:
     DirectByteBuffer(const DirectByteBuffer&) = delete;
     DirectByteBuffer& operator=(const DirectByteBuffer& other) = delete;
 
-    DirectByteBuffer(DirectByteBuffer&& other) {
+    DirectByteBuffer(DirectByteBuffer&& other) noexcept {
         _handle = other._handle;
         _data = other._data;
         _capacity = other._capacity;
@@ -235,7 +247,7 @@ public:
         other._capacity = 0;
     }
 
-    DirectByteBuffer& operator=(DirectByteBuffer&& other) {
+    DirectByteBuffer& operator=(DirectByteBuffer&& other) noexcept {
         DirectByteBuffer tmp(std::move(other));
         std::swap(this->_handle, tmp._handle);
         std::swap(this->_data, tmp._data);
@@ -256,16 +268,16 @@ private:
 // A global ref of the guard, handle can be shared across threads
 class JavaGlobalRef {
 public:
-    JavaGlobalRef(jobject&& handle) : _handle(std::move(handle)) {}
+    JavaGlobalRef(jobject handle) : _handle(handle) {}
     ~JavaGlobalRef();
     JavaGlobalRef(const JavaGlobalRef&) = delete;
 
-    JavaGlobalRef(JavaGlobalRef&& other) {
+    JavaGlobalRef(JavaGlobalRef&& other) noexcept {
         _handle = other._handle;
         other._handle = nullptr;
     }
 
-    JavaGlobalRef& operator=(JavaGlobalRef&& other) {
+    JavaGlobalRef& operator=(JavaGlobalRef&& other) noexcept {
         JavaGlobalRef tmp(std::move(other));
         std::swap(this->_handle, tmp._handle);
         return *this;
@@ -284,15 +296,15 @@ private:
 // A Class object created from the ClassLoader that can be accessed by multiple threads
 class JVMClass {
 public:
-    JVMClass(jobject&& clazz) : _clazz(std::move(clazz)) {}
+    JVMClass(jobject clazz) : _clazz(clazz) {}
     JVMClass(const JVMClass&) = delete;
 
     JVMClass& operator=(const JVMClass&&) = delete;
     JVMClass& operator=(const JVMClass& other) = delete;
 
-    JVMClass(JVMClass&& other) : _clazz(nullptr) { _clazz = std::move(other._clazz); }
+    JVMClass(JVMClass&& other) noexcept : _clazz(nullptr) { _clazz = std::move(other._clazz); }
 
-    JVMClass& operator=(JVMClass&& other) {
+    JVMClass& operator=(JVMClass&& other) noexcept {
         JVMClass tmp(std::move(other));
         std::swap(this->_clazz, tmp._clazz);
         return *this;
@@ -391,7 +403,7 @@ public:
     // get batch call stub
     StatusOr<JVMClass> genCallStub(const std::string& stubClassName, jclass clazz, jobject method, int type);
 
-    Status init();
+    [[nodiscard]] Status init();
 
 private:
     std::string _path;
@@ -402,7 +414,7 @@ private:
 };
 
 struct MethodTypeDescriptor {
-    PrimitiveType type;
+    LogicalType type;
     bool is_box;
     bool is_array;
 };
@@ -421,11 +433,11 @@ class ClassAnalyzer {
 public:
     ClassAnalyzer() = default;
     ~ClassAnalyzer() = default;
-    Status has_method(jclass clazz, const std::string& method, bool* has);
-    Status get_signature(jclass clazz, const std::string& method, std::string* sign);
-    Status get_method_desc(const std::string& sign, std::vector<MethodTypeDescriptor>* desc);
+    [[nodiscard]] Status has_method(jclass clazz, const std::string& method, bool* has);
+    [[nodiscard]] Status get_signature(jclass clazz, const std::string& method, std::string* sign);
+    [[nodiscard]] Status get_method_desc(const std::string& sign, std::vector<MethodTypeDescriptor>* desc);
     StatusOr<jobject> get_method_object(jclass clazz, const std::string& method_name);
-    Status get_udaf_method_desc(const std::string& sign, std::vector<MethodTypeDescriptor>* desc);
+    [[nodiscard]] Status get_udaf_method_desc(const std::string& sign, std::vector<MethodTypeDescriptor>* desc);
 };
 
 struct JavaUDFContext {
@@ -510,4 +522,4 @@ struct JavaUDAFContext {
 // Check whether java runtime can work
 Status detect_java_runtime();
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

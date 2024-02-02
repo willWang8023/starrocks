@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "column/binary_column.h"
 
@@ -8,9 +20,10 @@
 #include "column/const_column.h"
 #include "column/fixed_length_column.h"
 #include "column/nullable_column.h"
+#include "column/vectorized_fwd.h"
 #include "testutil/parallel_test.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // NOLINTNEXTLINE
 PARALLEL_TEST(BinaryColumnTest, test_create) {
@@ -127,7 +140,7 @@ PARALLEL_TEST(BinaryColumnTest, test_filter) {
         column->append(std::to_string(i));
     }
 
-    Column::Filter filter;
+    Filter filter;
     for (int k = 0; k < 100; ++k) {
         filter.push_back(k % 2);
     }
@@ -547,7 +560,7 @@ PARALLEL_TEST(BinaryColumnTest, test_update_rows) {
     auto c2 = BinaryColumn::create();
     c2->append_datum("pq");
     c2->append_datum("rstu");
-    ASSERT_TRUE(c1->update_rows(*c2.get(), replace_idxes.data()).ok());
+    c1->update_rows(*c2.get(), replace_idxes.data());
 
     auto slices = c1->get_data();
     EXPECT_EQ(5, c1->size());
@@ -560,7 +573,7 @@ PARALLEL_TEST(BinaryColumnTest, test_update_rows) {
     auto c3 = BinaryColumn::create();
     c3->append_datum("ab");
     c3->append_datum("cdef");
-    ASSERT_TRUE(c1->update_rows(*c3.get(), replace_idxes.data()).ok());
+    c1->update_rows(*c3.get(), replace_idxes.data());
 
     slices = c1->get_data();
     EXPECT_EQ(5, c1->size());
@@ -574,7 +587,7 @@ PARALLEL_TEST(BinaryColumnTest, test_update_rows) {
     std::vector<uint32_t> new_replace_idxes = {0, 1};
     c4->append_datum("ab");
     c4->append_datum("cdef");
-    ASSERT_TRUE(c1->update_rows(*c4.get(), new_replace_idxes.data()).ok());
+    c1->update_rows(*c4.get(), new_replace_idxes.data());
 
     slices = c1->get_data();
     EXPECT_EQ(5, c1->size());
@@ -620,4 +633,36 @@ PARALLEL_TEST(BinaryColumnTest, test_xor_checksum) {
     ASSERT_EQ(checksum, expected_checksum);
 }
 
-} // namespace starrocks::vectorized
+// NOLINTNEXTLINE
+PARALLEL_TEST(BinaryColumnTest, test_replicate) {
+    auto c1 = BinaryColumn::create();
+    c1->append_datum("abc");
+    c1->append_datum("def");
+
+    Offsets offsets;
+    offsets.push_back(0);
+    offsets.push_back(3);
+    offsets.push_back(5);
+
+    auto c2 = c1->replicate(offsets);
+
+    auto slices = down_cast<BinaryColumn*>(c2.get())->get_data();
+    ASSERT_EQ(5, c2->size());
+    ASSERT_EQ("abc", slices[0]);
+    ASSERT_EQ("abc", slices[1]);
+    ASSERT_EQ("abc", slices[2]);
+    ASSERT_EQ("def", slices[3]);
+    ASSERT_EQ("def", slices[4]);
+}
+
+PARALLEL_TEST(BinaryColumnTest, test_reference_memory_usage) {
+    auto column = BinaryColumn::create();
+    column->append("");
+    column->append("1");
+    column->append("23");
+    column->append("456");
+
+    ASSERT_EQ(0, column->Column::reference_memory_usage());
+}
+
+} // namespace starrocks

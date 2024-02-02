@@ -1,9 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/column_predicate_rewriter.h"
 
 #include <algorithm>
 #include <cstdint>
+#include <limits>
 #include <utility>
 
 #include "column/binary_column.h"
@@ -13,20 +26,22 @@
 #include "column/vectorized_fwd.h"
 #include "common/config.h"
 #include "common/object_pool.h"
+#include "common/statusor.h"
 #include "exprs/expr_context.h"
-#include "exprs/vectorized/in_const_predicate.hpp"
-#include "exprs/vectorized/runtime_filter_bank.h"
+#include "exprs/in_const_predicate.hpp"
+#include "exprs/runtime_filter_bank.h"
 #include "gutil/casts.h"
 #include "runtime/global_dict/config.h"
 #include "runtime/global_dict/miscs.h"
 #include "simd/simd.h"
 #include "storage/column_expr_predicate.h"
+#include "storage/column_predicate.h"
+#include "storage/range.h"
 #include "storage/rowset/column_reader.h"
 #include "storage/rowset/scalar_column_iterator.h"
-#include "storage/vectorized_column_predicate.h"
 
-namespace starrocks::vectorized {
-constexpr static const FieldType kDictCodeType = OLAP_FIELD_TYPE_INT;
+namespace starrocks {
+constexpr static const LogicalType kDictCodeType = TYPE_INT;
 
 Status ColumnPredicateRewriter::rewrite_predicate(ObjectPool* pool) {
     // because schema has reordered
@@ -57,18 +72,18 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
 
     std::vector<const ColumnPredicate*> remove_list;
 
-    for (int i = 0; i < preds.size(); ++i) {
-        const ColumnPredicate* pred = preds[i];
+    for (auto& i : preds) {
+        const ColumnPredicate* pred = i;
         if (PredicateType::kEQ == pred->type()) {
             Datum value = pred->value();
             int code = _column_iterators[cid]->dict_lookup(value.get_slice());
             if (code < 0) {
                 // predicate always false, clear scan range, this will make `get_next` return EOF directly.
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
                 continue;
             }
             auto ptr = new_column_eq_predicate(get_type_info(kDictCodeType), cid, std::to_string(code));
-            preds[i] = pool->add(ptr);
+            i = pool->add(ptr);
             continue;
         }
         if (PredicateType::kNE == pred->type()) {
@@ -77,17 +92,17 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
             if (code < 0) {
                 if (!field->is_nullable()) {
                     // predicate always true, clear this predicate.
-                    remove_list.push_back(preds[i]);
+                    remove_list.push_back(i);
                     continue;
                 } else {
                     // convert this predicate to `not null` predicate.
                     auto ptr = new_column_null_predicate(get_type_info(kDictCodeType), cid, false);
-                    preds[i] = pool->add(ptr);
+                    i = pool->add(ptr);
                     continue;
                 }
             }
             auto ptr = new_column_ne_predicate(get_type_info(kDictCodeType), cid, std::to_string(code));
-            preds[i] = pool->add(ptr);
+            i = pool->add(ptr);
             continue;
         }
         if (PredicateType::kInList == pred->type()) {
@@ -100,7 +115,7 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
             }
             if (codewords.empty()) {
                 // predicate always false, clear scan range.
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
                 continue;
             }
             std::vector<std::string> str_codewords;
@@ -109,7 +124,7 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
                 str_codewords.emplace_back(std::to_string(code));
             }
             auto ptr = new_column_in_predicate(get_type_info(kDictCodeType), cid, str_codewords);
-            preds[i] = pool->add(ptr);
+            i = pool->add(ptr);
         }
         if (PredicateType::kNotInList == pred->type()) {
             std::vector<Datum> values = pred->values();
@@ -122,12 +137,12 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
             if (codewords.empty()) {
                 if (!field->is_nullable()) {
                     // predicate always true, clear this predicate.
-                    remove_list.push_back(preds[i]);
+                    remove_list.push_back(i);
                     continue;
                 } else {
                     // convert this predicate to `not null` predicate.
                     auto ptr = new_column_null_predicate(get_type_info(kDictCodeType), cid, false);
-                    preds[i] = pool->add(ptr);
+                    i = pool->add(ptr);
                     continue;
                 }
             }
@@ -137,10 +152,10 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
                 str_codewords.emplace_back(std::to_string(code));
             }
             auto ptr = new_column_not_in_predicate(get_type_info(kDictCodeType), cid, str_codewords);
-            preds[i] = pool->add(ptr);
+            i = pool->add(ptr);
         }
         if (PredicateType::kGE == pred->type() || PredicateType::kGT == pred->type()) {
-            _get_segment_dict(&sorted_dicts, _column_iterators[cid]);
+            RETURN_IF_ERROR(_get_segment_dict(&sorted_dicts, _column_iterators[cid].get()));
             // use non-padding string value.
             auto value = pred->values()[0].get_slice().to_string();
             auto iter = std::lower_bound(
@@ -160,14 +175,14 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
             }
             if (!str_codewords.empty()) {
                 auto ptr = new_column_in_predicate(get_type_info(kDictCodeType), cid, str_codewords);
-                preds[i] = pool->add(ptr);
+                i = pool->add(ptr);
             } else {
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
                 continue;
             }
         }
         if (PredicateType::kLE == pred->type() || PredicateType::kLT == pred->type()) {
-            _get_segment_dict(&sorted_dicts, _column_iterators[cid]);
+            RETURN_IF_ERROR(_get_segment_dict(&sorted_dicts, _column_iterators[cid].get()));
             // use non-padding string value.
             auto value = pred->values()[0].get_slice().to_string();
             auto iter = std::lower_bound(
@@ -188,9 +203,9 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
             }
             if (!str_codewords.empty()) {
                 auto ptr = new_column_in_predicate(get_type_info(kDictCodeType), cid, str_codewords);
-                preds[i] = pool->add(ptr);
+                i = pool->add(ptr);
             } else {
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
                 continue;
             }
         }
@@ -199,21 +214,22 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
     bool load_seg_dict_vec = false;
     ColumnPtr dict_column;
     ColumnPtr code_column;
-    for (int i = 0; i < preds.size(); ++i) {
-        const ColumnPredicate* pred = preds[i];
+    for (auto& i : preds) {
+        const ColumnPredicate* pred = i;
         if (PredicateType::kExpr == pred->type()) {
             if (!load_seg_dict_vec) {
                 load_seg_dict_vec = true;
-                _get_segment_dict_vec(_column_iterators[cid], &dict_column, &code_column, field->is_nullable());
+                RETURN_IF_ERROR(_get_segment_dict_vec(_column_iterators[cid].get(), &dict_column, &code_column,
+                                                      field->is_nullable()));
             }
 
             ColumnPredicate* ptr;
             ASSIGN_OR_RETURN(bool non_empty,
                              _rewrite_expr_predicate(pool, pred, dict_column, code_column, field->is_nullable(), &ptr));
             if (!non_empty) {
-                _scan_range = _scan_range.intersection(SparseRange());
+                _scan_range = _scan_range.intersection(SparseRange<>());
             } else {
-                preds[i] = pool->add(ptr);
+                i = pool->add(ptr);
             }
         }
     }
@@ -229,10 +245,11 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_predicate(ObjectPool* pool, con
 // This function is only used to rewrite the LE/LT/GE/GT condition.
 // For the greater than or less than condition,
 // you need to get the values of all ordered dictionaries and rewrite them as `InList` expressions
-void ColumnPredicateRewriter::_get_segment_dict(std::vector<std::pair<std::string, int>>* dicts, ColumnIterator* iter) {
+Status ColumnPredicateRewriter::_get_segment_dict(std::vector<std::pair<std::string, int>>* dicts,
+                                                  ColumnIterator* iter) {
     // We already loaded dicts, no need to do once more.
     if (!dicts->empty()) {
-        return;
+        return Status::OK();
     }
     auto column_iterator = down_cast<ScalarColumnIterator*>(iter);
     auto dict_size = column_iterator->dict_size();
@@ -240,7 +257,7 @@ void ColumnPredicateRewriter::_get_segment_dict(std::vector<std::pair<std::strin
     std::iota(dict_codes, dict_codes + dict_size, 0);
 
     auto column = BinaryColumn::create();
-    column_iterator->decode_dict_codes(dict_codes, dict_size, column.get());
+    RETURN_IF_ERROR(column_iterator->decode_dict_codes(dict_codes, dict_size, column.get()));
 
     for (int i = 0; i < dict_size; ++i) {
         dicts->emplace_back(column->get_slice(i).to_string(), dict_codes[i]);
@@ -248,17 +265,18 @@ void ColumnPredicateRewriter::_get_segment_dict(std::vector<std::pair<std::strin
 
     std::sort(dicts->begin(), dicts->end(),
               [](const auto& e1, const auto& e2) { return e1.first.compare(e2.first) < 0; });
+    return Status::OK();
 }
 
-void ColumnPredicateRewriter::_get_segment_dict_vec(ColumnIterator* iter, ColumnPtr* dict_column,
-                                                    ColumnPtr* code_column, bool field_nullable) {
+Status ColumnPredicateRewriter::_get_segment_dict_vec(ColumnIterator* iter, ColumnPtr* dict_column,
+                                                      ColumnPtr* code_column, bool field_nullable) {
     auto column_iterator = down_cast<ScalarColumnIterator*>(iter);
     auto dict_size = column_iterator->dict_size();
     int dict_codes[dict_size];
     std::iota(dict_codes, dict_codes + dict_size, 0);
 
     auto dict_col = BinaryColumn::create();
-    column_iterator->decode_dict_codes(dict_codes, dict_size, dict_col.get());
+    RETURN_IF_ERROR(column_iterator->decode_dict_codes(dict_codes, dict_size, dict_col.get()));
 
     if (field_nullable) {
         // create nullable column with NULL at last.
@@ -279,6 +297,7 @@ void ColumnPredicateRewriter::_get_segment_dict_vec(ColumnIterator* iter, Column
         code_buf[i] = dict_codes[i];
     }
     *code_column = code_col;
+    return Status::OK();
 }
 
 StatusOr<bool> ColumnPredicateRewriter::_rewrite_expr_predicate(ObjectPool* pool, const ColumnPredicate* raw_pred,
@@ -288,8 +307,26 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_expr_predicate(ObjectPool* pool
     *ptr = nullptr;
     size_t value_size = raw_dict_column->size();
     std::vector<uint8_t> selection(value_size);
-    const ColumnExprPredicate* pred = down_cast<const ColumnExprPredicate*>(raw_pred);
-    pred->evaluate(raw_dict_column.get(), selection.data(), 0, value_size);
+    const auto* pred = down_cast<const ColumnExprPredicate*>(raw_pred);
+    size_t chunk_size = std::min<size_t>(pred->runtime_state()->chunk_size(), std::numeric_limits<uint16_t>::max());
+
+    if (value_size <= chunk_size) {
+        RETURN_IF_ERROR(pred->evaluate(raw_dict_column.get(), selection.data(), 0, value_size));
+    } else {
+        auto dict_column = raw_dict_column->clone_empty();
+        SparseRange<> range(0, value_size);
+        auto iter = range.new_iterator();
+        auto selection_cursor = selection.data();
+        while (iter.has_more()) {
+            auto next_range = iter.next(chunk_size);
+            size_t num_rows = next_range.span_size();
+            DCHECK_LE(next_range.begin() + num_rows, raw_dict_column->size());
+            dict_column->append(*raw_dict_column, next_range.begin(), num_rows);
+            RETURN_IF_ERROR(pred->evaluate(dict_column.get(), selection_cursor, 0, num_rows));
+            dict_column->reset_column();
+            selection_cursor += num_rows;
+        }
+    }
 
     size_t code_size = raw_code_column->size();
     const auto& code_column = ColumnHelper::cast_to<TYPE_INT>(raw_code_column);
@@ -330,7 +367,7 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_expr_predicate(ObjectPool* pool
     RuntimeState* state = pred->runtime_state();
     ColumnRef column_ref(pred->slot_desc());
     // change column input type from binary to int(code)
-    TypeDescriptor type_desc = TypeDescriptor::from_primtive_type(TYPE_INT);
+    TypeDescriptor type_desc = TypeDescriptor::from_logical_type(TYPE_INT);
     column_ref._type = type_desc;
     Expr* probe_expr = &column_ref;
 
@@ -341,20 +378,21 @@ StatusOr<bool> ColumnPredicateRewriter::_rewrite_expr_predicate(ObjectPool* pool
     builder.set_is_not_in(is_not_in);
     builder.use_array_set(code_size);
     DCHECK_IF_ERROR(builder.create());
-    builder.add_values(used_values, 0);
+    (void)builder.add_values(used_values, 0);
     ExprContext* filter = builder.get_in_const_predicate();
 
     DCHECK_IF_ERROR(filter->prepare(state));
     DCHECK_IF_ERROR(filter->open(state));
-    *ptr = new ColumnExprPredicate(get_type_info(kDictCodeType), pred->column_id(), state, filter, pred->slot_desc());
+    ASSIGN_OR_RETURN(*ptr, ColumnExprPredicate::make_column_expr_predicate(
+                                   get_type_info(kDictCodeType), pred->column_id(), state, filter, pred->slot_desc()))
     filter->close(state);
 
     return true;
 }
 
-// member function for ConjunctivePredicatesRewriter
+// member function for GlobalDictPredicatesRewriter
 
-Status ConjunctivePredicatesRewriter::rewrite_predicate(ObjectPool* pool) {
+Status GlobalDictPredicatesRewriter::rewrite_predicate(ObjectPool* pool) {
     std::vector<uint8_t> selection;
     auto pred_rewrite = [&](std::vector<const ColumnPredicate*>& preds) {
         for (auto& pred : preds) {
@@ -364,14 +402,14 @@ Status ConjunctivePredicatesRewriter::rewrite_predicate(ObjectPool* pool) {
 
                 auto [binary_column, codes] = extract_column_with_codes(*dict);
 
-                int dict_rows = codes.size();
+                size_t dict_rows = codes.size();
                 selection.resize(dict_rows);
 
                 RETURN_IF_ERROR(pred->evaluate(binary_column.get(), selection.data(), 0, dict_rows));
 
                 std::vector<uint8_t> code_mapping;
                 code_mapping.resize(DICT_DECODE_MAX_SIZE + 1);
-                for (int i = 0; i < codes.size(); ++i) {
+                for (size_t i = 0; i < codes.size(); ++i) {
                     code_mapping[codes[i]] = selection[i];
                 }
 
@@ -423,8 +461,8 @@ Status ZonemapPredicatesRewriter::rewrite_predicate_list(ObjectPool* pool, const
 Status ZonemapPredicatesRewriter::_rewrite_column_expr_predicates(ObjectPool* pool, const ColumnPredicate* pred,
                                                                   std::vector<const ColumnExprPredicate*>* new_preds) {
     DCHECK(new_preds != nullptr);
-    const ColumnExprPredicate* column_expr_pred = static_cast<const ColumnExprPredicate*>(pred);
+    const auto* column_expr_pred = static_cast<const ColumnExprPredicate*>(pred);
     return column_expr_pred->try_to_rewrite_for_zone_map_filter(pool, new_preds);
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

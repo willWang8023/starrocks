@@ -1,12 +1,25 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.optimizer.task;
 
 import com.google.common.base.Preconditions;
+import com.starrocks.common.profile.Timer;
+import com.starrocks.common.profile.Tracers;
 import com.starrocks.qe.SessionVariable;
 import com.starrocks.sql.optimizer.ExpressionContext;
 import com.starrocks.sql.optimizer.OptExpression;
-import com.starrocks.sql.optimizer.OptimizerTraceInfo;
 import com.starrocks.sql.optimizer.OptimizerTraceUtil;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.pattern.Pattern;
@@ -54,15 +67,20 @@ public class RewriteTreeTask extends OptimizerTask {
         SessionVariable sessionVariable = context.getOptimizerContext().getSessionVariable();
 
         for (Rule rule : rules) {
+            if (rule.exhausted(context.getOptimizerContext())) {
+                continue;
+            }
             if (!match(rule.getPattern(), root) || !rule.check(root, context.getOptimizerContext())) {
                 continue;
             }
 
-            List<OptExpression> result = rule.transform(root, context.getOptimizerContext());
+            List<OptExpression> result;
+            try (Timer ignore = Tracers.watchScope(Tracers.Module.OPTIMIZER, rule.getClass().getSimpleName())) {
+                result = rule.transform(root, context.getOptimizerContext());
+            }
             Preconditions.checkState(result.size() <= 1, "Rewrite rule should provide at most 1 expression");
 
-            OptimizerTraceInfo traceInfo = context.getOptimizerContext().getTraceInfo();
-            OptimizerTraceUtil.logApplyRule(sessionVariable, traceInfo, rule, root, result);
+            OptimizerTraceUtil.logApplyRule(context.getOptimizerContext(), rule, root, result);
 
             if (result.isEmpty()) {
                 continue;
@@ -74,6 +92,7 @@ public class RewriteTreeTask extends OptimizerTask {
             deriveLogicalProperty(root);
         }
 
+        // prune cte column depend on prune right child first
         for (int i = root.getInputs().size() - 1; i >= 0; i--) {
             rewrite(root, i, root.getInputs().get(i));
         }
@@ -84,6 +103,10 @@ public class RewriteTreeTask extends OptimizerTask {
             return false;
         }
 
+        if (pattern.children().size() > 0 && pattern.children().size() != root.getInputs().size() &&
+                pattern.children().stream().noneMatch(Pattern::isPatternMultiLeaf)) {
+            return false;
+        }
         int patternIndex = 0;
         int childIndex = 0;
 

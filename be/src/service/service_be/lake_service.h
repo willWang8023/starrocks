@@ -1,27 +1,35 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
+#include <span>
 
-#include "common/config.h"
 #include "gen_cpp/lake_service.pb.h"
-#include "util/threadpool.h"
 
 namespace starrocks {
 
 class ExecEnv;
 
+namespace lake {
+class TabletManager;
+}
+
 class LakeServiceImpl : public ::starrocks::lake::LakeService {
 public:
-    explicit LakeServiceImpl(ExecEnv* env) : _env(env) {
-        auto st = ThreadPoolBuilder("compact")
-                          .set_min_threads(0)
-                          .set_max_threads(config::compact_threads)
-                          .set_max_queue_size(config::compact_thread_pool_queue_size)
-                          .build(&(_compact_thread_pool));
-        CHECK(st.ok()) << st;
-    }
+    explicit LakeServiceImpl(ExecEnv* env, lake::TabletManager* tablet_mgr);
 
-    ~LakeServiceImpl() override = default;
+    ~LakeServiceImpl() override;
 
     void publish_version(::google::protobuf::RpcController* controller,
                          const ::starrocks::lake::PublishVersionRequest* request,
@@ -34,6 +42,10 @@ public:
     void delete_tablet(::google::protobuf::RpcController* controller,
                        const ::starrocks::lake::DeleteTabletRequest* request,
                        ::starrocks::lake::DeleteTabletResponse* response, ::google::protobuf::Closure* done) override;
+
+    void delete_txn_log(::google::protobuf::RpcController* controller,
+                        const ::starrocks::lake::DeleteTxnLogRequest* request,
+                        ::starrocks::lake::DeleteTxnLogResponse* response, ::google::protobuf::Closure* done) override;
 
     void compact(::google::protobuf::RpcController* controller, const ::starrocks::lake::CompactRequest* request,
                  ::starrocks::lake::CompactResponse* response, ::google::protobuf::Closure* done) override;
@@ -52,6 +64,11 @@ public:
                              const ::starrocks::lake::PublishLogVersionRequest* request,
                              ::starrocks::lake::PublishLogVersionResponse* response,
                              ::google::protobuf::Closure* done) override;
+
+    void publish_log_version_batch(::google::protobuf::RpcController* controller,
+                                   const ::starrocks::lake::PublishLogVersionBatchRequest* request,
+                                   ::starrocks::lake::PublishLogVersionResponse* response,
+                                   ::google::protobuf::Closure* done) override;
 
     void lock_tablet_metadata(::google::protobuf::RpcController* controller,
                               const ::starrocks::lake::LockTabletMetadataRequest* request,
@@ -73,10 +90,28 @@ public:
                            ::starrocks::lake::RestoreSnapshotsResponse* response,
                            ::google::protobuf::Closure* done) override;
 
-private:
-    ExecEnv* _env;
+    void abort_compaction(::google::protobuf::RpcController* controller,
+                          const ::starrocks::lake::AbortCompactionRequest* request,
+                          ::starrocks::lake::AbortCompactionResponse* response,
+                          ::google::protobuf::Closure* done) override;
 
-    std::unique_ptr<ThreadPool> _compact_thread_pool;
+    void vacuum(::google::protobuf::RpcController* controller, const ::starrocks::lake::VacuumRequest* request,
+                ::starrocks::lake::VacuumResponse* response, ::google::protobuf::Closure* done) override;
+
+    void vacuum_full(::google::protobuf::RpcController* controller, const ::starrocks::lake::VacuumFullRequest* request,
+                     ::starrocks::lake::VacuumFullResponse* response, ::google::protobuf::Closure* done) override;
+
+private:
+    void _submit_publish_log_version_task(const int64_t* tablet_ids, size_t tablet_size, const int64_t* txn_ids,
+                                          const int64_t* log_versions, size_t txn_size,
+                                          ::starrocks::lake::PublishLogVersionResponse* response);
+
+private:
+    static constexpr int64_t kDefaultTimeoutForGetTabletStat = 5 * 60 * 1000L;  // 5 minutes
+    static constexpr int64_t kDefaultTimeoutForPublishVersion = 1 * 60 * 1000L; // 1 minute
+
+    ExecEnv* _env;
+    lake::TabletManager* _tablet_mgr;
 };
 
 } // namespace starrocks

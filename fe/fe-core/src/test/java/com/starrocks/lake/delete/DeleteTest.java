@@ -1,13 +1,25 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.lake.delete;
 
 import com.google.common.collect.Lists;
-import com.starrocks.analysis.AccessTestUtil;
-import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.BinaryPredicate;
-import com.starrocks.analysis.DeleteStmt;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.IntLiteral;
+import com.starrocks.analysis.IsNullPredicate;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.TableName;
@@ -28,17 +40,18 @@ import com.starrocks.common.UserException;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.lake.LakeTable;
 import com.starrocks.lake.LakeTablet;
-import com.starrocks.lake.proto.DeleteDataRequest;
-import com.starrocks.lake.proto.DeleteDataResponse;
-import com.starrocks.load.DeleteHandler;
 import com.starrocks.load.DeleteJob;
-import com.starrocks.mysql.privilege.Auth;
+import com.starrocks.load.DeleteMgr;
 import com.starrocks.persist.EditLog;
+import com.starrocks.proto.DeleteDataRequest;
+import com.starrocks.proto.DeleteDataResponse;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.QueryStateException;
 import com.starrocks.rpc.BrpcProxy;
 import com.starrocks.rpc.LakeService;
 import com.starrocks.rpc.RpcException;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.sql.ast.PartitionNames;
 import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
@@ -88,9 +101,8 @@ public class DeleteTest {
     private LakeService lakeService;
 
     private Database db;
-    private Auth auth;
-    private Analyzer analyzer;
-    private DeleteHandler deleteHandler;
+    private ConnectContext connectContext = new ConnectContext();
+    private DeleteMgr deleteHandler;
 
     private Database createDb() {
         // Schema
@@ -124,7 +136,7 @@ public class DeleteTest {
         table.setIndexMeta(indexId, "t1", columns, 0, 0, (short) 3, TStorageType.COLUMN, KeysType.AGG_KEYS);
 
         Database db = new Database(dbId, dbName);
-        db.createTable(table);
+        db.registerTableUnlocked(table);
         return db;
     }
 
@@ -139,13 +151,13 @@ public class DeleteTest {
                 globalStateMgr.getDb(anyString);
                 result = db;
 
-                GlobalStateMgr.getCurrentGlobalTransactionMgr();
+                GlobalStateMgr.getCurrentState().getGlobalTransactionMgr();
                 result = globalTransactionMgr;
 
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
 
-                systemInfoService.getBackend(anyLong);
+                systemInfoService.getBackendOrComputeNode(anyLong);
                 result = backend;
             }
         };
@@ -153,9 +165,8 @@ public class DeleteTest {
 
     @Before
     public void setUp() {
-        deleteHandler = new DeleteHandler();
-        auth = AccessTestUtil.fetchAdminAccess();
-        analyzer = AccessTestUtil.fetchAdminAnalyzer();
+        connectContext.setGlobalStateMgr(globalStateMgr);
+        deleteHandler = new DeleteMgr();
         db = createDb();
     }
 
@@ -202,7 +213,7 @@ public class DeleteTest {
                     }
                 };
 
-                globalTransactionMgr.commitAndPublishTransaction(db, anyLong, (List) any, anyLong);
+                globalTransactionMgr.commitAndPublishTransaction(db, anyLong, (List) any, (List) any, anyLong);
                 result = true;
 
                 globalTransactionMgr.getTransactionState(anyLong, anyLong);
@@ -210,15 +221,15 @@ public class DeleteTest {
             }
         };
 
-        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryPredicate.Operator.GT, new SlotRef(null, "k1"),
+        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryType.GT, new SlotRef(null, "k1"),
                 new IntLiteral(3));
 
         DeleteStmt deleteStmt = new DeleteStmt(new TableName(dbName, tableName),
                 new PartitionNames(false, Lists.newArrayList(partitionName)), binaryPredicate);
 
         try {
-            deleteStmt.analyze(analyzer);
-        } catch (UserException e) {
+            com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
+        } catch (Exception e) {
             Assert.fail();
         }
 
@@ -276,15 +287,15 @@ public class DeleteTest {
             }
         };
 
-        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryPredicate.Operator.GT, new SlotRef(null, "k1"),
+        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryType.GT, new SlotRef(null, "k1"),
                 new IntLiteral(3));
 
         DeleteStmt deleteStmt = new DeleteStmt(new TableName(dbName, tableName),
                 new PartitionNames(false, Lists.newArrayList(partitionName)), binaryPredicate);
 
         try {
-            deleteStmt.analyze(analyzer);
-        } catch (UserException e) {
+            com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
+        } catch (Exception e) {
             Assert.fail();
         }
 
@@ -301,7 +312,7 @@ public class DeleteTest {
                 globalStateMgr.getDb(anyString);
                 result = db;
 
-                GlobalStateMgr.getCurrentGlobalTransactionMgr();
+                GlobalStateMgr.getCurrentState().getGlobalTransactionMgr();
                 result = globalTransactionMgr;
 
             }
@@ -319,16 +330,28 @@ public class DeleteTest {
         };
 
         // Not supported type
-        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryPredicate.Operator.GT, new SlotRef(null, "v1"),
+        BinaryPredicate binaryPredicate = new BinaryPredicate(BinaryType.GT, new SlotRef(null, "v1"),
                 new StringLiteral("[]"));
         DeleteStmt deleteStmt = new DeleteStmt(new TableName(dbName, tableName),
                 new PartitionNames(false, Lists.newArrayList(partitionName)), binaryPredicate);
 
-        deleteStmt.analyze(analyzer);
+        com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
         try {
             deleteHandler.process(deleteStmt);
         } catch (DdlException e) {
-            Assert.assertTrue(e.getMessage().contains("Type[ARRAY<bigint(20)>] not supported"));
+            Assert.assertTrue(e.getMessage().contains("unsupported delete condition on Array/Map/Struct type column"));
+        }
+
+        // Not supported type
+        IsNullPredicate isNull = new IsNullPredicate(new SlotRef(null, "v1"), true);
+        deleteStmt = new DeleteStmt(new TableName(dbName, tableName),
+                new PartitionNames(false, Lists.newArrayList(partitionName)), isNull);
+
+        com.starrocks.sql.analyzer.Analyzer.analyze(deleteStmt, connectContext);
+        try {
+            deleteHandler.process(deleteStmt);
+        } catch (DdlException e) {
+            Assert.assertTrue(e.getMessage().contains("unsupported delete condition on Array/Map/Struct type"));
         }
     }
 }

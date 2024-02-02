@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -18,6 +30,8 @@ import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.rewrite.ScalarOperatorRewriter;
 import com.starrocks.sql.optimizer.rewrite.ScalarRangePredicateExtractor;
+import com.starrocks.sql.optimizer.rewrite.scalar.PruneTediousPredicateRule;
+import com.starrocks.sql.optimizer.rewrite.scalar.SimplifiedCaseWhenRule;
 import com.starrocks.sql.optimizer.rule.RuleType;
 
 import java.util.List;
@@ -34,15 +48,26 @@ public class PushDownPredicateScanRule extends TransformationRule {
             new PushDownPredicateScanRule(OperatorType.LOGICAL_ICEBERG_SCAN);
     public static final PushDownPredicateScanRule HUDI_SCAN =
             new PushDownPredicateScanRule(OperatorType.LOGICAL_HUDI_SCAN);
+    public static final PushDownPredicateScanRule DELTALAKE_SCAN =
+            new PushDownPredicateScanRule(OperatorType.LOGICAL_DELTALAKE_SCAN);
+    public static final PushDownPredicateScanRule FILE_SCAN =
+            new PushDownPredicateScanRule(OperatorType.LOGICAL_FILE_SCAN);
+    public static final PushDownPredicateScanRule PAIMON_SCAN =
+            new PushDownPredicateScanRule(OperatorType.LOGICAL_PAIMON_SCAN);
     public static final PushDownPredicateScanRule SCHEMA_SCAN =
             new PushDownPredicateScanRule(OperatorType.LOGICAL_SCHEMA_SCAN);
-    public static final PushDownPredicateScanRule MYSQL_SCAN =
-            new PushDownPredicateScanRule(OperatorType.LOGICAL_MYSQL_SCAN);
     public static final PushDownPredicateScanRule ES_SCAN = new PushDownPredicateScanRule(OperatorType.LOGICAL_ES_SCAN);
     public static final PushDownPredicateScanRule META_SCAN =
             new PushDownPredicateScanRule(OperatorType.LOGICAL_META_SCAN);
     public static final PushDownPredicateScanRule JDBC_SCAN =
             new PushDownPredicateScanRule(OperatorType.LOGICAL_JDBC_SCAN);
+    public static final PushDownPredicateScanRule BINLOG_SCAN =
+            new PushDownPredicateScanRule(OperatorType.LOGICAL_BINLOG_SCAN);
+    public static final PushDownPredicateScanRule VIEW_SCAN =
+            new PushDownPredicateScanRule(OperatorType.LOGICAL_VIEW_SCAN);
+
+    public static final PushDownPredicateScanRule TABLE_FUNCTION_TABLE_SCAN =
+            new PushDownPredicateScanRule(OperatorType.LOGICAL_TABLE_FUNCTION_TABLE_SCAN);
 
     public PushDownPredicateScanRule(OperatorType type) {
         super(RuleType.TF_PUSH_DOWN_PREDICATE_SCAN, Pattern.create(OperatorType.LOGICAL_FILTER, type));
@@ -57,18 +82,28 @@ public class PushDownPredicateScanRule extends TransformationRule {
 
         ScalarOperatorRewriter scalarOperatorRewriter = new ScalarOperatorRewriter();
         ScalarOperator predicates = Utils.compoundAnd(lfo.getPredicate(), logicalScanOperator.getPredicate());
+        // simplify case-when
+        if (context.getSessionVariable().isEnableSimplifyCaseWhen()) {
+            predicates = scalarOperatorRewriter.rewrite(predicates, Lists.newArrayList(
+                    SimplifiedCaseWhenRule.INSTANCE,
+                    PruneTediousPredicateRule.INSTANCE
+            ));
+        }
+
         ScalarRangePredicateExtractor rangeExtractor = new ScalarRangePredicateExtractor();
         predicates = rangeExtractor.rewriteOnlyColumn(Utils.compoundAnd(Utils.extractConjuncts(predicates)
                 .stream().map(rangeExtractor::rewriteOnlyColumn).collect(Collectors.toList())));
         Preconditions.checkState(predicates != null);
+
         predicates = scalarOperatorRewriter.rewrite(predicates,
                 ScalarOperatorRewriter.DEFAULT_REWRITE_SCAN_PREDICATE_RULES);
         predicates = Utils.transTrue2Null(predicates);
 
         // clone a new scan operator and rewrite predicate.
         Operator.Builder builder = OperatorBuilderFactory.build(logicalScanOperator);
-        LogicalScanOperator newScanOperator = (LogicalScanOperator) builder.withOperator(logicalScanOperator).build();
-        newScanOperator.setPredicate(predicates);
+        LogicalScanOperator newScanOperator = (LogicalScanOperator) builder.withOperator(logicalScanOperator)
+                .setPredicate(predicates)
+                .build();
         newScanOperator.buildColumnFilters(predicates);
         Map<ColumnRefOperator, ScalarOperator> projectMap =
                 newScanOperator.getOutputColumns().stream()

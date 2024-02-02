@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <cstdint>
 #include <sstream>
@@ -7,9 +19,9 @@
 #include "column/datum.h"
 #include "runtime/global_dict/dict_column.h"
 #include "storage/column_operator_predicate.h"
-#include "storage/vectorized_column_predicate.h"
+#include "storage/column_predicate.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // DictConjuctPredicateOperator for global dictionary optimization.
 // It converts all predicates into code mappings.
@@ -20,7 +32,7 @@ namespace starrocks::vectorized {
 // [2] "RK" -> false
 //
 
-template <FieldType field_type>
+template <LogicalType field_type>
 class DictConjuctPredicateOperator {
 public:
     static constexpr bool skip_null = false;
@@ -37,7 +49,7 @@ public:
 
     static constexpr bool can_vectorized() { return true; }
 
-    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange* range) const {
+    Status seek_bitmap_dictionary(BitmapIndexIterator* iter, SparseRange<>* range) const {
         return Status::Cancelled("not implemented");
     }
 
@@ -55,12 +67,13 @@ public:
 
     bool padding_zeros(size_t len) const { return false; }
 
-    Datum value() const { return Datum(); }
+    Datum value() const { return {}; }
 
     std::vector<Datum> values() const {
         std::vector<Datum> res;
-        for (int i = 0; i < _code_mapping.size(); ++i) {
-            res.emplace_back(int(_code_mapping[i]));
+        res.reserve(_code_mapping.size());
+        for (unsigned char i : _code_mapping) {
+            res.emplace_back(int(i));
         }
         return res;
     }
@@ -72,12 +85,12 @@ private:
 // used in low_card dict code
 ColumnPredicate* new_column_dict_conjuct_predicate(const TypeInfoPtr& type_info, ColumnId id,
                                                    std::vector<uint8_t> dict_mapping) {
-    DCHECK(type_info->type() == OLAP_FIELD_TYPE_INT);
-    if (type_info->type() == OLAP_FIELD_TYPE_INT) {
-        return new ColumnOperatorPredicate<OLAP_FIELD_TYPE_INT, LowCardDictColumn, DictConjuctPredicateOperator,
+    DCHECK(type_info->type() == TYPE_INT);
+    if (type_info->type() == TYPE_INT) {
+        return new ColumnOperatorPredicate<TYPE_INT, LowCardDictColumn, DictConjuctPredicateOperator,
                                            decltype(dict_mapping)>(type_info, id, std::move(dict_mapping));
     }
 
     return nullptr;
 }
-} // namespace starrocks::vectorized
+} // namespace starrocks

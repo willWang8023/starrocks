@@ -17,7 +17,9 @@
 
 package com.starrocks.load;
 
+import com.google.common.base.Objects;
 import com.google.common.base.Strings;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 
@@ -37,7 +39,9 @@ public class FailMsg implements Writable {
         TXN_UNKNOWN // cancelled because txn status is unknown
     }
 
+    @SerializedName("c")
     private CancelType cancelType;
+    @SerializedName("m")
     private String msg = "";
 
     public FailMsg() {
@@ -88,6 +92,12 @@ public class FailMsg implements Writable {
         msg = Text.readString(in);
     }
 
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(cancelType, msg);
+    }
+
+    @Override
     public boolean equals(Object obj) {
         if (obj == this) {
             return true;

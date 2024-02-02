@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -26,37 +38,29 @@ public:
     bool has_output() const override;
     bool is_finished() const override;
 
-    StatusOr<vectorized::ChunkPtr> pull_chunk(RuntimeState* state) override;
+    StatusOr<ChunkPtr> pull_chunk(RuntimeState* state) override;
 
 private:
-    Status _capture_tablet_rowsets();
-
-private:
-    // The row sets of tablets will become stale and be deleted, if compaction occurs
-    // and these row sets aren't referenced, which will typically happen when the tablets
-    // of the left table are compacted at building the right hash table. Therefore, reference
-    // the row sets into _tablet_rowsets in the preparation phase to avoid the row sets being deleted.
-    std::vector<TabletSharedPtr> _tablets;
-    std::vector<std::vector<RowsetSharedPtr>> _tablet_rowsets;
-
     OlapScanContextPtr _ctx;
 };
 
 class OlapScanPrepareOperatorFactory final : public SourceOperatorFactory {
 public:
-    OlapScanPrepareOperatorFactory(int32_t id, int32_t plan_node_id, vectorized::OlapScanNode* const scan_node,
+    OlapScanPrepareOperatorFactory(int32_t id, int32_t plan_node_id, OlapScanNode* const scan_node,
                                    OlapScanContextFactoryPtr ctx_factory);
     ~OlapScanPrepareOperatorFactory() override = default;
 
-    bool with_morsels() const { return true; }
+    bool with_morsels() const override { return true; }
 
     Status prepare(RuntimeState* state) override;
     void close(RuntimeState* state) override;
 
     OperatorPtr create(int32_t degree_of_parallelism, int32_t driver_sequence) override;
 
+    SourceOperatorFactory::AdaptiveState adaptive_initial_state() const override { return AdaptiveState::ACTIVE; }
+
 private:
-    vectorized::OlapScanNode* const _scan_node;
+    OlapScanNode* const _scan_node;
     OlapScanContextFactoryPtr _ctx_factory;
 };
 

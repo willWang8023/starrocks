@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/conjunctive_predicates.h"
 
@@ -8,21 +20,23 @@
 #include <unordered_map>
 #include <vector>
 
-#include "exec/vectorized/olap_scan_prepare.h"
-#include "exprs/vectorized/binary_predicate.h"
-#include "exprs/vectorized/column_ref.h"
-#include "exprs/vectorized/mock_vectorized_expr.h"
-#include "exprs/vectorized/runtime_filter_bank.h"
+#include "exec/olap_scan_prepare.h"
+#include "exprs/binary_predicate.h"
+#include "exprs/column_ref.h"
+#include "exprs/mock_vectorized_expr.h"
+#include "exprs/runtime_filter_bank.h"
 #include "gen_cpp/Opcodes_types.h"
 #include "runtime/descriptor_helper.h"
 #include "runtime/descriptors.h"
-#include "runtime/primitive_type.h"
+#include "runtime/mem_tracker.h"
 #include "storage/chunk_helper.h"
+#include "storage/column_predicate.h"
 #include "storage/predicate_parser.h"
-#include "storage/vectorized_column_predicate.h"
-#include "testutil//assert.h"
+#include "storage/tablet_schema.h"
+#include "testutil/assert.h"
+#include "types/logical_type.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 inline TExprOpcode::type convert_predicate_type_to_thrift(PredicateType p) {
     static std::unordered_map<PredicateType, TExprOpcode::type> mapping = {
@@ -58,11 +72,11 @@ using PredicatePtr = std::unique_ptr<ColumnPredicate>;
 // NOLINTNEXTLINE
 TEST(ConjunctivePredicatesTest, test_evaluate) {
     SchemaPtr schema(new Schema());
-    auto c0_field = std::make_shared<Field>(0, "c0", OLAP_FIELD_TYPE_INT, true);
-    auto c1_field = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_CHAR, true);
-    auto c2_field = std::make_shared<Field>(2, "c2", OLAP_FIELD_TYPE_DATE_V2, true);
-    auto c3_field = std::make_shared<Field>(3, "c3", OLAP_FIELD_TYPE_TIMESTAMP, true);
-    auto c4_field = std::make_shared<Field>(4, "c4", OLAP_FIELD_TYPE_DECIMAL_V2, true);
+    auto c0_field = std::make_shared<Field>(0, "c0", TYPE_INT, true);
+    auto c1_field = std::make_shared<Field>(1, "c1", TYPE_CHAR, true);
+    auto c2_field = std::make_shared<Field>(2, "c2", TYPE_DATE, true);
+    auto c3_field = std::make_shared<Field>(3, "c3", TYPE_DATETIME, true);
+    auto c4_field = std::make_shared<Field>(4, "c4", TYPE_DECIMALV2, true);
 
     schema->append(c0_field);
     schema->append(c1_field);
@@ -115,7 +129,7 @@ TEST(ConjunctivePredicatesTest, test_evaluate) {
 
     // c3 > '1991-01-01 00:00:00'
     {
-        PredicatePtr p0(new_column_gt_predicate(get_type_info(OLAP_FIELD_TYPE_TIMESTAMP), 3, "1991-01-01 00:00:00"));
+        PredicatePtr p0(new_column_gt_predicate(get_type_info(TYPE_DATETIME), 3, "1991-01-01 00:00:00"));
 
         ConjunctivePredicates conjuncts({p0.get()});
 
@@ -124,8 +138,8 @@ TEST(ConjunctivePredicatesTest, test_evaluate) {
     }
     // c3 > '1991-01-01 00:00:00' and c3 <= '1992-02-10 00:00:00'
     {
-        PredicatePtr p0(new_column_gt_predicate(get_type_info(OLAP_FIELD_TYPE_TIMESTAMP), 3, "1991-01-01 00:00:00"));
-        PredicatePtr p1(new_column_le_predicate(get_type_info(OLAP_FIELD_TYPE_TIMESTAMP), 3, "1992-02-10 00:00:00"));
+        PredicatePtr p0(new_column_gt_predicate(get_type_info(TYPE_DATETIME), 3, "1991-01-01 00:00:00"));
+        PredicatePtr p1(new_column_le_predicate(get_type_info(TYPE_DATETIME), 3, "1992-02-10 00:00:00"));
 
         ConjunctivePredicates conjuncts({p0.get(), p1.get()});
 
@@ -134,8 +148,8 @@ TEST(ConjunctivePredicatesTest, test_evaluate) {
     }
     // c2 < '2020-01-01' and c0 is not null
     {
-        PredicatePtr p0(new_column_lt_predicate(get_type_info(OLAP_FIELD_TYPE_DATE_V2), 2, "2020-01-01"));
-        PredicatePtr p1(new_column_null_predicate(get_type_info(OLAP_FIELD_TYPE_INT), 0, false));
+        PredicatePtr p0(new_column_lt_predicate(get_type_info(TYPE_DATE), 2, "2020-01-01"));
+        PredicatePtr p1(new_column_null_predicate(get_type_info(TYPE_INT), 0, false));
 
         ConjunctivePredicates conjuncts({p0.get(), p1.get()});
 
@@ -144,10 +158,9 @@ TEST(ConjunctivePredicatesTest, test_evaluate) {
     }
     // c0 is not null and c1 >= 'aaa' and c4 in ('0.000001', '0.000003')
     {
-        PredicatePtr p0(new_column_null_predicate(get_type_info(OLAP_FIELD_TYPE_INT), 0, false));
-        PredicatePtr p1(new_column_ge_predicate(get_type_info(OLAP_FIELD_TYPE_CHAR), 1, "aaa"));
-        PredicatePtr p2(
-                new_column_in_predicate(get_type_info(OLAP_FIELD_TYPE_DECIMAL_V2), 4, {"0.000001", "0.000003"}));
+        PredicatePtr p0(new_column_null_predicate(get_type_info(TYPE_INT), 0, false));
+        PredicatePtr p1(new_column_ge_predicate(get_type_info(TYPE_CHAR), 1, "aaa"));
+        PredicatePtr p2(new_column_in_predicate(get_type_info(TYPE_DECIMALV2), 4, {"0.000001", "0.000003"}));
 
         ConjunctivePredicates conjuncts({p0.get(), p1.get(), p2.get()});
 
@@ -159,9 +172,9 @@ TEST(ConjunctivePredicatesTest, test_evaluate) {
 // NOLINTNEXTLINE
 TEST(ConjunctivePredicatesTest, test_evaluate_and) {
     SchemaPtr schema(new Schema());
-    schema->append(std::make_shared<Field>(0, "c0", OLAP_FIELD_TYPE_INT, true));
+    schema->append(std::make_shared<Field>(0, "c0", TYPE_INT, true));
 
-    auto c0 = ChunkHelper::column_from_field_type(OLAP_FIELD_TYPE_INT, true);
+    auto c0 = ChunkHelper::column_from_field_type(TYPE_INT, true);
 
     // +------+
     // | c0   |
@@ -182,7 +195,7 @@ TEST(ConjunctivePredicatesTest, test_evaluate_and) {
         std::vector<uint8_t> selection(chunk->num_rows(), 0);
 
         // c0 is not null
-        PredicatePtr p0(new_column_null_predicate(get_type_info(OLAP_FIELD_TYPE_INT), 0, false));
+        PredicatePtr p0(new_column_null_predicate(get_type_info(TYPE_INT), 0, false));
 
         ConjunctivePredicates conjuncts({p0.get()});
 
@@ -198,9 +211,9 @@ TEST(ConjunctivePredicatesTest, test_evaluate_and) {
 // NOLINTNEXTLINE
 TEST(ConjunctivePredicatesTest, test_evaluate_or) {
     SchemaPtr schema(new Schema());
-    schema->append(std::make_shared<Field>(0, "c0", OLAP_FIELD_TYPE_INT, true));
+    schema->append(std::make_shared<Field>(0, "c0", TYPE_INT, true));
 
-    auto c0 = ChunkHelper::column_from_field_type(OLAP_FIELD_TYPE_INT, true);
+    auto c0 = ChunkHelper::column_from_field_type(TYPE_INT, true);
 
     // +------+
     // | c0   |
@@ -221,7 +234,7 @@ TEST(ConjunctivePredicatesTest, test_evaluate_or) {
         std::vector<uint8_t> selection(chunk->num_rows(), 0);
 
         // c0 is not null
-        PredicatePtr p0(new_column_null_predicate(get_type_info(OLAP_FIELD_TYPE_INT), 0, false));
+        PredicatePtr p0(new_column_null_predicate(get_type_info(TYPE_INT), 0, false));
 
         ConjunctivePredicates conjuncts({p0.get()});
 
@@ -236,9 +249,9 @@ TEST(ConjunctivePredicatesTest, test_evaluate_or) {
 }
 
 struct MockConstExprBuilder {
-    template <PrimitiveType ptype>
+    template <LogicalType ltype>
     Expr* operator()(ObjectPool* pool) {
-        if constexpr (pt_is_decimal<ptype>) {
+        if constexpr (lt_is_decimal<ltype>) {
             CHECK(false) << "not supported";
             return nullptr;
         } else {
@@ -250,44 +263,45 @@ struct MockConstExprBuilder {
             expr_node.__isset.child_type = true;
             expr_node.type = gen_type_desc(TPrimitiveType::INT);
 
-            using CppType = RunTimeCppType<ptype>;
+            using CppType = RunTimeCppType<ltype>;
             CppType literal_value;
-            if constexpr (pt_is_binary<ptype>) {
+            if constexpr (lt_is_string<ltype>) {
                 literal_value = "123";
-            } else if constexpr (pt_is_integer<ptype>) {
+            } else if constexpr (lt_is_integer<ltype>) {
                 literal_value = 123;
             } else {
                 literal_value = CppType{};
             }
-            Expr* expr = pool->add(new MockConstVectorizedExpr<ptype>(expr_node, literal_value));
+            Expr* expr = pool->add(new MockConstVectorizedExpr<ltype>(expr_node, literal_value));
             return expr;
         }
     }
 };
 
-class ConjunctiveTestFixture : public testing::TestWithParam<std::tuple<TExprOpcode::type, PrimitiveType>> {
+class ConjunctiveTestFixture : public testing::TestWithParam<std::tuple<TExprOpcode::type, LogicalType>> {
 public:
-    TSlotDescriptor _create_slot_desc(PrimitiveType type, const std::string& col_name, int col_pos) {
+    TSlotDescriptor _create_slot_desc(LogicalType type, const std::string& col_name, int col_pos) {
         TSlotDescriptorBuilder builder;
 
-        if (type == PrimitiveType::TYPE_VARCHAR || type == PrimitiveType::TYPE_CHAR) {
+        if (type == LogicalType::TYPE_VARCHAR || type == LogicalType::TYPE_CHAR) {
             return builder.string_type(1024).column_name(col_name).column_pos(col_pos).nullable(false).build();
         } else {
             return builder.type(type).column_name(col_name).column_pos(col_pos).nullable(false).build();
         }
     }
 
-    TupleDescriptor* _create_tuple_desc(PrimitiveType ptype) {
+    TupleDescriptor* _create_tuple_desc(LogicalType ltype) {
         TDescriptorTableBuilder table_builder;
         TTupleDescriptorBuilder tuple_builder;
 
-        tuple_builder.add_slot(_create_slot_desc(ptype, "c1", 0));
+        tuple_builder.add_slot(_create_slot_desc(ltype, "c1", 0));
         tuple_builder.build(&table_builder);
 
         std::vector<TTupleId> row_tuples = std::vector<TTupleId>{0};
         std::vector<bool> nullable_tuples = std::vector<bool>{true};
         DescriptorTbl* tbl = nullptr;
-        DescriptorTbl::create(&_pool, table_builder.desc_tbl(), &tbl, config::vector_chunk_size);
+        CHECK(DescriptorTbl::create(&_runtime_state, &_pool, table_builder.desc_tbl(), &tbl, config::vector_chunk_size)
+                      .ok());
 
         auto* row_desc = _pool.add(new RowDescriptor(*tbl, row_tuples, nullable_tuples));
         auto* tuple_desc = row_desc->tuple_descriptors()[0];
@@ -295,22 +309,22 @@ public:
         return tuple_desc;
     }
 
-    TabletSchemaPB create_tablet_schema(PrimitiveType ptype) {
+    TabletSchemaPB create_tablet_schema(LogicalType ltype) {
         TabletSchemaPB tablet_schema;
 
         ColumnPB* col = tablet_schema.add_column();
         col->set_name("c1");
-        std::string type_name = type_to_string(ptype);
+        std::string type_name = type_to_string(ltype);
         col->set_type(type_name);
 
         return tablet_schema;
     }
 
     // Build an expression: col < literal
-    Expr* build_predicate(PrimitiveType ptype, TExprOpcode::type op, SlotDescriptor* slot) {
+    Expr* build_predicate(LogicalType ltype, TExprOpcode::type op, SlotDescriptor* slot) {
         TExprNode expr_node;
         expr_node.opcode = op;
-        expr_node.child_type = to_thrift(ptype);
+        expr_node.child_type = to_thrift(ltype);
         expr_node.node_type = TExprNodeType::BINARY_PRED;
         expr_node.num_children = 2;
         expr_node.__isset.opcode = true;
@@ -319,7 +333,7 @@ public:
 
         Expr* expr = _pool.add(VectorizedBinaryPredicateFactory::from_thrift(expr_node));
         ColumnRef* column_ref = _pool.add(new ColumnRef(slot));
-        Expr* col2 = type_dispatch_basic(ptype, MockConstExprBuilder(), &_pool);
+        Expr* col2 = type_dispatch_basic(ltype, MockConstExprBuilder(), &_pool);
         expr->_children.push_back(column_ref);
         expr->_children.push_back(col2);
 
@@ -327,20 +341,23 @@ public:
     }
 
 protected:
+    RuntimeState _runtime_state;
     ObjectPool _pool;
 };
 
 // normalize a simple predicate: col op const
 // NOLINTNEXTLINE
 TEST_P(ConjunctiveTestFixture, test_parse_conjuncts) {
-    auto [op, ptype] = GetParam();
+    auto [op, ltype] = GetParam();
 
     _pool.clear();
-    TupleDescriptor* tuple_desc = _create_tuple_desc(ptype);
+    TupleDescriptor* tuple_desc = _create_tuple_desc(ltype);
     std::vector<std::string> key_column_names = {"c1"};
     SlotDescriptor* slot = tuple_desc->slots()[0];
-    std::vector<ExprContext*> conjunct_ctxs = {_pool.add(new ExprContext(build_predicate(ptype, op, slot)))};
-    auto tablet_schema = TabletSchema::create(create_tablet_schema(ptype));
+    std::vector<ExprContext*> conjunct_ctxs = {_pool.add(new ExprContext(build_predicate(ltype, op, slot)))};
+    ASSERT_OK(Expr::prepare(conjunct_ctxs, &_runtime_state));
+    ASSERT_OK(Expr::open(conjunct_ctxs, &_runtime_state));
+    auto tablet_schema = TabletSchema::create(create_tablet_schema(ltype));
 
     OlapScanConjunctsManager cm;
     cm.conjunct_ctxs_ptr = &conjunct_ctxs;
@@ -351,7 +368,7 @@ TEST_P(ConjunctiveTestFixture, test_parse_conjuncts) {
 
     ASSERT_OK(cm.parse_conjuncts(true, 1));
     // col >= false will be elimated
-    if (ptype == TYPE_BOOLEAN && op == TExprOpcode::GE) {
+    if (ltype == TYPE_BOOLEAN && op == TExprOpcode::GE) {
         ASSERT_EQ(0, cm.olap_filters.size());
         return;
     } else {
@@ -361,12 +378,12 @@ TEST_P(ConjunctiveTestFixture, test_parse_conjuncts) {
     ASSERT_EQ(1, cm.column_value_ranges.count(slot->col_name()));
 
     {
-        PredicateParser pp(*tablet_schema);
+        PredicateParser pp(tablet_schema);
         std::unique_ptr<ColumnPredicate> predicate(pp.parse_thrift_cond(cm.olap_filters[0]));
         ASSERT_TRUE(!!predicate);
 
         // BOOLEAN is special, col <= false will be convert to col = false
-        if (ptype == TYPE_BOOLEAN && op == TExprOpcode::LE) {
+        if (ltype == TYPE_BOOLEAN && op == TExprOpcode::LE) {
             ASSERT_EQ(TExprOpcode::EQ, convert_predicate_type_to_thrift(predicate->type()));
         } else {
             ASSERT_EQ(op, convert_predicate_type_to_thrift(predicate->type()));
@@ -377,9 +394,9 @@ TEST_P(ConjunctiveTestFixture, test_parse_conjuncts) {
 INSTANTIATE_TEST_SUITE_P(ConjunctiveTest, ConjunctiveTestFixture,
                          testing::Combine(testing::Values(TExprOpcode::LT, TExprOpcode::LE, TExprOpcode::GT,
                                                           TExprOpcode::GE, TExprOpcode::EQ, TExprOpcode::NE),
-                                          testing::Values(PrimitiveType::TYPE_TINYINT, PrimitiveType::TYPE_SMALLINT,
-                                                          PrimitiveType::TYPE_INT, PrimitiveType::TYPE_BIGINT,
-                                                          PrimitiveType::TYPE_LARGEINT, PrimitiveType::TYPE_VARCHAR,
-                                                          PrimitiveType::TYPE_CHAR, PrimitiveType::TYPE_BOOLEAN)));
+                                          testing::Values(LogicalType::TYPE_TINYINT, LogicalType::TYPE_SMALLINT,
+                                                          LogicalType::TYPE_INT, LogicalType::TYPE_BIGINT,
+                                                          LogicalType::TYPE_LARGEINT, LogicalType::TYPE_VARCHAR,
+                                                          LogicalType::TYPE_CHAR, LogicalType::TYPE_BOOLEAN)));
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

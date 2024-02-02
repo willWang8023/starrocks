@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/http/action/pprof_actions.cpp
 
@@ -20,11 +33,7 @@
 // under the License.
 
 #include "http/action/pprof_actions.h"
-#ifdef USE_JEMALLOC
-#include "jemalloc/jemalloc.h"
-#endif
-#include <gperftools/heap-profiler.h>
-#include <gperftools/malloc_extension.h>
+
 #include <gperftools/profiler.h>
 
 #include <fstream>
@@ -32,12 +41,14 @@
 #include <mutex>
 
 #include "common/config.h"
+#include "common/prof/heap_prof.h"
 #include "common/status.h"
 #include "common/tracer.h"
 #include "http/ev_http_server.h"
 #include "http/http_channel.h"
 #include "http/http_headers.h"
 #include "http/http_request.h"
+#include "io/io_profiler.h"
 #include "util/bfd_parser.h"
 
 namespace starrocks {
@@ -56,42 +67,16 @@ void HeapAction::handle(HttpRequest* req) {
     std::string str = "Heap profiling is not available with address sanitizer builds.";
 
     HttpChannel::send_reply(req, str);
-#elif defined(USE_JEMALLOC)
-    (void)kPprofDefaultSampleSecs; // Avoid unused variable warning.
-
-    std::lock_guard<std::mutex> lock(kPprofActionMutex);
-    std::string str;
-    std::stringstream tmp_prof_file_name;
-    tmp_prof_file_name << config::pprof_profile_dir << "/heap_profile." << getpid() << "." << rand();
-    const char* file_name = tmp_prof_file_name.str().c_str();
-    if (je_mallctl("prof.dump", NULL, NULL, &file_name, sizeof(const char*)) == 0) {
-        std::ifstream f(file_name);
-        str = std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
-    } else {
-        std::string str = "dump jemalloc prof file failed";
-    }
-    HttpChannel::send_reply(req, str);
 #else
     std::lock_guard<std::mutex> lock(kPprofActionMutex);
+    std::string str = HeapProf::getInstance().snapshot();
 
-    int seconds = kPprofDefaultSampleSecs;
-    const std::string& seconds_str = req->param(SECOND_KEY);
-    if (!seconds_str.empty()) {
-        seconds = std::atoi(seconds_str.c_str());
+    if (str.empty()) {
+        str = "dump jemalloc prof file failed";
+    } else {
+        std::ifstream f(str);
+        str = std::string(std::istreambuf_iterator<char>(f), std::istreambuf_iterator<char>());
     }
-
-    std::stringstream tmp_prof_file_name;
-    // Build a temporary file name that is hopefully unique.
-    tmp_prof_file_name << config::pprof_profile_dir << "/heap_profile." << getpid() << "." << rand();
-
-    HeapProfilerStart(tmp_prof_file_name.str().c_str());
-    // Sleep to allow for some samples to be collected.
-    sleep(seconds);
-    const char* profile = GetHeapProfile();
-    HeapProfilerStop();
-    std::string str = profile;
-    delete profile;
-
     HttpChannel::send_reply(req, str);
 #endif
 }
@@ -100,18 +85,11 @@ void GrowthAction::handle(HttpRequest* req) {
 #if defined(ADDRESS_SANITIZER) || defined(LEAK_SANITIZER) || defined(THREAD_SANITIZER)
     std::string str = "Growth profiling is not available with address sanitizer builds.";
     HttpChannel::send_reply(req, str);
-#elif defined(USE_JEMALLOC)
+#else
     std::string str =
             "Growth profiling is not available with jemalloc builds.You can set the `--base` flag to jeprof to compare "
             "the results of two Heap Profiling";
     HttpChannel::send_reply(req, str);
-#else
-    std::lock_guard<std::mutex> lock(kPprofActionMutex);
-
-    std::string heap_growth_stack;
-    MallocExtension::instance()->GetHeapGrowthStacks(&heap_growth_stack);
-
-    HttpChannel::send_reply(req, heap_growth_stack);
 #endif
 }
 
@@ -149,6 +127,28 @@ void ProfileAction::handle(HttpRequest* req) {
 
     HttpChannel::send_reply(req, str);
 #endif
+}
+
+static std::mutex kIOPprofActionMutex;
+
+void IOProfileAction::handle(HttpRequest* req) {
+    std::lock_guard<std::mutex> lock(kIOPprofActionMutex);
+    auto scoped_span = trace::Scope(Tracer::Instance().start_trace("http_handle_io_profile"));
+
+    int seconds = 10;
+    const std::string& seconds_str = req->param(SECOND_KEY);
+    if (!seconds_str.empty()) {
+        seconds = std::atoi(seconds_str.c_str());
+    }
+    int topn = 10;
+    const std::string& topn_str = req->param("topn");
+    if (!topn_str.empty()) {
+        topn = std::atoi(topn_str.c_str());
+    }
+    topn = std::max(1, topn);
+
+    auto ret = IOProfiler::profile_and_get_topn_stats_str(req->param("mode"), seconds, topn);
+    HttpChannel::send_reply(req, ret);
 }
 
 void CmdlineAction::handle(HttpRequest* req) {
@@ -207,5 +207,4 @@ void SymbolAction::handle(HttpRequest* req) {
         HttpChannel::send_reply(req, result);
     }
 }
-
 } // namespace starrocks

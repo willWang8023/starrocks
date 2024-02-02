@@ -1,12 +1,24 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Strings;
 import com.starrocks.analysis.BinaryPredicate;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
-import com.starrocks.analysis.ShowSnapshotStmt;
-import com.starrocks.analysis.ShowStmt;
+import com.starrocks.analysis.InPredicate;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
 import com.starrocks.backup.Repository;
@@ -15,6 +27,8 @@ import com.starrocks.common.ErrorReport;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.ast.ShowSnapshotStmt;
+import com.starrocks.sql.ast.ShowStmt;
 
 public class ShowSnapshotAnalyzer {
 
@@ -28,7 +42,7 @@ public class ShowSnapshotAnalyzer {
         }
 
         @Override
-        public Void visitShowSnapshotStmt(ShowSnapshotStmt showSnapshotStmt, ConnectContext context) {
+        public Void visitShowSnapshotStatement(ShowSnapshotStmt showSnapshotStmt, ConnectContext context) {
             String repoName = showSnapshotStmt.getRepoName();
 
             Repository repo =
@@ -65,6 +79,29 @@ public class ShowSnapshotAnalyzer {
                                 || !analyzeSubExpr(showSnapshotStmt, (BinaryPredicate) cp.getChild(1))) {
                             ok = false;
                             break CHECK;
+                        }
+                    } else if (where instanceof InPredicate) {
+                        InPredicate inPredicate = (InPredicate) where;
+                        Expr leftExpr = inPredicate.getChild(0);
+                        if (!(leftExpr instanceof SlotRef)) {
+                            throw new SemanticException("Left expr of should be snapshot");
+                        }
+                        String name = ((SlotRef) leftExpr).getColumnName();
+                        if (!name.equalsIgnoreCase("snapshot")) {
+                            throw new SemanticException("Left expr of should be snapshot");
+                        }
+
+                        for (int i = 1; i <= inPredicate.getInElementNum(); i++) {
+                            Expr expr = inPredicate.getChild(i);
+                            if (!(expr instanceof StringLiteral)) {
+                                throw new SemanticException("Child of in predicate should be string value");
+                            }
+
+                            String snapshotName = ((StringLiteral) expr).getStringValue();
+                            if (Strings.isNullOrEmpty(snapshotName)) {
+                                continue;
+                            }
+                            showSnapshotStmt.addSnapshotName(snapshotName);
                         }
                     }
                 }

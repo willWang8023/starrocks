@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.optimizer.transformer;
 
 import com.google.common.collect.Lists;
@@ -18,11 +31,11 @@ import java.util.List;
 import java.util.Map;
 
 public class ExpressionMapping {
+
     /**
      * This structure is responsible for the translation map from Expr to operator
      */
-    private final Map<Expr, ColumnRefOperator> expressionToColumns = new HashMap<>();
-
+    private Map<Expr, ColumnRefOperator> expressionToColumns = new HashMap<>();
     /**
      * The purpose of below property is to hold the current plan built so far,
      * and the mapping to indicate how the fields (by position) in the relation map to
@@ -50,6 +63,9 @@ public class ExpressionMapping {
             this.scope.setParent(outer.getScope());
             fieldsList.addAll(outer.getFieldMappings());
             this.outerScopeRelationId = outer.getScope().getRelationId();
+            if (scope.isLambdaScope()) { // lambda can use outer scope's expression, like agg.
+                this.expressionToColumns = outer.expressionToColumns;
+            }
         }
         this.fieldMappings = new ColumnRefOperator[fieldsList.size()];
         fieldsList.toArray(this.fieldMappings);
@@ -64,6 +80,13 @@ public class ExpressionMapping {
             scope = scope.getParent();
         }
         this.fieldMappings = new ColumnRefOperator[fieldMappingSize];
+    }
+
+    public ExpressionMapping(ExpressionMapping other) {
+        this.scope = other.scope;
+        this.fieldMappings = other.fieldMappings;
+        this.outerScopeRelationId = other.outerScopeRelationId;
+        this.expressionToColumns = other.expressionToColumns;
     }
 
     public Scope getScope() {
@@ -96,11 +119,29 @@ public class ExpressionMapping {
         if (expression instanceof FieldReference) {
             fieldMappings[((FieldReference) expression).getFieldIndex()] = columnRefOperator;
         }
-
-        if (expression instanceof SlotRef) {
+        // slotRef with struct origin type is subfieldExpr, can not put into fieldMappings.
+        if (expression instanceof SlotRef && !expression.getTrueOriginType().isStructType()) {
             scope.tryResolveField((SlotRef) expression)
                     .ifPresent(field -> fieldMappings[field.getRelationFieldIndex()] = columnRefOperator);
         }
+
+        expressionToColumns.put(expression, columnRefOperator);
+    }
+
+    public void putWithSymbol(Expr expression, Expr resolveExpr, ColumnRefOperator columnRefOperator) {
+        if (resolveExpr instanceof SlotRef) {
+            if (expression instanceof SlotRef
+                    && ((SlotRef) expression).getColumnName().equals(((SlotRef) resolveExpr).getColumnName())) {
+                // There is no alias, and it is an expression of SlotRef,
+                // which is resolved according to the original expression
+                scope.tryResolveField((SlotRef) expression)
+                        .ifPresent(field -> fieldMappings[field.getRelationFieldIndex()] = columnRefOperator);
+            } else {
+                scope.tryResolveField((SlotRef) resolveExpr)
+                        .ifPresent(field -> fieldMappings[field.getRelationFieldIndex()] = columnRefOperator);
+            }
+        }
+
         expressionToColumns.put(expression, columnRefOperator);
     }
 
@@ -114,5 +155,13 @@ public class ExpressionMapping {
 
     public List<Expr> getAllExpressions() {
         return Lists.newArrayList(expressionToColumns.keySet());
+    }
+
+    public Map<Expr, ColumnRefOperator> getExpressionToColumns() {
+        return expressionToColumns;
+    }
+
+    public void addExpressionToColumns(Map<Expr, ColumnRefOperator> expressionToColumns) {
+        this.expressionToColumns.putAll(expressionToColumns);
     }
 }

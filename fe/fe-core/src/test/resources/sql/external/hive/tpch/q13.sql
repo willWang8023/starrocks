@@ -1,97 +1,70 @@
-[sql]
-select
-    c_count,
-    count(*) as custdist
-from
-    (
-        select
-            c_custkey,
-            count(o_orderkey) as c_count
-        from
-            customer left outer join orders on
-                        c_custkey = o_custkey
-                    and o_comment not like '%unusual%deposits%'
-        group by
-            c_custkey
-    ) a
-group by
-    c_count
-order by
-    custdist desc,
-    c_count desc ;
 [fragment statistics]
-PLAN FRAGMENT 0(F07)
+PLAN FRAGMENT 0(F06)
 Output Exprs:18: count | 19: count
 Input Partition: UNPARTITIONED
 RESULT SINK
 
-14:MERGING-EXCHANGE
+13:MERGING-EXCHANGE
+distribution type: GATHER
 cardinality: 10031873
 column statistics:
-* count-->[0.0, 1.0031873E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
+* count-->[0.0, 1.125E8, 0.0, 8.0, 1.0031873E7] ESTIMATE
 * count-->[0.0, 1.0031873E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
 
-PLAN FRAGMENT 1(F06)
+PLAN FRAGMENT 1(F05)
 
 Input Partition: HASH_PARTITIONED: 18: count
 OutPut Partition: UNPARTITIONED
-OutPut Exchange Id: 14
+OutPut Exchange Id: 13
 
-13:SORT
+12:SORT
 |  order by: [19, BIGINT, false] DESC, [18, BIGINT, true] DESC
 |  offset: 0
 |  hasNullableGenerateChild: true
 |  cardinality: 10031873
 |  column statistics:
-|  * count-->[0.0, 1.0031873E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
+|  * count-->[0.0, 1.125E8, 0.0, 8.0, 1.0031873E7] ESTIMATE
 |  * count-->[0.0, 1.0031873E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
 |
-12:AGGREGATE (update finalize)
+11:AGGREGATE (merge finalize)
+|  aggregate: count[([19: count, BIGINT, false]); args: ; result: BIGINT; args nullable: true; result nullable: false]
+|  group by: [18: count, BIGINT, true]
+|  hasNullableGenerateChild: true
+|  cardinality: 10031873
+|  column statistics:
+|  * count-->[0.0, 1.125E8, 0.0, 8.0, 1.0031873E7] ESTIMATE
+|  * count-->[0.0, 1.0031873E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
+|
+10:EXCHANGE
+distribution type: SHUFFLE
+partition exprs: [18: count, BIGINT, true]
+cardinality: 10031873
+
+PLAN FRAGMENT 2(F04)
+
+Input Partition: HASH_PARTITIONED: 10: o_custkey
+OutPut Partition: HASH_PARTITIONED: 18: count
+OutPut Exchange Id: 10
+
+9:AGGREGATE (update serialize)
+|  STREAMING
 |  aggregate: count[(*); args: ; result: BIGINT; args nullable: false; result nullable: false]
 |  group by: [18: count, BIGINT, true]
 |  hasNullableGenerateChild: true
 |  cardinality: 10031873
 |  column statistics:
-|  * count-->[0.0, 1.0031873E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
+|  * count-->[0.0, 1.125E8, 0.0, 8.0, 1.0031873E7] ESTIMATE
 |  * count-->[0.0, 1.0031873E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
 |
-11:EXCHANGE
-cardinality: 10031873
-
-PLAN FRAGMENT 2(F05)
-
-Input Partition: HASH_PARTITIONED: 1: c_custkey
-OutPut Partition: HASH_PARTITIONED: 18: count
-OutPut Exchange Id: 11
-
-10:Project
+8:Project
 |  output columns:
 |  18 <-> [18: count, BIGINT, false]
 |  hasNullableGenerateChild: true
 |  cardinality: 10031873
 |  column statistics:
-|  * count-->[0.0, 1.0031873E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
+|  * count-->[0.0, 1.125E8, 0.0, 8.0, 1.0031873E7] ESTIMATE
 |
-9:AGGREGATE (merge finalize)
-|  aggregate: count[([18: count, BIGINT, false]); args: INT; result: BIGINT; args nullable: true; result nullable: false]
-|  group by: [1: c_custkey, INT, true]
-|  hasNullableGenerateChild: true
-|  cardinality: 10031873
-|  column statistics:
-|  * c_custkey-->[1.0, 1.5E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
-|  * count-->[0.0, 1.0031873E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
-|
-8:EXCHANGE
-cardinality: 10031873
-
-PLAN FRAGMENT 3(F04)
-
-Input Partition: HASH_PARTITIONED: 10: o_custkey
-OutPut Partition: HASH_PARTITIONED: 1: c_custkey
-OutPut Exchange Id: 08
-
-7:AGGREGATE (update serialize)
-|  STREAMING
+7:AGGREGATE (update finalize)
 |  aggregate: count[([9: o_orderkey, INT, true]); args: INT; result: BIGINT; args nullable: true; result nullable: false]
 |  group by: [1: c_custkey, INT, true]
 |  hasNullableGenerateChild: true
@@ -123,12 +96,16 @@ OutPut Exchange Id: 08
 |  * o_custkey-->[1.0, 1.5E7, 0.0, 8.0, 1.0031873E7] ESTIMATE
 |
 |----4:EXCHANGE
+|       distribution type: SHUFFLE
+|       partition exprs: [1: c_custkey, INT, true]
 |       cardinality: 15000000
 |
 2:EXCHANGE
+distribution type: SHUFFLE
+partition exprs: [10: o_custkey, INT, true]
 cardinality: 112500000
 
-PLAN FRAGMENT 4(F02)
+PLAN FRAGMENT 3(F02)
 
 Input Partition: RANDOM
 OutPut Partition: HASH_PARTITIONED: 1: c_custkey
@@ -138,12 +115,11 @@ OutPut Exchange Id: 04
 TABLE: customer
 partitions=1/1
 avgRowSize=8.0
-numNodes=0
 cardinality: 15000000
 column statistics:
 * c_custkey-->[1.0, 1.5E7, 0.0, 8.0, 1.5E7] ESTIMATE
 
-PLAN FRAGMENT 5(F00)
+PLAN FRAGMENT 4(F00)
 
 Input Partition: RANDOM
 OutPut Partition: HASH_PARTITIONED: 10: o_custkey
@@ -163,7 +139,6 @@ TABLE: orders
 NON-PARTITION PREDICATES: NOT (17: o_comment LIKE '%unusual%deposits%')
 partitions=1/1
 avgRowSize=95.0
-numNodes=0
 cardinality: 112500000
 probe runtime filters:
 - filter_id = 0, probe_expr = (10: o_custkey)
@@ -172,4 +147,3 @@ column statistics:
 * o_custkey-->[1.0, 1.5E8, 0.0, 8.0, 1.0031873E7] ESTIMATE
 * o_comment-->[-Infinity, Infinity, 0.0, 79.0, 1.10204136E8] ESTIMATE
 [end]
-

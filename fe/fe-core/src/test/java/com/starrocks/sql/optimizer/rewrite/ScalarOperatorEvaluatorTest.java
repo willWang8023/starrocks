@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.optimizer.rewrite;
 
 import com.google.common.collect.Lists;
@@ -12,8 +25,10 @@ import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import mockit.Expectations;
+import org.junit.Assert;
 import org.junit.Test;
 
+import java.math.BigInteger;
 import java.time.LocalDateTime;
 
 import static org.junit.Assert.assertEquals;
@@ -112,6 +127,20 @@ public class ScalarOperatorEvaluatorTest {
         ScalarOperator result = ScalarOperatorEvaluator.INSTANCE.evaluation(operator);
 
         assertEquals(result, operator);
+    }
+
+    @Test
+    public void testCreateConstantValue() {
+        ConstantOperator tinyInt = ConstantOperator.createExampleValueByType(Type.TINYINT);
+        Assert.assertTrue(tinyInt.getTinyInt() == 1);
+        ConstantOperator smallInt = ConstantOperator.createExampleValueByType(Type.SMALLINT);
+        Assert.assertTrue(smallInt.getSmallint() == 1);
+        ConstantOperator intValue = ConstantOperator.createExampleValueByType(Type.INT);
+        Assert.assertTrue(intValue.getInt() == 1);
+        ConstantOperator bigInt = ConstantOperator.createExampleValueByType(Type.BIGINT);
+        Assert.assertTrue(bigInt.getBigint() == 1L);
+        ConstantOperator largeInt = ConstantOperator.createExampleValueByType(Type.LARGEINT);
+        Assert.assertTrue(largeInt.getLargeInt().equals(new BigInteger("1")));
     }
 
 }

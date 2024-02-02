@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/journal/bdbje/BDBToolOptions.java
 
@@ -25,15 +38,15 @@ import com.google.common.base.Strings;
 import com.starrocks.common.FeConstants;
 
 public class BDBToolOptions {
-    private boolean isListDbs;
-    private String dbName;
-    private boolean isDbStat;
-    private boolean hasFromKey;
-    private String fromKey;
-    private boolean hasEndKey;
-    private String endKey;
-    private int metaVersion;
-    private int starrocksMetaVersion;
+    private final boolean isListDbs;
+    private final String dbName;
+    private final boolean isDbStat;
+    private final boolean hasFromKey;
+    private final String fromKey;
+    private final boolean hasEndKey;
+    private final String endKey;
+    private final int metaVersion;
+    private final int starrocksMetaVersion;
 
     public BDBToolOptions(boolean isListDbs, String dbName, boolean isDbStat,
                           String fromKey, String endKey, int metaVersion, int starrocksMetaVersion) {
@@ -44,9 +57,9 @@ public class BDBToolOptions {
         this.hasFromKey = !Strings.isNullOrEmpty(fromKey);
         this.endKey = endKey;
         this.hasEndKey = !Strings.isNullOrEmpty(endKey);
-        this.metaVersion = metaVersion == 0 ? FeConstants.meta_version : metaVersion;
+        this.metaVersion = metaVersion == 0 ? FeConstants.META_VERSION : metaVersion;
         this.starrocksMetaVersion =
-                starrocksMetaVersion == 0 ? FeConstants.starrocks_meta_version : starrocksMetaVersion;
+                starrocksMetaVersion == 0 ? FeConstants.STARROCKS_META_VERSION : starrocksMetaVersion;
     }
 
     public boolean isListDbs() {
@@ -88,12 +101,12 @@ public class BDBToolOptions {
     @Override
     public String toString() {
         StringBuilder sb = new StringBuilder();
-        sb.append("list bdb database: " + isListDbs).append("\n");
-        sb.append("bdb database name: " + dbName).append("\n");
-        sb.append("get bdb database stat: " + isDbStat).append("\n");
-        sb.append("from key" + fromKey).append("\n");
-        sb.append("end key: " + endKey).append("\n");
-        sb.append("meta version: " + metaVersion + "," + starrocksMetaVersion).append("\n");
+        sb.append("list bdb database: ").append(isListDbs).append("\n");
+        sb.append("bdb database name: ").append(dbName).append("\n");
+        sb.append("get bdb database stat: ").append(isDbStat).append("\n");
+        sb.append("from key").append(fromKey).append("\n");
+        sb.append("end key: ").append(endKey).append("\n");
+        sb.append("meta version: ").append(metaVersion).append(",").append(starrocksMetaVersion).append("\n");
         return sb.toString();
     }
 }

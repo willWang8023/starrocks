@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #pragma once
 
 #include <string>
@@ -7,9 +20,7 @@
 #include "column/vectorized_fwd.h"
 #include "runtime/descriptors.h"
 #include "storage/olap_common.h"
-#include "storage/rowset/column_iterator.h"
 #include "storage/rowset/segment.h"
-#include "storage/tablet.h"
 
 namespace starrocks {
 
@@ -17,37 +28,36 @@ class RuntimeState;
 
 } // namespace starrocks
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-class Tablet;
+class ColumnIterator;
 class SegmentMetaCollecter;
 
 // Params for MetaReader
 // mainly include tablet
 struct MetaReaderParams {
-    MetaReaderParams(){};
-    TabletSharedPtr tablet;
+    MetaReaderParams() = default;
+
+    int64_t tablet_id;
     Version version = Version(-1, 0);
     const std::vector<SlotDescriptor*>* slots = nullptr;
     RuntimeState* runtime_state = nullptr;
-    void check_validation() const {
-        if (UNLIKELY(version.first == -1)) {
-            LOG(FATAL) << "version is not set. tablet=" << tablet->full_name();
-        }
-    }
 
     const std::map<int32_t, std::string>* id_to_names = nullptr;
     const DescriptorTbl* desc_tbl = nullptr;
 
     int chunk_size = config::vector_chunk_size;
+
+    void check_validation() const { LOG_IF(FATAL, version.first == -1) << "version is not set. tablet=" << tablet_id; }
 };
 
 struct SegmentMetaCollecterParams {
     std::vector<std::string> fields;
     std::vector<ColumnId> cids;
     std::vector<bool> read_page;
-    std::vector<FieldType> field_type;
-    int32_t max_cid;
+    std::vector<LogicalType> field_type;
+    bool use_page_cache;
+    TabletSchemaCSPtr tablet_schema;
 };
 
 // MetaReader will implements
@@ -56,15 +66,11 @@ struct SegmentMetaCollecterParams {
 class MetaReader {
 public:
     MetaReader();
-    ~MetaReader();
-
-    Status init(const MetaReaderParams& read_params);
-
-    TabletSharedPtr tablet() { return _tablet; }
+    virtual ~MetaReader() = default;
 
     Status open();
 
-    Status do_get_next(ChunkPtr* chunk);
+    virtual Status do_get_next(ChunkPtr* chunk) = 0;
 
     bool has_more();
 
@@ -76,29 +82,18 @@ public:
         std::vector<int32_t> result_slot_ids;
     };
 
-private:
-    TabletSharedPtr _tablet;
-    Version _version;
-    std::vector<RowsetSharedPtr> _rowsets;
-
+protected:
+    CollectContext _collect_context;
     bool _is_init;
     bool _has_more;
-    int _chunk_size;
+    // this variable is introduced to solve compatibility issues,
+    // see more details in the description of https://github.com/StarRocks/starrocks/pull/17619
+    bool _has_count_agg = false;
+
     MetaReaderParams _params;
 
-    CollectContext _collect_context;
-
-    Status _init_params(const MetaReaderParams& read_params);
-
-    Status _build_collect_context(const MetaReaderParams& read_params);
-
-    Status _init_seg_meta_collecters(const MetaReaderParams& read_params);
-
-    Status _fill_result_chunk(Chunk* chunk);
-
-    Status _get_segments(const TabletSharedPtr& tablet, const Version& version,
-                         std::vector<SegmentSharedPtr>* segments);
-
+    virtual Status _fill_result_chunk(Chunk* chunk);
+    void _fill_empty_result(Chunk* chunk);
     Status _read(Chunk* chunk, size_t n);
 };
 
@@ -108,29 +103,29 @@ public:
     ~SegmentMetaCollecter();
     Status init(const SegmentMetaCollecterParams* params);
     Status open();
-    Status collect(std::vector<vectorized::Column*>* dsts);
+    Status collect(std::vector<Column*>* dsts);
 
 public:
     static std::vector<std::string> support_collect_fields;
     static Status parse_field_and_colname(const std::string& item, std::string* field, std::string* col_name);
 
-    using CollectFunc = std::function<Status(ColumnId, vectorized::Column*, FieldType)>;
+    using CollectFunc = std::function<Status(ColumnId, Column*, LogicalType)>;
     std::unordered_map<std::string, CollectFunc> support_collect_func;
 
 private:
     Status _init_return_column_iterators();
-    Status _collect(const std::string& name, ColumnId cid, vectorized::Column* column, FieldType type);
-    Status _collect_dict(ColumnId cid, vectorized::Column* column, FieldType type);
-    Status _collect_max(ColumnId cid, vectorized::Column* column, FieldType type);
-    Status _collect_min(ColumnId cid, vectorized::Column* column, FieldType type);
+    Status _collect(const std::string& name, ColumnId cid, Column* column, LogicalType type);
+    Status _collect_dict(ColumnId cid, Column* column, LogicalType type);
+    Status _collect_max(ColumnId cid, Column* column, LogicalType type);
+    Status _collect_min(ColumnId cid, Column* column, LogicalType type);
+    Status _collect_count(Column* column, LogicalType type);
     template <bool is_max>
-    Status __collect_max_or_min(ColumnId cid, vectorized::Column* column, FieldType type);
+    Status __collect_max_or_min(ColumnId cid, Column* column, LogicalType type);
     SegmentSharedPtr _segment;
-    std::vector<ColumnIterator*> _column_iterators;
+    std::vector<std::unique_ptr<ColumnIterator>> _column_iterators;
     const SegmentMetaCollecterParams* _params = nullptr;
     std::unique_ptr<RandomAccessFile> _read_file;
     OlapReaderStatistics _stats;
-    ObjectPool _obj_pool;
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

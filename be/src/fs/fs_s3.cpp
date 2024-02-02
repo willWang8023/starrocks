@@ -1,29 +1,40 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "fs/fs_s3.h"
 
 #include <aws/core/Aws.h>
 #include <aws/core/auth/AWSCredentialsProvider.h>
-#include <aws/core/utils/threading/Executor.h>
+#include <aws/core/auth/AWSCredentialsProviderChain.h>
+#include <aws/core/client/ClientConfiguration.h>
+#include <aws/identity-management/auth/STSAssumeRoleCredentialsProvider.h>
 #include <aws/s3/model/CopyObjectRequest.h>
-#include <aws/s3/model/CreateBucketRequest.h>
-#include <aws/s3/model/DeleteBucketRequest.h>
 #include <aws/s3/model/DeleteObjectRequest.h>
 #include <aws/s3/model/DeleteObjectsRequest.h>
-#include <aws/s3/model/DeleteObjectsResult.h>
-#include <aws/s3/model/GetObjectRequest.h>
-#include <aws/s3/model/HeadObjectRequest.h>
 #include <aws/s3/model/ListObjectsV2Request.h>
 #include <aws/s3/model/ListObjectsV2Result.h>
 #include <aws/s3/model/PutObjectRequest.h>
+#include <aws/sts/STSClient.h>
 #include <fmt/core.h>
-#include <time.h>
 
+#include <ctime>
 #include <limits>
 
 #include "common/config.h"
 #include "common/s3_uri.h"
 #include "fs/output_stream_adapter.h"
+#include "gutil/casts.h"
 #include "gutil/strings/util.h"
 #include "io/s3_input_stream.h"
 #include "io/s3_output_stream.h"
@@ -45,7 +56,7 @@ static Status to_status(Aws::S3::S3Errors error, const std::string& msg) {
     case Aws::S3::S3Errors::NO_SUCH_UPLOAD:
         return Status::NotFound(fmt::format("no such upload: {}", msg));
     default:
-        return Status::InternalError(fmt::format(msg));
+        return Status::InternalError(msg);
     }
 }
 
@@ -72,7 +83,10 @@ public:
     S3ClientFactory(S3ClientFactory&&) = delete;
     void operator=(S3ClientFactory&&) = delete;
 
+    S3ClientPtr new_client(const TCloudConfiguration& cloud_configuration);
     S3ClientPtr new_client(const ClientConfiguration& config, const FSOptions& opts);
+
+    void close();
 
     static ClientConfiguration& getClientConfig() {
         // We cached config here and make a deep copy each time.Since aws sdk has changed the
@@ -87,23 +101,134 @@ public:
 private:
     S3ClientFactory();
 
+    static std::shared_ptr<Aws::Auth::AWSCredentialsProvider> _get_aws_credentials_provider(
+            const AWSCloudCredential& aws_cloud_credential);
+
+    class ClientCacheKey {
+    public:
+        ClientConfiguration config;
+        AWSCloudConfiguration aws_cloud_configuration;
+
+        bool operator==(const ClientCacheKey& rhs) const {
+            return config == rhs.config && aws_cloud_configuration == rhs.aws_cloud_configuration;
+        }
+    };
+
     constexpr static int kMaxItems = 8;
 
     std::mutex _lock;
-    int _items;
-    // _configs[i] is the client configuration of |_clients[i].
-    ClientConfiguration _configs[kMaxItems];
+    int _items{0};
+    // _client_cache_keys[i] is the client cache key of |_clients[i].
+    ClientCacheKey _client_cache_keys[kMaxItems];
     S3ClientPtr _clients[kMaxItems];
     Random _rand;
 };
 
-S3ClientFactory::S3ClientFactory() : _items(0), _rand((int)::time(NULL)) {}
+S3ClientFactory::S3ClientFactory() : _rand((int)::time(nullptr)) {}
+
+// Get an AWSCredentialsProvider based on CloudCredential
+std::shared_ptr<Aws::Auth::AWSCredentialsProvider> S3ClientFactory::_get_aws_credentials_provider(
+        const AWSCloudCredential& aws_cloud_credential) {
+    std::shared_ptr<Aws::Auth::AWSCredentialsProvider> credential_provider = nullptr;
+    // Create a base credentials provider
+    if (aws_cloud_credential.use_aws_sdk_default_behavior) {
+        credential_provider = std::make_shared<Aws::Auth::DefaultAWSCredentialsProviderChain>();
+    } else if (aws_cloud_credential.use_instance_profile) {
+        credential_provider = std::make_shared<Aws::Auth::InstanceProfileCredentialsProvider>();
+    } else if (!aws_cloud_credential.access_key.empty() && !aws_cloud_credential.secret_key.empty()) {
+        credential_provider = std::make_shared<Aws::Auth::SimpleAWSCredentialsProvider>(
+                aws_cloud_credential.access_key, aws_cloud_credential.secret_key, aws_cloud_credential.session_token);
+    } else {
+        DCHECK(false) << "Unreachable!";
+        credential_provider = std::make_shared<Aws::Auth::AnonymousAWSCredentialsProvider>();
+    }
+
+    if (!aws_cloud_credential.iam_role_arn.empty()) {
+        // Do assume role
+        Aws::Client::ClientConfiguration clientConfiguration{};
+        if (!aws_cloud_credential.sts_region.empty()) {
+            clientConfiguration.region = aws_cloud_credential.sts_region;
+        }
+        if (!aws_cloud_credential.sts_endpoint.empty()) {
+            clientConfiguration.endpointOverride = aws_cloud_credential.sts_endpoint;
+        }
+        auto sts = std::make_shared<Aws::STS::STSClient>(credential_provider, clientConfiguration);
+        credential_provider = std::make_shared<Aws::Auth::STSAssumeRoleCredentialsProvider>(
+                aws_cloud_credential.iam_role_arn, Aws::String(), aws_cloud_credential.external_id,
+                Aws::Auth::DEFAULT_CREDS_LOAD_FREQ_SECONDS, sts);
+    }
+    return credential_provider;
+}
+
+void S3ClientFactory::close() {
+    std::lock_guard l(_lock);
+    for (auto& item : _clients) {
+        item.reset();
+    }
+}
+
+S3ClientFactory::S3ClientPtr S3ClientFactory::new_client(const TCloudConfiguration& t_cloud_configuration) {
+    const AWSCloudConfiguration aws_cloud_configuration = CloudConfigurationFactory::create_aws(t_cloud_configuration);
+
+    Aws::Client::ClientConfiguration config = S3ClientFactory::getClientConfig();
+    AWSCloudCredential aws_cloud_credential = aws_cloud_configuration.aws_cloud_credential;
+    // Set into config
+    bool path_style_access = aws_cloud_configuration.enable_path_style_access;
+    if (aws_cloud_configuration.enable_ssl) {
+        config.scheme = Aws::Http::Scheme::HTTPS;
+    } else {
+        config.scheme = Aws::Http::Scheme::HTTP;
+    }
+
+    if (!aws_cloud_credential.region.empty()) {
+        config.region = aws_cloud_credential.region;
+    }
+    if (!aws_cloud_credential.endpoint.empty()) {
+        config.endpointOverride = aws_cloud_credential.endpoint;
+    }
+    config.maxConnections = config::object_storage_max_connection;
+    if (config::object_storage_connect_timeout_ms > 0) {
+        config.connectTimeoutMs = config::object_storage_connect_timeout_ms;
+    }
+    if (config::object_storage_request_timeout_ms >= 0) {
+        config.requestTimeoutMs = config::object_storage_request_timeout_ms;
+    }
+
+    ClientCacheKey client_cache_key{config, aws_cloud_configuration};
+    {
+        // Duplicate code for cache s3 client
+        std::lock_guard l(_lock);
+        for (size_t i = 0; i < _items; i++) {
+            if (_client_cache_keys[i] == client_cache_key) return _clients[i];
+        }
+    }
+
+    auto credential_provider = _get_aws_credentials_provider(aws_cloud_credential);
+
+    S3ClientPtr client = std::make_shared<Aws::S3::S3Client>(
+            credential_provider, config, Aws::Client::AWSAuthV4Signer::PayloadSigningPolicy::Never, !path_style_access);
+
+    {
+        std::lock_guard l(_lock);
+        if (UNLIKELY(_items >= kMaxItems)) {
+            int idx = _rand.Uniform(kMaxItems);
+            _client_cache_keys[idx] = client_cache_key;
+            _clients[idx] = client;
+        } else {
+            _client_cache_keys[_items] = client_cache_key;
+            _clients[_items] = client;
+            _items++;
+        }
+    }
+    return client;
+}
 
 S3ClientFactory::S3ClientPtr S3ClientFactory::new_client(const ClientConfiguration& config, const FSOptions& opts) {
     std::lock_guard l(_lock);
 
+    ClientCacheKey client_cache_key{config, AWSCloudConfiguration{}};
     for (size_t i = 0; i < _items; i++) {
-        if (_configs[i] == config) return _clients[i];
+        if (_client_cache_keys[i] == client_cache_key) return _clients[i];
     }
 
     S3ClientPtr client;
@@ -112,10 +237,12 @@ S3ClientFactory::S3ClientPtr S3ClientFactory::new_client(const ClientConfigurati
     bool path_style_access = config::object_storage_endpoint_path_style_access;
     const THdfsProperties* hdfs_properties = opts.hdfs_properties();
     if (hdfs_properties != nullptr) {
-        DCHECK(hdfs_properties->__isset.access_key);
-        DCHECK(hdfs_properties->__isset.secret_key);
-        access_key_id = hdfs_properties->access_key;
-        secret_access_key = hdfs_properties->secret_key;
+        if (hdfs_properties->__isset.access_key) {
+            access_key_id = hdfs_properties->access_key;
+        }
+        if (hdfs_properties->__isset.secret_key) {
+            secret_access_key = hdfs_properties->secret_key;
+        }
     } else {
         access_key_id = config::object_storage_access_key_id;
         secret_access_key = config::object_storage_secret_access_key;
@@ -138,30 +265,39 @@ S3ClientFactory::S3ClientPtr S3ClientFactory::new_client(const ClientConfigurati
 
     if (UNLIKELY(_items >= kMaxItems)) {
         int idx = _rand.Uniform(kMaxItems);
-        _configs[idx] = config;
+        _client_cache_keys[idx] = client_cache_key;
         _clients[idx] = client;
     } else {
-        _configs[_items] = config;
+        _client_cache_keys[_items] = client_cache_key;
         _clients[_items] = client;
         _items++;
     }
     return client;
 }
 
+// If you find yourself change this code, see also `bool operator==(const Aws::Client::ClientConfiguration&, const Aws::Client::ClientConfiguration&)`
 static std::shared_ptr<Aws::S3::S3Client> new_s3client(const S3URI& uri, const FSOptions& opts) {
     Aws::Client::ClientConfiguration config = S3ClientFactory::getClientConfig();
     const THdfsProperties* hdfs_properties = opts.hdfs_properties();
-    if (hdfs_properties != nullptr) {
+    // TODO(SmithCruise) If CloudType is DEFAULT, we should use hadoop sdk to access file,
+    // otherwise user's core-site.xml will not take effect in s3 sdk
+    if ((hdfs_properties != nullptr && hdfs_properties->__isset.cloud_configuration) ||
+        (opts.cloud_configuration != nullptr && opts.cloud_configuration->cloud_type != TCloudType::DEFAULT)) {
+        // Use CloudConfiguration instead of original logic
+        const TCloudConfiguration& tCloudConfiguration = (opts.cloud_configuration != nullptr)
+                                                                 ? *opts.cloud_configuration
+                                                                 : hdfs_properties->cloud_configuration;
+        return S3ClientFactory::instance().new_client(tCloudConfiguration);
+    } else if (hdfs_properties != nullptr) {
         DCHECK(hdfs_properties->__isset.end_point);
         if (hdfs_properties->__isset.end_point) {
             config.endpointOverride = hdfs_properties->end_point;
         }
-        if (hdfs_properties->__isset.ssl_enable && hdfs_properties->ssl_enable) {
-            config.scheme = Aws::Http::Scheme::HTTPS;
-        }
-
         if (hdfs_properties->__isset.region) {
             config.region = hdfs_properties->region;
+        }
+        if (hdfs_properties->__isset.ssl_enable && hdfs_properties->ssl_enable) {
+            config.scheme = Aws::Http::Scheme::HTTPS;
         }
         if (hdfs_properties->__isset.max_connection) {
             config.maxConnections = hdfs_properties->max_connection;
@@ -183,6 +319,13 @@ static std::shared_ptr<Aws::S3::S3Client> new_s3client(const S3URI& uri, const F
         }
         config.maxConnections = config::object_storage_max_connection;
     }
+    if (config::object_storage_connect_timeout_ms > 0) {
+        config.connectTimeoutMs = config::object_storage_connect_timeout_ms;
+    }
+    // 0 is meaningful for object_storage_request_timeout_ms
+    if (config::object_storage_request_timeout_ms >= 0) {
+        config.requestTimeoutMs = config::object_storage_request_timeout_ms;
+    }
     return S3ClientFactory::instance().new_client(config, opts);
 }
 
@@ -198,12 +341,17 @@ public:
 
     Type type() const override { return S3; }
 
-    StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const std::string& path) override;
+    using FileSystem::new_sequential_file;
+    using FileSystem::new_random_access_file;
 
     StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const RandomAccessFileOptions& opts,
                                                                        const std::string& path) override;
 
-    StatusOr<std::unique_ptr<SequentialFile>> new_sequential_file(const std::string& path) override;
+    StatusOr<std::unique_ptr<RandomAccessFile>> new_random_access_file(const RandomAccessFileOptions& opts,
+                                                                       const FileInfo& file_info) override;
+
+    StatusOr<std::unique_ptr<SequentialFile>> new_sequential_file(const SequentialFileOptions& opts,
+                                                                  const std::string& path) override;
 
     // FIXME: `new_writable_file()` will not truncate an already-exist file/object, which does not satisfy
     // the API requirement.
@@ -214,13 +362,13 @@ public:
 
     Status path_exists(const std::string& path) override { return Status::NotSupported("S3FileSystem::path_exists"); }
 
-    Status list_path(const std::string& dir, std::vector<FileStatus>* result) override;
-
     Status get_children(const std::string& dir, std::vector<std::string>* file) override {
         return Status::NotSupported("S3FileSystem::get_children");
     }
 
     Status iterate_dir(const std::string& dir, const std::function<bool(std::string_view)>& cb) override;
+
+    Status iterate_dir2(const std::string& dir, const std::function<bool(DirEntry)>& cb) override;
 
     Status delete_file(const std::string& path) override;
 
@@ -262,10 +410,6 @@ private:
     FSOptions _options;
 };
 
-StatusOr<std::unique_ptr<RandomAccessFile>> S3FileSystem::new_random_access_file(const std::string& path) {
-    return S3FileSystem::new_random_access_file(RandomAccessFileOptions(), path);
-}
-
 StatusOr<std::unique_ptr<RandomAccessFile>> S3FileSystem::new_random_access_file(const RandomAccessFileOptions& opts,
                                                                                  const std::string& path) {
     S3URI uri;
@@ -277,7 +421,23 @@ StatusOr<std::unique_ptr<RandomAccessFile>> S3FileSystem::new_random_access_file
     return std::make_unique<RandomAccessFile>(std::move(input_stream), path);
 }
 
-StatusOr<std::unique_ptr<SequentialFile>> S3FileSystem::new_sequential_file(const std::string& path) {
+StatusOr<std::unique_ptr<RandomAccessFile>> S3FileSystem::new_random_access_file(const RandomAccessFileOptions& opts,
+                                                                                 const FileInfo& file_info) {
+    S3URI uri;
+    if (!uri.parse(file_info.path)) {
+        return Status::InvalidArgument(fmt::format("Invalid S3 URI: {}", file_info.path));
+    }
+    auto client = new_s3client(uri, _options);
+    auto input_stream = std::make_shared<io::S3InputStream>(std::move(client), uri.bucket(), uri.key());
+    if (file_info.size.has_value()) {
+        input_stream->set_size(file_info.size.value());
+    }
+    return std::make_unique<RandomAccessFile>(std::move(input_stream), file_info.path);
+}
+
+StatusOr<std::unique_ptr<SequentialFile>> S3FileSystem::new_sequential_file(const SequentialFileOptions& opts,
+                                                                            const std::string& path) {
+    (void)opts;
     S3URI uri;
     if (!uri.parse(path)) {
         return Status::InvalidArgument(fmt::format("Invalid S3 URI: {}", path));
@@ -372,7 +532,12 @@ Status S3FileSystem::iterate_dir(const std::string& dir, const std::function<boo
     Aws::S3::Model::ListObjectsV2Result result;
     request.WithBucket(uri.bucket()).WithPrefix(uri.key()).WithDelimiter("/");
 #ifdef BE_TEST
-    request.SetMaxKeys(1);
+    // NOTE: set max-keys to a small number in BE_TEST mode to force the following list/delete operations
+    // iterating more than one loop, and hence resulting a better code coverage.
+    //
+    // Don't set max-keys to 1, to avoid hitting minio so-called optimization/feature or whatever.
+    // Refer https://github.com/minio/minio/pull/13000 for details.
+    request.SetMaxKeys(2);
 #endif
     do {
         auto outcome = client->ListObjectsV2(request);
@@ -410,7 +575,7 @@ Status S3FileSystem::iterate_dir(const std::string& dir, const std::function<boo
     return directory_exist ? Status::OK() : Status::NotFound(dir);
 }
 
-Status S3FileSystem::list_path(const std::string& dir, std::vector<FileStatus>* file_status) {
+Status S3FileSystem::iterate_dir2(const std::string& dir, const std::function<bool(DirEntry)>& cb) {
     S3URI uri;
     if (!uri.parse(dir)) {
         return Status::InvalidArgument(fmt::format("Invalid S3 URI {}", dir));
@@ -441,9 +606,10 @@ Status S3FileSystem::list_path(const std::string& dir, std::vector<FileStatus>* 
             const auto& full_name = cp.GetPrefix();
 
             std::string_view name(full_name.data() + uri.key().size(), full_name.size() - uri.key().size() - 1);
-            bool is_dir = true;
-            int64_t file_size = 0;
-            file_status->emplace_back(std::move(name), is_dir, file_size);
+            DirEntry entry{.name = name, .is_dir = {true}};
+            if (!cb(entry)) {
+                return Status::OK();
+            }
         }
         for (auto&& obj : result.GetContents()) {
             if (obj.GetKey() == uri.key()) {
@@ -452,19 +618,27 @@ Status S3FileSystem::list_path(const std::string& dir, std::vector<FileStatus>* 
             DCHECK(HasPrefixString(obj.GetKey(), uri.key()));
 
             std::string_view obj_key(obj.GetKey());
-            bool is_dir = true;
-            int64_t file_size = 0;
+            DirEntry entry;
+            if (obj.LastModifiedHasBeenSet()) {
+                entry.mtime = obj.GetLastModified().Seconds();
+            }
             if (obj_key.back() == '/') {
                 obj_key = std::string_view(obj_key.data(), obj_key.size() - 1);
+                entry.is_dir = true;
             } else {
                 DCHECK(obj.SizeHasBeenSet());
-                is_dir = false;
-                file_size = obj.GetSize();
+                entry.is_dir = false;
+                if (obj.SizeHasBeenSet()) {
+                    entry.size = obj.GetSize();
+                }
             }
 
             std::string_view name(obj_key.data() + uri.key().size(), obj_key.size() - uri.key().size());
+            entry.name = name;
 
-            file_status->emplace_back(std::move(name), is_dir, file_size);
+            if (!cb(entry)) {
+                return Status::OK();
+            }
         }
     } while (result.GetIsTruncated());
     return directory_exist ? Status::OK() : Status::NotFound(dir);
@@ -634,7 +808,12 @@ Status S3FileSystem::delete_dir_recursive(const std::string& dirname) {
     Aws::S3::Model::ListObjectsV2Result result;
     request.WithBucket(uri.bucket()).WithPrefix(uri.key());
 #ifdef BE_TEST
-    request.SetMaxKeys(1);
+    // NOTE: set max-keys to a small number in BE_TEST mode to force the following list/delete operations
+    // iterating more than one loop, and hence resulting a better code coverage.
+    //
+    // Don't set max-keys to 1, to avoid hitting minio so-called optimization/feature or whatever.
+    // Refer https://github.com/minio/minio/pull/13000 for details.
+    request.SetMaxKeys(2);
 #endif
 
     Aws::S3::Model::DeleteObjectsRequest delete_request;
@@ -671,6 +850,10 @@ Status S3FileSystem::delete_dir_recursive(const std::string& dirname) {
 
 std::unique_ptr<FileSystem> new_fs_s3(const FSOptions& options) {
     return std::make_unique<S3FileSystem>(options);
+}
+
+void close_s3_clients() {
+    S3ClientFactory::instance().close();
 }
 
 } // namespace starrocks

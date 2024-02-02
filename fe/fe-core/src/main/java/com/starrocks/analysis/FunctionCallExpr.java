@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/FunctionCallExpr.java
 
@@ -25,13 +38,14 @@ import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.ImmutableSet;
-import com.google.common.collect.ImmutableSortedSet;
 import com.google.common.collect.Lists;
 import com.starrocks.catalog.AggregateFunction;
 import com.starrocks.catalog.Function;
 import com.starrocks.catalog.FunctionSet;
+import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TAggregateExpr;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
@@ -42,6 +56,8 @@ import java.io.IOException;
 import java.util.List;
 import java.util.Objects;
 import java.util.Set;
+
+import static com.starrocks.catalog.FunctionSet.IGNORE_NULL_WINDOW_FUNCTION;
 
 public class FunctionCallExpr extends Expr {
     private FunctionName fnName;
@@ -60,12 +76,6 @@ public class FunctionCallExpr extends Expr {
     // because when create merge agg fn from update agg fn,
     // The slot SlotDescriptor nullable info will lost or change
     private boolean mergeAggFnHasNullableChild = true;
-
-    private static final ImmutableSet<String> STDDEV_FUNCTION_SET =
-            new ImmutableSortedSet.Builder<>(String.CASE_INSENSITIVE_ORDER)
-                    .add(FunctionSet.STDDEV).add(FunctionSet.STDDEV_VAL).add(FunctionSet.STDDEV_SAMP)
-                    .add(FunctionSet.VARIANCE).add(FunctionSet.VARIANCE_POP).add(FunctionSet.VARIANCE_POP)
-                    .add(FunctionSet.VAR_SAMP).add(FunctionSet.VAR_POP).build();
 
     // TODO(yan): add more known functions which are monotonic.
     private static final ImmutableSet<String> MONOTONIC_FUNCTION_SET =
@@ -93,28 +103,44 @@ public class FunctionCallExpr extends Expr {
 
     // only used restore from readFields.
     private FunctionCallExpr() {
-        super();
+        super(NodePosition.ZERO);
     }
 
     public FunctionCallExpr(String functionName, List<Expr> params) {
-        this(new FunctionName(functionName), new FunctionParams(false, params));
+        this(new FunctionName(functionName), new FunctionParams(false, params), NodePosition.ZERO);
+    }
+
+    public FunctionCallExpr(String functionName, List<Expr> params, NodePosition pos) {
+        this(new FunctionName(functionName), new FunctionParams(false, params), pos);
     }
 
     public FunctionCallExpr(FunctionName fnName, List<Expr> params) {
-        this(fnName, new FunctionParams(false, params));
+        this(fnName, new FunctionParams(false, params), NodePosition.ZERO);
+    }
+
+    public FunctionCallExpr(FunctionName fnName, List<Expr> params, NodePosition pos) {
+        this(fnName, new FunctionParams(false, params), pos);
     }
 
     public FunctionCallExpr(String fnName, FunctionParams params) {
-        this(new FunctionName(fnName), params);
+        this(new FunctionName(fnName), params, NodePosition.ZERO);
+    }
+
+    public FunctionCallExpr(String fnName, FunctionParams params, NodePosition pos) {
+        this(new FunctionName(fnName), params, pos);
     }
 
     public FunctionCallExpr(FunctionName fnName, FunctionParams params) {
-        this(fnName, params, false);
+        this(fnName, params, false, NodePosition.ZERO);
+    }
+
+    public FunctionCallExpr(FunctionName fnName, FunctionParams params, NodePosition pos) {
+        this(fnName, params, false, pos);
     }
 
     private FunctionCallExpr(
-            FunctionName fnName, FunctionParams params, boolean isMergeAggFn) {
-        super();
+            FunctionName fnName, FunctionParams params, boolean isMergeAggFn, NodePosition pos) {
+        super(pos);
         this.fnName = fnName;
         fnParams = params;
         this.isMergeAggFn = isMergeAggFn;
@@ -151,7 +177,7 @@ public class FunctionCallExpr extends Expr {
             Preconditions.checkState(children.isEmpty());
             fnParams = FunctionParams.createStarParam();
         } else {
-            fnParams = new FunctionParams(other.fnParams.isDistinct(), children);
+            fnParams = new FunctionParams(other.fnParams.isDistinct(), children, other.fnParams.getOrderByElements());
         }
         this.isMergeAggFn = other.isMergeAggFn;
         this.mergeAggFnHasNullableChild = other.mergeAggFnHasNullableChild;
@@ -190,18 +216,7 @@ public class FunctionCallExpr extends Expr {
         }
     }
 
-    @Override
-    public boolean equals(Object obj) {
-        if (!super.equals(obj)) {
-            return false;
-        }
-        FunctionCallExpr o = (FunctionCallExpr) obj;
-        return /*opcode == o.opcode && aggOp == o.aggOp &&*/ fnName.equals(o.fnName)
-                && fnParams.isDistinct() == o.fnParams.isDistinct()
-                && fnParams.isStar() == o.fnParams.isStar()
-                && nondeterministicId.equals(o.nondeterministicId);
-    }
-
+    // TODO: process order by
     @Override
     public String toSqlImpl() {
         StringBuilder sb = new StringBuilder();
@@ -214,7 +229,11 @@ public class FunctionCallExpr extends Expr {
         if (fnParams.isDistinct()) {
             sb.append("DISTINCT ");
         }
-        sb.append(Joiner.on(", ").join(childrenToSql())).append(")");
+        sb.append(Joiner.on(", ").join(firstNChildrenToSql(children.size() - fnParams.getOrderByElemNum())));
+        if (fnParams.getOrderByElements() != null) {
+            sb.append(fnParams.getOrderByStringToSql());
+        }
+        sb.append(')');
         return sb.toString();
     }
 
@@ -231,7 +250,14 @@ public class FunctionCallExpr extends Expr {
         if (fnParams.isDistinct()) {
             sb.append("distinct ");
         }
-        sb.append(Joiner.on(", ").join(childrenToExplain())).append(");");
+        if (fnParams.getOrderByElements() == null) {
+            sb.append(Joiner.on(", ").join(firstNChildrenToExplain(children.size()))).append(");");
+        } else {
+            sb.append(Joiner.on(", ").join(firstNChildrenToExplain(
+                    children.size() - fnParams.getOrderByElements().size())));
+            sb.append(fnParams.getOrderByStringToExplain());
+            sb.append(')');
+        }
         if (fn != null) {
             sb.append(" args: ");
             for (int i = 0; i < fn.getArgs().length; ++i) {
@@ -249,10 +275,21 @@ public class FunctionCallExpr extends Expr {
         return sb.toString();
     }
 
-    public List<String> childrenToExplain() {
+    // explain the first N children
+    public List<String> firstNChildrenToExplain(int n) {
+        Preconditions.checkState(n <= children.size());
         List<String> result = Lists.newArrayList();
-        for (Expr child : children) {
-            result.add(child.explain());
+        for (int i = 0; i < n; i++) {
+            result.add(children.get(i).explain());
+        }
+        return result;
+    }
+
+    public List<String> firstNChildrenToSql(int n) {
+        Preconditions.checkState(n <= children.size());
+        List<String> result = Lists.newArrayList();
+        for (int i = 0; i < n; i++) {
+            result.add(children.get(i).toSql());
         }
         return result;
     }
@@ -260,8 +297,9 @@ public class FunctionCallExpr extends Expr {
     @Override
     public String debugString() {
         return MoreObjects.toStringHelper(this)/*.add("op", aggOp)*/.add("name", fnName).add("isStar",
-                fnParams.isStar()).add("isDistinct", fnParams.isDistinct()).addValue(
-                super.debugString()).toString();
+                        fnParams.isStar()).add("isDistinct", fnParams.isDistinct()).
+                add(" hasOrderBy ", fnParams.getOrderByElements() != null).addValue(
+                        super.debugString()).toString();
     }
 
     public FunctionParams getParams() {
@@ -323,10 +361,7 @@ public class FunctionCallExpr extends Expr {
         }
 
         // For BE code simply, handle the following window functions with nullable
-        if (fnName.getFunction().equalsIgnoreCase(FunctionSet.LEAD) ||
-                fnName.getFunction().equalsIgnoreCase(FunctionSet.LAG) ||
-                fnName.getFunction().equalsIgnoreCase(FunctionSet.FIRST_VALUE) ||
-                fnName.getFunction().equalsIgnoreCase(FunctionSet.LAST_VALUE)) {
+        if (IGNORE_NULL_WINDOW_FUNCTION.contains(fnName)) {
             return true;
         }
 
@@ -349,18 +384,6 @@ public class FunctionCallExpr extends Expr {
             return children.stream().anyMatch(e -> e.isNullable() || e.getType().isDecimalV3());
         }
         return true;
-    }
-
-    public static FunctionCallExpr createMergeAggCall(
-            FunctionCallExpr agg, List<Expr> params) {
-        Preconditions.checkState(agg.isAnalyzed);
-        Preconditions.checkState(agg.isAggregateFunction());
-        FunctionCallExpr result = new FunctionCallExpr(
-                agg.fnName, new FunctionParams(false, params), true);
-        // Inherit the function object from 'agg'.
-        result.fn = agg.fn;
-        result.type = agg.type;
-        return result;
     }
 
     @Override
@@ -435,8 +458,21 @@ public class FunctionCallExpr extends Expr {
 
     @Override
     public int hashCode() {
-        // fnParams contains all information of children Expr. No need to calculate super's hashcode again.
-        return Objects.hash(type, opcode, fnName, fnParams, nondeterministicId);
+        // @Note: fnParams is different with children Expr. use children plz.
+        return Objects.hash(super.hashCode(), type, opcode, fnName, nondeterministicId);
+    }
+
+    @Override
+    public boolean equals(Object obj) {
+        if (!super.equals(obj)) {
+            return false;
+        }
+        FunctionCallExpr o = (FunctionCallExpr) obj;
+        return /*opcode == o.opcode && aggOp == o.aggOp &&*/ fnName.equals(o.fnName)
+                && fnParams.isDistinct() == o.fnParams.isDistinct()
+                && fnParams.isStar() == o.fnParams.isStar()
+                && nondeterministicId.equals(o.nondeterministicId)
+                && Objects.equals(fnParams.getOrderByElements(), o.fnParams.getOrderByElements());
     }
 
     /**
@@ -459,4 +495,15 @@ public class FunctionCallExpr extends Expr {
         }
         return false;
     }
+
+    @Override
+    public Expr uncheckedCastTo(Type targetType) throws AnalysisException {
+        Type type = getFn().getReturnType();
+        if (!type.equals(targetType)) {
+            return super.uncheckedCastTo(targetType);
+        } else {
+            return this;
+        }
+    }
+
 }

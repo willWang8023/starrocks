@@ -1,13 +1,43 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.catalog;
 
 import com.google.common.collect.Lists;
+import com.starrocks.analysis.DescriptorTable;
+import com.starrocks.analysis.SlotDescriptor;
+import com.starrocks.analysis.TupleDescriptor;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.NotImplementedException;
+import com.starrocks.common.UserException;
+import com.starrocks.planner.OlapTableSink;
+import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.QueryState;
+import com.starrocks.qe.StmtExecutor;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.TruncateTableStmt;
+import com.starrocks.thrift.TDataSink;
 import com.starrocks.thrift.TStorageMedium;
+import com.starrocks.thrift.TUniqueId;
+import com.starrocks.thrift.TWriteQuorumType;
+import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
+import mockit.Expectations;
+import mockit.Injectable;
 import org.junit.Assert;
 import org.junit.Before;
 import org.junit.BeforeClass;
@@ -22,12 +52,14 @@ import java.io.IOException;
 import java.text.DateFormat;
 import java.text.ParseException;
 import java.text.SimpleDateFormat;
+import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
 public class ListPartitionInfoTest {
 
+    private static StarRocksAssert starRocksAssert;
     private ListPartitionInfo listPartitionInfo;
     private ListPartitionInfo listPartitionInfoForMulti;
 
@@ -36,12 +68,50 @@ public class ListPartitionInfoTest {
         UtFrameUtils.createMinStarRocksCluster();
         UtFrameUtils.addMockBackend(10002);
         UtFrameUtils.addMockBackend(10003);
+        starRocksAssert = new StarRocksAssert();
+        starRocksAssert.withDatabase("test").useDatabase("test")
+                .withTable("CREATE TABLE t_recharge_detail(\n" +
+                        "    id bigint not null ,\n" +
+                        "    user_id  bigint not null ,\n" +
+                        "    recharge_money decimal(32,2) , \n" +
+                        "    province varchar(20) not null,\n" +
+                        "    dt varchar(20) not null\n" +
+                        ") ENGINE=OLAP\n" +
+                        "DUPLICATE KEY(id)\n" +
+                        "PARTITION BY LIST (dt,province) (\n" +
+                        "   PARTITION p1 VALUES IN ((\"2022-04-01\", \"beijing\")),\n" +
+                        "   PARTITION p2 VALUES IN ((\"2022-04-01\", \"shanghai\"))\n" +
+                        ")\n" +
+                        "DISTRIBUTED BY HASH(`id`) BUCKETS 10 \n" +
+                        "PROPERTIES (\n" +
+                        "\"replication_num\" = \"1\",\n" +
+                        "\"in_memory\" = \"false\"\n" +
+                        ");");
     }
 
     @Before
     public void setUp() throws DdlException, AnalysisException {
         this.listPartitionInfo = new ListPartitionDescTest().findSingleListPartitionInfo();
         this.listPartitionInfoForMulti = new ListPartitionDescTest().findMultiListPartitionInfo();
+    }
+
+    @Test
+    public void testListPartitionQueryPlan() throws Exception {
+        String sql = "SELECT * FROM t_recharge_detail";
+        starRocksAssert.query(sql).explainQuery();
+    }
+
+    @Test
+    public void testTruncateWithPartition() throws Exception {
+        ConnectContext ctx = starRocksAssert.getCtx();
+        String truncateSql = "truncate table t_recharge_detail partition(p1)";
+        TruncateTableStmt truncateTableStmt = (TruncateTableStmt) UtFrameUtils.parseStmtWithNewParser(truncateSql, ctx);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().truncateTable(truncateTableStmt);
+        String showSql = "show partitions from t_recharge_detail;";
+        StatementBase statementBase = UtFrameUtils.parseStmtWithNewParser(showSql, ctx);
+        StmtExecutor executor = new StmtExecutor(ctx, statementBase);
+        executor.execute();
+        Assert.assertNotEquals(QueryState.MysqlStateType.ERR, ctx.getState().getStateType());
     }
 
     @Test
@@ -95,6 +165,60 @@ public class ListPartitionInfoTest {
         }
     }
 
+    @Test
+    public void testMultiListPartition(@Injectable OlapTable dstTable) throws UserException {
+
+        DescriptorTable descTable = new DescriptorTable();
+        TupleDescriptor tuple = descTable.createTupleDescriptor("DstTable");
+        // k1
+        SlotDescriptor k1 = descTable.addSlotDescriptor(tuple);
+        k1.setColumn(new Column("k1", Type.BIGINT));
+        k1.setIsMaterialized(true);
+
+        // k2
+        SlotDescriptor k2 = descTable.addSlotDescriptor(tuple);
+        k2.setColumn(new Column("k2", ScalarType.createVarchar(25)));
+        k2.setIsMaterialized(true);
+        // v1
+        SlotDescriptor v1 = descTable.addSlotDescriptor(tuple);
+        v1.setColumn(new Column("v1", ScalarType.createVarchar(25)));
+        v1.setIsMaterialized(true);
+        // v2
+        SlotDescriptor v2 = descTable.addSlotDescriptor(tuple);
+        v2.setColumn(new Column("v2", Type.BIGINT));
+        v2.setIsMaterialized(true);
+
+        ListPartitionInfo listPartitionInfo = new ListPartitionInfo(PartitionType.LIST,
+                Lists.newArrayList(new Column("dt", Type.STRING), new Column("province", Type.STRING)));
+        List<String> multiItems = Lists.newArrayList("dt", "shanghai");
+        List<List<String>> multiValues = new ArrayList<>();
+        multiValues.add(multiItems);
+
+        listPartitionInfo.setMultiValues(1, multiValues);
+        listPartitionInfo.setReplicationNum(1, (short) 3);
+        MaterializedIndex index = new MaterializedIndex(1, MaterializedIndex.IndexState.NORMAL);
+        HashDistributionInfo distInfo = new HashDistributionInfo(
+                3, Lists.newArrayList(new Column("id", Type.BIGINT)));
+        Partition partition = new Partition(1, "p1", index, distInfo);
+
+        new Expectations() {{
+                dstTable.getId();
+                result = 1;
+                dstTable.getPartitions();
+                result = Lists.newArrayList(partition);
+                dstTable.getPartition(1L);
+                result = partition;
+                dstTable.getPartitionInfo();
+                result = listPartitionInfo;
+            }};
+
+        OlapTableSink sink = new OlapTableSink(dstTable, tuple, Lists.newArrayList(1L),
+                TWriteQuorumType.MAJORITY, false, false, false);
+        sink.init(new TUniqueId(1, 2), 3, 4, 1000);
+        sink.complete();
+
+        Assert.assertTrue(sink.toThrift() instanceof TDataSink);
+    }
 
     @Test
     public void testToSqlForSingle() {

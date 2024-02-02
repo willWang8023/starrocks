@@ -1,9 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.catalog.Function;
@@ -106,7 +119,7 @@ public class ScalarApply2JoinRule extends TransformationRule {
         CorrelatedPredicateRewriter rewriter = new CorrelatedPredicateRewriter(
                 apply.getCorrelationColumnRefs(), context);
 
-        ScalarOperator newPredicate = SubqueryUtils.rewritePredicateAndExtractColumnRefs(correlationPredicate, rewriter);
+        ScalarOperator newPredicate = rewriter.rewrite(correlationPredicate);
 
         Map<ColumnRefOperator, ScalarOperator> innerRefMap = rewriter.getColumnRefToExprMap();
 
@@ -140,6 +153,11 @@ public class ScalarApply2JoinRule extends TransformationRule {
         // any_value aggregate
         ScalarOperator subqueryOperator = apply.getSubqueryOperator();
         CallOperator anyValueCallOp = SubqueryUtils.createAnyValueOperator(subqueryOperator);
+        if (anyValueCallOp.getFunction() == null) {
+            throw new SemanticException(String.format(
+                    "NOT support scalar correlated sub-query of type %s",
+                    subqueryOperator.getType().toSql()));
+        }
         ColumnRefOperator anyValue = factory.create("anyValue", anyValueCallOp.getType(), anyValueCallOp.isNullable());
         aggregates.put(anyValue, anyValueCallOp);
 
@@ -172,17 +190,17 @@ public class ScalarApply2JoinRule extends TransformationRule {
         // Add assertion column
         IsNullPredicateOperator countRowsIsNullPredicate = new IsNullPredicateOperator(countRows);
         BinaryPredicateOperator countRowsLEOneRowPredicate =
-                new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.LE, countRows,
+                new BinaryPredicateOperator(BinaryType.LE, countRows,
                         ConstantOperator.createBigint(1));
         PredicateOperator countRowsPredicate =
                 new CompoundPredicateOperator(CompoundPredicateOperator.CompoundType.OR, countRowsIsNullPredicate,
                         countRowsLEOneRowPredicate);
-        Function assertTrueFn = Expr.getBuiltinFunction(FunctionSet.ASSERT_TRUE, new Type[] {Type.BOOLEAN},
-                Function.CompareMode.IS_IDENTICAL);
-        CallOperator assertTrueCallOp =
-                new CallOperator(FunctionSet.ASSERT_TRUE, Type.BOOLEAN,
-                        Collections.singletonList(countRowsPredicate),
-                        assertTrueFn);
+        Function assertTrueFn =
+                Expr.getBuiltinFunction(FunctionSet.ASSERT_TRUE, new Type[] {Type.BOOLEAN, Type.VARCHAR},
+                        Function.CompareMode.IS_IDENTICAL);
+        CallOperator assertTrueCallOp = new CallOperator(FunctionSet.ASSERT_TRUE, Type.BOOLEAN,
+                Lists.newArrayList(countRowsPredicate,
+                        ConstantOperator.createVarchar("correlate scalar subquery result must 1 row")), assertTrueFn);
         ColumnRefOperator assertion =
                 factory.create("subquery_assertion", assertTrueCallOp.getType(), assertTrueCallOp.isNullable());
         projectMap.put(assertion, assertTrueCallOp);
@@ -229,8 +247,9 @@ public class ScalarApply2JoinRule extends TransformationRule {
         assertOptExpression.getInputs().add(input.getInputs().get(1));
 
         // use hint, forbidden reorder un-correlate subquery
-        OptExpression joinOptExpression = new OptExpression(
-                LogicalJoinOperator.builder().setJoinType(JoinOperator.CROSS_JOIN).setJoinHint("broadcast").build());
+        OptExpression joinOptExpression = new OptExpression(LogicalJoinOperator.builder()
+                .setJoinType(JoinOperator.CROSS_JOIN)
+                .setJoinHint(JoinOperator.HINT_BROADCAST).build());
         joinOptExpression.getInputs().add(input.getInputs().get(0));
         joinOptExpression.getInputs().add(assertOptExpression);
 

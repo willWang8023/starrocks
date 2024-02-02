@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exprs/table_function/java_udtf_function.h"
 
@@ -17,8 +29,9 @@
 #include "udf/java/java_data_converter.h"
 #include "udf/java/java_udf.h"
 #include "udf/java/utils.h"
+#include "util/defer_op.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 const TableFunction* getJavaUDTFFunction() {
     static JavaUDTFFunction java_table_function;
@@ -29,7 +42,7 @@ class JavaUDTFState : public TableFunctionState {
 public:
     JavaUDTFState(std::string libpath, std::string symbol, const TTypeDesc& desc)
             : _libpath(std::move(libpath)), _symbol(std::move(symbol)), _ret_type(TypeDescriptor::from_thrift(desc)) {}
-    ~JavaUDTFState() {}
+    ~JavaUDTFState() override = default;
 
     Status open();
     void close();
@@ -110,7 +123,8 @@ Status JavaUDTFFunction::close(RuntimeState* runtime_state, TableFunctionState* 
     return Status::OK();
 }
 
-std::pair<Columns, ColumnPtr> JavaUDTFFunction::process(TableFunctionState* state, bool* eos) const {
+std::pair<Columns, UInt32Column::Ptr> JavaUDTFFunction::process(RuntimeState* runtime_state,
+                                                                TableFunctionState* state) const {
     Columns res;
     const Columns& cols = state->get_columns();
     auto* stateUDTF = down_cast<JavaUDTFState*>(state);
@@ -123,8 +137,17 @@ std::pair<Columns, ColumnPtr> JavaUDTFFunction::process(TableFunctionState* stat
 
     std::vector<jvalue> call_stack;
     std::vector<jobject> rets;
+    DeferOp defer = DeferOp([&]() {
+        // clean up arrays
+        for (auto& ret : rets) {
+            if (ret) {
+                env->DeleteLocalRef(ret);
+            }
+        }
+    });
     size_t num_rows = cols[0]->size();
     size_t num_cols = cols.size();
+    state->set_processed_rows(num_rows);
 
     call_stack.reserve(num_cols);
     rets.resize(num_rows);
@@ -161,6 +184,7 @@ std::pair<Columns, ColumnPtr> JavaUDTFFunction::process(TableFunctionState* stat
         // update for col
         for (int j = 0; j < len; ++j) {
             jobject vi = env->GetObjectArrayElement((jobjectArray)rets[i], j);
+            LOCAL_REF_GUARD_ENV(env, vi);
             append_jvalue(method_desc, col.get(), {.l = vi});
             release_jvalue(method_desc.is_box, {.l = vi});
         }
@@ -178,4 +202,4 @@ std::pair<Columns, ColumnPtr> JavaUDTFFunction::process(TableFunctionState* stat
     return std::make_pair(std::move(res), std::move(offsets_col));
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

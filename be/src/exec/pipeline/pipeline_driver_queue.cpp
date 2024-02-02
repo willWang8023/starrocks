@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exec/pipeline/pipeline_driver_queue.h"
 
@@ -39,6 +51,8 @@ void QuerySharedDriverQueue::put_back(const DriverRawPtr driver) {
         std::lock_guard<std::mutex> lock(_global_mutex);
         _queues[level].put(driver);
         driver->set_in_ready_queue(true);
+        driver->set_in_queue(this);
+        driver->update_peak_driver_queue_size_counter(_num_drivers);
         _cv.notify_one();
         ++_num_drivers;
     }
@@ -54,6 +68,8 @@ void QuerySharedDriverQueue::put_back(const std::vector<DriverRawPtr>& drivers) 
     for (int i = 0; i < drivers.size(); i++) {
         _queues[levels[i]].put(drivers[i]);
         drivers[i]->set_in_ready_queue(true);
+        drivers[i]->set_in_queue(this);
+        drivers[i]->update_peak_driver_queue_size_counter(_num_drivers);
         _cv.notify_one();
     }
     _num_drivers += drivers.size();
@@ -64,11 +80,11 @@ void QuerySharedDriverQueue::put_back_from_executor(const DriverRawPtr driver) {
     put_back(driver);
 }
 
-StatusOr<DriverRawPtr> QuerySharedDriverQueue::take() {
+StatusOr<DriverRawPtr> QuerySharedDriverQueue::take(const bool block) {
     // -1 means no candidates; else has candidate.
     int queue_idx = -1;
     double target_accu_time = 0;
-    DriverRawPtr driver_ptr;
+    DriverRawPtr driver_ptr = nullptr;
 
     {
         std::unique_lock<std::mutex> lock(_global_mutex);
@@ -92,13 +108,19 @@ StatusOr<DriverRawPtr> QuerySharedDriverQueue::take() {
             if (queue_idx >= 0) {
                 break;
             }
+            if (!block) {
+                break;
+            }
             _cv.wait(lock);
         }
-        // record queue's index to accumulate time for it.
-        driver_ptr = _queues[queue_idx].take();
-        driver_ptr->set_in_ready_queue(false);
 
-        --_num_drivers;
+        if (queue_idx >= 0) {
+            // record queue's index to accumulate time for it.
+            driver_ptr = _queues[queue_idx].take(false);
+            driver_ptr->set_in_ready_queue(false);
+
+            --_num_drivers;
+        }
     }
 
     // next pipeline driver to execute.
@@ -157,8 +179,9 @@ void SubQuerySharedDriverQueue::cancel(const DriverRawPtr driver) {
     }
 }
 
-DriverRawPtr SubQuerySharedDriverQueue::take() {
+DriverRawPtr SubQuerySharedDriverQueue::take(const bool block) {
     DCHECK(!empty());
+    DCHECK(!block);
     if (!pending_cancel_queue.empty()) {
         DriverRawPtr driver = pending_cancel_queue.front();
         pending_cancel_queue.pop();
@@ -183,8 +206,13 @@ DriverRawPtr SubQuerySharedDriverQueue::take() {
 
 /// WorkGroupDriverQueue.
 bool WorkGroupDriverQueue::WorkGroupDriverSchedEntityComparator::operator()(
-        const WorkGroupDriverSchedEntityPtr& lhs, const WorkGroupDriverSchedEntityPtr& rhs) const {
-    return lhs->vruntime_ns() < rhs->vruntime_ns();
+        const WorkGroupDriverSchedEntityPtr& lhs_ptr, const WorkGroupDriverSchedEntityPtr& rhs_ptr) const {
+    int64_t lhs_val = lhs_ptr->vruntime_ns();
+    int64_t rhs_val = rhs_ptr->vruntime_ns();
+    if (lhs_val != rhs_val) {
+        return lhs_val < rhs_val;
+    }
+    return lhs_ptr < rhs_ptr;
 }
 
 void WorkGroupDriverQueue::close() {
@@ -210,7 +238,7 @@ void WorkGroupDriverQueue::put_back_from_executor(const DriverRawPtr driver) {
     _put_back<true>(driver);
 }
 
-StatusOr<DriverRawPtr> WorkGroupDriverQueue::take() {
+StatusOr<DriverRawPtr> WorkGroupDriverQueue::take(const bool block) {
     std::unique_lock<std::mutex> lock(_global_mutex);
 
     workgroup::WorkGroupDriverSchedEntity* wg_entity = nullptr;
@@ -222,6 +250,9 @@ StatusOr<DriverRawPtr> WorkGroupDriverQueue::take() {
         _update_bandwidth_control_period();
 
         if (_wg_entities.empty()) {
+            if (!block) {
+                return nullptr;
+            }
             _cv.wait(lock);
         } else if (wg_entity = _take_next_wg(); wg_entity == nullptr) {
             int64_t cur_ns = MonotonicNanos();
@@ -230,6 +261,9 @@ StatusOr<DriverRawPtr> WorkGroupDriverQueue::take() {
                 continue;
             }
 
+            if (!block) {
+                return nullptr;
+            }
             // All the ready tasks are throttled, so wait until the new period or a new task comes.
             _cv.wait_for(lock, std::chrono::nanoseconds(sleep_ns));
         }
@@ -241,7 +275,11 @@ StatusOr<DriverRawPtr> WorkGroupDriverQueue::take() {
         _dequeue_workgroup(wg_entity);
     }
 
-    return wg_entity->queue()->take();
+    auto maybe_driver = wg_entity->queue()->take(block);
+    if (maybe_driver.ok() && maybe_driver.value() != nullptr) {
+        --_num_drivers;
+    }
+    return maybe_driver;
 }
 
 void WorkGroupDriverQueue::cancel(DriverRawPtr driver) {
@@ -287,13 +325,7 @@ void WorkGroupDriverQueue::update_statistics(const DriverRawPtr driver) {
 size_t WorkGroupDriverQueue::size() const {
     // TODO: reduce the lock scope
     std::lock_guard<std::mutex> lock(_global_mutex);
-
-    size_t size = 0;
-    for (auto wg_entity : _wg_entities) {
-        size += wg_entity->queue()->size();
-    }
-
-    return size;
+    return _num_drivers;
 }
 
 bool WorkGroupDriverQueue::should_yield(const DriverRawPtr driver, int64_t unaccounted_runtime_ns) const {
@@ -303,8 +335,9 @@ bool WorkGroupDriverQueue::should_yield(const DriverRawPtr driver, int64_t unacc
 
     // Return true, if the minimum-vruntime workgroup is not current workgroup anymore.
     auto* wg_entity = driver->workgroup()->driver_sched_entity();
-    return _min_wg_entity.load() != wg_entity &&
-           _min_vruntime_ns.load() < wg_entity->vruntime_ns() + unaccounted_runtime_ns / wg_entity->cpu_limit();
+    auto* min_entity = _min_wg_entity.load();
+    return min_entity != wg_entity && min_entity &&
+           min_entity->vruntime_ns() < wg_entity->vruntime_ns() + unaccounted_runtime_ns / wg_entity->cpu_limit();
 }
 
 bool WorkGroupDriverQueue::_throttled(const workgroup::WorkGroupDriverSchedEntity* wg_entity,
@@ -322,13 +355,18 @@ bool WorkGroupDriverQueue::_throttled(const workgroup::WorkGroupDriverSchedEntit
 
 template <bool from_executor>
 void WorkGroupDriverQueue::_put_back(const DriverRawPtr driver) {
+    driver->update_peak_driver_queue_size_counter(_num_drivers);
+
     auto* wg_entity = driver->workgroup()->driver_sched_entity();
     wg_entity->set_in_queue(this);
     wg_entity->queue()->put_back(driver);
+    driver->set_in_queue(this);
 
     if (_wg_entities.find(wg_entity) == _wg_entities.end()) {
         _enqueue_workgroup<from_executor>(wg_entity);
     }
+
+    ++_num_drivers;
 
     _cv.notify_one();
 }
@@ -336,10 +374,8 @@ void WorkGroupDriverQueue::_put_back(const DriverRawPtr driver) {
 void WorkGroupDriverQueue::_update_min_wg() {
     auto* min_wg_entity = _take_next_wg();
     if (min_wg_entity == nullptr) {
-        _min_vruntime_ns = std::numeric_limits<int64_t>::max();
         _min_wg_entity = nullptr;
     } else {
-        _min_vruntime_ns = min_wg_entity->vruntime_ns();
         _min_wg_entity = min_wg_entity;
     }
 }
@@ -372,7 +408,7 @@ void WorkGroupDriverQueue::_enqueue_workgroup(workgroup::WorkGroupDriverSchedEnt
             int64_t diff_vruntime_ns = new_vruntime_ns - wg_entity->vruntime_ns();
             if (diff_vruntime_ns > 0) {
                 DCHECK(_wg_entities.find(wg_entity) == _wg_entities.end());
-                wg_entity->incr_runtime_ns(diff_vruntime_ns * wg_entity->cpu_limit());
+                wg_entity->adjust_runtime_ns(diff_vruntime_ns * wg_entity->cpu_limit());
             }
         }
     }

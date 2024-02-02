@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exec/pipeline/sort/local_merge_sort_source_operator.h"
 
@@ -8,12 +20,17 @@
 
 namespace starrocks::pipeline {
 
+Status LocalMergeSortSourceOperator::prepare(RuntimeState* state) {
+    RETURN_IF_ERROR(Operator::prepare(state));
+    _sort_context->ref();
+    return Status::OK();
+}
 void LocalMergeSortSourceOperator::close(RuntimeState* state) {
     _sort_context->unref(state);
     Operator::close(state);
 }
 
-StatusOr<vectorized::ChunkPtr> LocalMergeSortSourceOperator::pull_chunk(RuntimeState* state) {
+StatusOr<ChunkPtr> LocalMergeSortSourceOperator::pull_chunk(RuntimeState* state) {
     return _sort_context->pull_chunk();
 }
 
@@ -23,11 +40,13 @@ Status LocalMergeSortSourceOperator::set_finishing(RuntimeState* state) {
 }
 
 Status LocalMergeSortSourceOperator::set_finished(RuntimeState* state) {
+    _sort_context->cancel();
     return _sort_context->set_finished();
 }
 
 bool LocalMergeSortSourceOperator::has_output() const {
-    return _sort_context->is_partition_sort_finished() && !_sort_context->is_output_finished();
+    return _sort_context->is_partition_sort_finished() && !_sort_context->is_output_finished() &&
+           _sort_context->is_partition_ready();
 }
 
 bool LocalMergeSortSourceOperator::is_finished() const {

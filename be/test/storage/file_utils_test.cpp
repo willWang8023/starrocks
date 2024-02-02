@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/test/olap/file_utils_test.cpp
 
@@ -83,6 +96,27 @@ TEST_F(FileUtilsTest, TestCopyFile) {
     ASSERT_EQ(4194317, std::filesystem::file_size(dst_file_name));
 }
 
+TEST_F(FileUtilsTest, TestCopyFileByRange) {
+    std::string src_file_name = _s_test_data_path + "/abcd12345_2.txt";
+    WritableFileOptions opts{.sync_on_close = false, .mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE};
+    std::unique_ptr<WritableFile> src_file = *FileSystem::Default()->new_writable_file(opts, src_file_name);
+
+    char large_bytes2[(1 << 12)];
+    memset(large_bytes2, 0, sizeof(char) * ((1 << 12)));
+    int i = 0;
+    while (i < 1 << 10) {
+        ASSERT_TRUE(src_file->append(Slice(large_bytes2, 1 << 12)).ok());
+        ++i;
+    }
+    ASSERT_TRUE(src_file->append(Slice(large_bytes2, 13)).ok());
+    ASSERT_TRUE(src_file->close().ok());
+
+    std::string dst_file_name = _s_test_data_path + "/abcd123456_2.txt";
+    fs::copy_file_by_range(src_file_name, dst_file_name, 10, 1024);
+
+    ASSERT_EQ(1024, std::filesystem::file_size(dst_file_name));
+}
+
 TEST_F(FileUtilsTest, TestRemove) {
     // remove_all
     ASSERT_OK(fs::remove_all("./file_test"));
@@ -125,27 +159,27 @@ TEST_F(FileUtilsTest, TestRemove) {
     save_string_file("./file_test/s2", "123");
 
     std::vector<std::string> ps;
-    ps.push_back("./file_test/123/456/789");
-    ps.push_back("./file_test/123/456");
-    ps.push_back("./file_test/123");
+    ps.emplace_back("./file_test/123/456/789");
+    ps.emplace_back("./file_test/123/456");
+    ps.emplace_back("./file_test/123");
 
     ASSERT_TRUE(fs::path_exist("./file_test/123"));
     ASSERT_TRUE(fs::remove(ps).ok());
     ASSERT_FALSE(fs::path_exist("./file_test/123"));
 
     ps.clear();
-    ps.push_back("./file_test/s1");
-    ps.push_back("./file_test/abc/def");
+    ps.emplace_back("./file_test/s1");
+    ps.emplace_back("./file_test/abc/def");
 
     ASSERT_FALSE(fs::remove(ps).ok());
     ASSERT_FALSE(fs::path_exist("./file_test/s1"));
     ASSERT_TRUE(fs::path_exist("./file_test/abc/def/"));
 
     ps.clear();
-    ps.push_back("./file_test/abc/def/zxc");
-    ps.push_back("./file_test/s2");
-    ps.push_back("./file_test/abc/def");
-    ps.push_back("./file_test/abc");
+    ps.emplace_back("./file_test/abc/def/zxc");
+    ps.emplace_back("./file_test/s2");
+    ps.emplace_back("./file_test/abc/def");
+    ps.emplace_back("./file_test/abc");
 
     ASSERT_TRUE(fs::remove(ps).ok());
     ASSERT_FALSE(fs::path_exist("./file_test/s2"));

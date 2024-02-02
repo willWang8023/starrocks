@@ -1,31 +1,37 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.ast;
 
 import com.google.common.base.Strings;
 import com.google.common.collect.Lists;
-import com.google.common.collect.Sets;
-import com.starrocks.analysis.ColumnDef;
-import com.starrocks.analysis.DdlStmt;
 import com.starrocks.analysis.IndexDef;
 import com.starrocks.analysis.KeysDesc;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Index;
+import com.starrocks.sql.common.EngineType;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.io.DataInput;
 import java.io.IOException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 
 public class CreateTableStmt extends DdlStmt {
-
-    private static final String DEFAULT_ENGINE_NAME = "olap";
-    public static final String LAKE_ENGINE_NAME = "starrocks";
-    private static final String DEFAULT_CHARSET_NAME = "utf8";
-
     private boolean ifNotExists;
     private boolean isExternal;
     private TableName tableName;
@@ -41,33 +47,11 @@ public class CreateTableStmt extends DdlStmt {
     private String comment;
     private List<AlterClause> rollupAlterClauseList;
 
-    private static Set<String> engineNames;
-
-    private static Set<String> charsetNames;
-
     // set in analyze
     private List<Column> columns = Lists.newArrayList();
+    private List<String> sortKeys = Lists.newArrayList();
 
     private List<Index> indexes = Lists.newArrayList();
-
-    static {
-        engineNames = Sets.newHashSet();
-        engineNames.add("olap");
-        engineNames.add("mysql");
-        engineNames.add("broker");
-        engineNames.add("elasticsearch");
-        engineNames.add("hive");
-        engineNames.add("iceberg");
-        engineNames.add("hudi");
-        engineNames.add("jdbc");
-        engineNames.add(LAKE_ENGINE_NAME);
-    }
-
-    static {
-        charsetNames = Sets.newHashSet();
-        charsetNames.add("utf8");
-        charsetNames.add("gbk");
-    }
 
     // for backup. set to -1 for normal use
     private int tableSignature;
@@ -84,7 +68,7 @@ public class CreateTableStmt extends DdlStmt {
                            Map<String, String> extProperties,
                            String comment) {
         this(ifNotExists, isExternal, tableName, columnDefinitions, null, engineName, null, keysDesc, partitionDesc,
-                distributionDesc, properties, extProperties, comment, null);
+                distributionDesc, properties, extProperties, comment, null, null);
     }
 
     public CreateTableStmt(boolean ifNotExists,
@@ -99,7 +83,7 @@ public class CreateTableStmt extends DdlStmt {
                            Map<String, String> extProperties,
                            String comment, List<AlterClause> ops) {
         this(ifNotExists, isExternal, tableName, columnDefinitions, engineName, null, keysDesc, partitionDesc,
-                distributionDesc, properties, extProperties, comment, ops);
+                distributionDesc, properties, extProperties, comment, ops, null);
     }
 
     public CreateTableStmt(boolean ifNotExists,
@@ -113,9 +97,9 @@ public class CreateTableStmt extends DdlStmt {
                            DistributionDesc distributionDesc,
                            Map<String, String> properties,
                            Map<String, String> extProperties,
-                           String comment, List<AlterClause> ops) {
+                           String comment, List<AlterClause> ops, List<String> sortKeys) {
         this(ifNotExists, isExternal, tableName, columnDefinitions, null, engineName, charsetName, keysDesc, partitionDesc,
-                distributionDesc, properties, extProperties, comment, ops);
+                distributionDesc, properties, extProperties, comment, ops, sortKeys);
     }
 
     public CreateTableStmt(boolean ifNotExists,
@@ -130,7 +114,27 @@ public class CreateTableStmt extends DdlStmt {
                            DistributionDesc distributionDesc,
                            Map<String, String> properties,
                            Map<String, String> extProperties,
-                           String comment, List<AlterClause> rollupAlterClauseList) {
+                           String comment, List<AlterClause> rollupAlterClauseList, List<String> sortKeys) {
+        this(ifNotExists, isExternal, tableName, columnDefinitions, indexDefs, engineName, charsetName, keysDesc,
+                partitionDesc, distributionDesc, properties, extProperties, comment, rollupAlterClauseList,
+                sortKeys, NodePosition.ZERO);
+    }
+
+    public CreateTableStmt(boolean ifNotExists,
+                           boolean isExternal,
+                           TableName tableName,
+                           List<ColumnDef> columnDefinitions,
+                           List<IndexDef> indexDefs,
+                           String engineName,
+                           String charsetName,
+                           KeysDesc keysDesc,
+                           PartitionDesc partitionDesc,
+                           DistributionDesc distributionDesc,
+                           Map<String, String> properties,
+                           Map<String, String> extProperties,
+                           String comment, List<AlterClause> rollupAlterClauseList, List<String> sortKeys,
+                           NodePosition pos) {
+        super(pos);
         this.tableName = tableName;
         if (columnDefinitions == null) {
             this.columnDefs = Lists.newArrayList();
@@ -138,18 +142,8 @@ public class CreateTableStmt extends DdlStmt {
             this.columnDefs = columnDefinitions;
         }
         this.indexDefs = indexDefs;
-        if (Strings.isNullOrEmpty(engineName)) {
-            this.engineName = DEFAULT_ENGINE_NAME;
-        } else {
-            this.engineName = engineName;
-        }
-
-        if (Strings.isNullOrEmpty(charsetName)) {
-            this.charsetName = DEFAULT_CHARSET_NAME;
-        } else {
-            this.charsetName = charsetName;
-        }
-
+        this.engineName = engineName;
+        this.charsetName = charsetName;
         this.keysDesc = keysDesc;
         this.partitionDesc = partitionDesc;
         this.distributionDesc = distributionDesc;
@@ -161,6 +155,7 @@ public class CreateTableStmt extends DdlStmt {
 
         this.tableSignature = -1;
         this.rollupAlterClauseList = rollupAlterClauseList == null ? new ArrayList<>() : rollupAlterClauseList;
+        this.sortKeys = sortKeys;
     }
 
     public void addColumnDef(ColumnDef columnDef) {
@@ -181,6 +176,10 @@ public class CreateTableStmt extends DdlStmt {
 
     public TableName getDbTbl() {
         return tableName;
+    }
+
+    public String getCatalogName() {
+        return tableName.getCatalog();
     }
 
     public String getTableName() {
@@ -215,20 +214,16 @@ public class CreateTableStmt extends DdlStmt {
         return engineName;
     }
 
+    public List<String> getSortKeys() {
+        return sortKeys;
+    }
+
     public void setEngineName(String engineName) {
         this.engineName = engineName;
     }
 
     public boolean isOlapEngine() {
-        return engineName.equals("olap");
-    }
-
-    public boolean isLakeEngine() {
-        return engineName.equals(LAKE_ENGINE_NAME);
-    }
-
-    public boolean isOlapOrLakeEngine() {
-        return isOlapEngine() || isLakeEngine();
+        return engineName.equalsIgnoreCase(EngineType.OLAP.name());
     }
 
     public String getCharsetName() {
@@ -283,8 +278,20 @@ public class CreateTableStmt extends DdlStmt {
         this.properties = properties;
     }
 
+    public void updateProperties(Map<String, String> properties) {
+        if (this.properties == null) {
+            this.properties = properties;
+        } else {
+            this.properties.putAll(properties);
+        }
+    }
+
     public void setDistributionDesc(DistributionDesc distributionDesc) {
         this.distributionDesc = distributionDesc;
+    }
+
+    public void setPartitionDesc(PartitionDesc partitionDesc) {
+        this.partitionDesc = partitionDesc;
     }
 
     public static CreateTableStmt read(DataInput in) throws IOException {
@@ -293,16 +300,11 @@ public class CreateTableStmt extends DdlStmt {
 
     @Override
     public boolean needAuditEncryption() {
-        return !isOlapOrLakeEngine();
+        return !Strings.isNullOrEmpty(engineName) && !isOlapEngine();
     }
 
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
         return visitor.visitCreateTableStatement(this, context);
-    }
-
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
     }
 }

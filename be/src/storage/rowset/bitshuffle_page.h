@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/segment_v2/bitshuffle_page.h
 
@@ -30,6 +43,7 @@
 #include <ostream>
 
 #include "column/fixed_length_column.h"
+#include "common/logging.h"
 #include "gutil/port.h"
 #include "storage/olap_common.h"
 #include "storage/rowset/bitshuffle_wrapper.h"
@@ -83,11 +97,13 @@ std::string bitshuffle_error_msg(int64_t err);
 //
 //    The header is followed by the bitshuffle-compressed element data.
 //
-template <FieldType Type>
+template <LogicalType Type>
 class BitshufflePageBuilder final : public PageBuilder {
+    typedef typename TypeTraits<Type>::CppType CppType;
+
 public:
     explicit BitshufflePageBuilder(const PageBuilderOptions& options)
-            : _reserved_head_size(0), _max_count(options.data_page_size / SIZE_OF_TYPE), _count(0), _finished(false) {
+            : _max_count(options.data_page_size / SIZE_OF_TYPE) {
         _data.reserve(ALIGN_UP(_max_count, 8u) * SIZE_OF_TYPE);
     }
 
@@ -98,9 +114,9 @@ public:
 
     bool is_page_full() override { return _count >= _max_count; }
 
-    size_t add(const uint8_t* vals, size_t count) override {
+    uint32_t add(const uint8_t* vals, uint32_t count) override {
         DCHECK(!_finished);
-        size_t to_add = std::min<size_t>(_max_count - _count, count);
+        uint32_t to_add = std::min<uint32_t>(_max_count - _count, count);
         size_t old_sz = _data.size();
         _data.resize(old_sz + to_add * SIZE_OF_TYPE);
         memcpy(&_data[old_sz], vals, to_add * SIZE_OF_TYPE);
@@ -113,7 +129,7 @@ public:
             return 0;
         }
         size_t old_sz = _data.size();
-        _data.resize(old_sz + sizeof(SIZE_OF_TYPE));
+        _data.resize(old_sz + SIZE_OF_TYPE);
         _count += 1;
         if constexpr (SIZE_OF_TYPE == 1) {
             *reinterpret_cast<uint8_t*>(&_data[old_sz]) = *elem;
@@ -151,7 +167,7 @@ public:
                 << "buffer must be naturally-aligned";
     }
 
-    size_t count() const override { return _count; }
+    uint32_t count() const override { return _count; }
 
     uint64_t size() const override { return _data.size(); }
 
@@ -173,9 +189,14 @@ public:
         return Status::OK();
     }
 
-private:
-    typedef typename TypeTraits<Type>::CppType CppType;
+    CppType cell(int idx) const {
+        DCHECK_GE(idx, 0);
+        CppType ret;
+        memcpy(&ret, &_data[idx * SIZE_OF_TYPE], SIZE_OF_TYPE);
+        return ret;
+    }
 
+private:
     faststring* _finish() {
         // Do padding so that the input num of element is multiple of 8.
         int num_elems_after_padding = ALIGN_UP(_count, 8U);
@@ -205,38 +226,25 @@ private:
         return &_compressed_data;
     }
 
-    CppType cell(int idx) const {
-        DCHECK_GE(idx, 0);
-        CppType ret;
-        memcpy(&ret, &_data[idx * SIZE_OF_TYPE], SIZE_OF_TYPE);
-        return ret;
-    }
-
     enum { SIZE_OF_TYPE = TypeTraits<Type>::size };
-    uint8_t _reserved_head_size;
+    uint8_t _reserved_head_size{0};
     uint32_t _max_count;
-    uint32_t _count;
+    uint32_t _count{0};
     faststring _data;
     faststring _compressed_data;
     CppType _first_value;
     CppType _last_value;
-    bool _finished;
+    bool _finished{false};
 };
 
-template <FieldType Type>
+template <LogicalType Type>
 class BitShufflePageDecoder final : public PageDecoder {
-public:
-    BitShufflePageDecoder(Slice data, const PageDecoderOptions& options)
-            : _data(data),
-              _options(options),
-              _num_elements(0),
-              _compressed_size(0),
-              _num_element_after_padding(0),
-              _size_of_element(0),
-              _cur_index(0),
-              _parsed(false) {}
+    typedef typename TypeTraits<Type>::CppType CppType;
 
-    Status init() override {
+public:
+    BitShufflePageDecoder(Slice data) : _data(data) {}
+
+    [[nodiscard]] Status init() override {
         CHECK(!_parsed);
         if (_data.size < BITSHUFFLE_PAGE_HEADER_SIZE) {
             std::stringstream ss;
@@ -271,7 +279,7 @@ public:
         }
 
         // Currently, only the UINT32 block encoder supports expanding size:
-        if (UNLIKELY(Type != OLAP_FIELD_TYPE_UNSIGNED_INT && _size_of_element != SIZE_OF_TYPE)) {
+        if (UNLIKELY(Type != TYPE_UNSIGNED_INT && _size_of_element != SIZE_OF_TYPE)) {
             std::stringstream ss;
             ss << "invalid size info. size of element:" << _size_of_element << ", SIZE_OF_TYPE:" << SIZE_OF_TYPE
                << ", type:" << Type;
@@ -295,19 +303,18 @@ public:
         return Status::OK();
     }
 
-    Status seek_to_position_in_page(size_t pos) override {
+    [[nodiscard]] Status seek_to_position_in_page(uint32_t pos) override {
         DCHECK(_parsed) << "Must call init()";
-        if (PREDICT_FALSE(_num_elements == 0)) {
-            DCHECK_EQ(0, pos);
-            return Status::InvalidArgument("invalid pos");
-        }
-
         DCHECK_LE(pos, _num_elements);
+        if (pos > _num_elements) {
+            std::string msg = strings::Substitute("invalid pos:$0, num_elements:$1", pos, _num_elements);
+            return Status::InternalError(msg);
+        }
         _cur_index = pos;
         return Status::OK();
     }
 
-    Status seek_at_or_after_value(const void* value, bool* exact_match) override {
+    [[nodiscard]] Status seek_at_or_after_value(const void* value, bool* exact_match) override {
         DCHECK(_parsed) << "Must call init() firstly";
 
         if (_num_elements == 0) {
@@ -339,77 +346,63 @@ public:
         return Status::OK();
     }
 
-    Status next_batch(size_t* n, ColumnBlockView* dst) override {
-        DCHECK(_parsed);
-        if (PREDICT_FALSE(*n == 0 || _cur_index >= _num_elements)) {
-            *n = 0;
-            return Status::OK();
-        }
-
-        size_t max_fetch = std::min(*n, static_cast<size_t>(_num_elements - _cur_index));
-        _copy_next_values(max_fetch, dst->data());
-        *n = max_fetch;
-        _cur_index += max_fetch;
-
-        return Status::OK();
+    void at_index(uint32_t idx, CppType* out) const {
+        memcpy(out, &_data[BITSHUFFLE_PAGE_HEADER_SIZE + idx * SIZE_OF_TYPE], SIZE_OF_TYPE);
     }
 
-    Status next_batch(size_t* count, vectorized::Column* dst) override;
-
-    Status next_batch(const vectorized::SparseRange& range, vectorized::Column* dst) override;
-
-    size_t count() const override { return _num_elements; }
-
-    size_t current_index() const override { return _cur_index; }
-
-    EncodingTypePB encoding_type() const override { return BIT_SHUFFLE; }
-
-private:
     inline const void* get_data(size_t pos) {
         return static_cast<const void*>(&_data[pos + BITSHUFFLE_PAGE_HEADER_SIZE]);
     }
 
+    [[nodiscard]] Status next_batch(size_t* count, Column* dst) override;
+
+    [[nodiscard]] Status next_batch(const SparseRange<>& range, Column* dst) override;
+
+    uint32_t count() const override { return _num_elements; }
+
+    uint32_t current_index() const override { return _cur_index; }
+
+    EncodingTypePB encoding_type() const override { return BIT_SHUFFLE; }
+
+private:
     void _copy_next_values(size_t n, void* data) {
         memcpy(data, get_data(_cur_index * SIZE_OF_TYPE), n * SIZE_OF_TYPE);
     }
 
-    typedef typename TypeTraits<Type>::CppType CppType;
-
     enum { SIZE_OF_TYPE = TypeTraits<Type>::size };
 
     Slice _data;
-    PageDecoderOptions _options;
-    size_t _num_elements;
-    size_t _compressed_size;
-    size_t _num_element_after_padding;
+    uint32_t _num_elements{0};
+    size_t _compressed_size{0};
+    size_t _num_element_after_padding{0};
 
-    int _size_of_element;
-    size_t _cur_index;
-    bool _parsed;
+    int _size_of_element{0};
+    size_t _cur_index{0};
+    bool _parsed{false};
 };
 
-template <FieldType Type>
-inline Status BitShufflePageDecoder<Type>::next_batch(size_t* count, vectorized::Column* dst) {
-    vectorized::SparseRange read_range;
-    size_t begin = current_index();
-    read_range.add(vectorized::Range(begin, begin + *count));
+template <LogicalType Type>
+inline Status BitShufflePageDecoder<Type>::next_batch(size_t* count, Column* dst) {
+    SparseRange<> read_range;
+    uint32_t begin = current_index();
+    read_range.add(Range<>(begin, begin + *count));
     RETURN_IF_ERROR(next_batch(read_range, dst));
     *count = current_index() - begin;
     return Status::OK();
 }
 
-template <FieldType Type>
-inline Status BitShufflePageDecoder<Type>::next_batch(const vectorized::SparseRange& range, vectorized::Column* dst) {
+template <LogicalType Type>
+inline Status BitShufflePageDecoder<Type>::next_batch(const SparseRange<>& range, Column* dst) {
     DCHECK(_parsed);
     if (PREDICT_FALSE(_cur_index >= _num_elements)) {
         return Status::OK();
     }
 
     size_t to_read = std::min(static_cast<size_t>(range.span_size()), static_cast<size_t>(_num_elements - _cur_index));
-    vectorized::SparseRangeIterator iter = range.new_iterator();
+    SparseRangeIterator<> iter = range.new_iterator();
     while (to_read > 0) {
         _cur_index = iter.begin();
-        vectorized::Range r = iter.next(to_read);
+        Range<> r = iter.next(to_read);
         int n = dst->append_numbers(get_data(_cur_index * SIZE_OF_TYPE), r.span_size() * SIZE_OF_TYPE);
         DCHECK_EQ(r.span_size(), n);
         _cur_index += r.span_size();

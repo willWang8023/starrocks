@@ -1,18 +1,32 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.rule.join;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.OptimizerContext;
 import com.starrocks.sql.optimizer.operator.logical.LogicalScanOperator;
 
 import java.util.BitSet;
+import java.util.Collections;
 import java.util.List;
+import java.util.Optional;
 
 public class JoinReorderLeftDeep extends JoinOrder {
-    OptExpression bestPlanRoot;
+    Optional<OptExpression> bestPlanRoot = Optional.empty();
 
     public JoinReorderLeftDeep(OptimizerContext context) {
         super(context);
@@ -74,24 +88,27 @@ public class JoinReorderLeftDeep extends JoinOrder {
             used[index] = true;
 
             GroupInfo rightGroup = atoms.get(index);
-            ExpressionInfo joinExpr = buildJoinExpr(leftGroup, atoms.get(index));
-            joinExpr.expr.deriveLogicalPropertyItself();
-            calculateStatistics(joinExpr.expr);
-            computeCost(joinExpr, true);
+            Optional<ExpressionInfo> joinExpr = buildJoinExpr(leftGroup, atoms.get(index));
+            if (!joinExpr.isPresent()) {
+                return;
+            }
+            joinExpr.get().expr.deriveLogicalPropertyItself();
+            calculateStatistics(joinExpr.get().expr);
+            computeCost(joinExpr.get());
 
             BitSet joinBitSet = new BitSet();
             joinBitSet.or(leftGroup.atoms);
             joinBitSet.or(rightGroup.atoms);
 
             leftGroup = new GroupInfo(joinBitSet);
-            leftGroup.bestExprInfo = joinExpr;
-            leftGroup.lowestExprCost = joinExpr.cost;
+            leftGroup.bestExprInfo = joinExpr.get();
+            leftGroup.lowestExprCost = joinExpr.get().cost;
         }
-        bestPlanRoot = leftGroup.bestExprInfo.expr;
+        bestPlanRoot = Optional.of(leftGroup.bestExprInfo.expr);
     }
 
     @Override
     public List<OptExpression> getResult() {
-        return Lists.newArrayList(bestPlanRoot);
+        return bestPlanRoot.map(Collections::singletonList).orElse(Collections.emptyList());
     }
 }

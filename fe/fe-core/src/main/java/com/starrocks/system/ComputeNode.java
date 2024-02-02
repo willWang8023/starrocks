@@ -1,21 +1,50 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.system;
 
+import com.google.common.base.Objects;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.alter.DecommissionType;
+import com.starrocks.catalog.ResourceGroup;
 import com.starrocks.common.Config;
+import com.starrocks.common.Pair;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.common.util.DnsCache;
+import com.starrocks.datacache.DataCacheMetrics;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.qe.CoordinatorMonitor;
+import com.starrocks.qe.GlobalVariable;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
+import com.starrocks.thrift.TNetworkAddress;
+import com.starrocks.thrift.TResourceGroupUsage;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.Collection;
+import java.util.HashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.Optional;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicReference;
+import java.util.stream.Collectors;
 
 /**
  * This class extends the primary identifier of a compute node with computing capabilities
@@ -55,12 +84,10 @@ public class ComputeNode implements IComputable, Writable {
     private final AtomicBoolean isDecommissioned;
     @SerializedName("decommissionType")
     private volatile int decommissionType;
-    @SerializedName("ownerClusterName")
-    private volatile String ownerClusterName;
+
     // to index the state in some cluster
     @SerializedName("backendState")
     private volatile int backendState;
-    // private BackendState backendState;
 
     @SerializedName("heartbeatErrMsg")
     private String heartbeatErrMsg = "";
@@ -72,7 +99,25 @@ public class ComputeNode implements IComputable, Writable {
     private int heartbeatRetryTimes = 0;
 
     // port of starlet on BE
-    private volatile int starletPort;
+    @SerializedName("starletPort")
+    private volatile int starletPort = 0;
+
+    @SerializedName("lastWriteFail")
+    private volatile boolean lastWriteFail = false;
+
+    // Indicate there is whether storage_path or not with CN node
+    // It must be true for Backend
+    @SerializedName("isSetStoragePath")
+    private volatile boolean isSetStoragePath = false;
+
+    private volatile DataCacheMetrics dataCacheMetrics = null;
+
+    private volatile int numRunningQueries = 0;
+    private volatile long memLimitBytes = 0;
+    private volatile long memUsedBytes = 0;
+    private volatile int cpuUsedPermille = 0;
+    private volatile long lastUpdateResourceUsageMs = 0;
+    private final AtomicReference<Map<Long, ResourceGroupUsage>> groupIdToUsage = new AtomicReference<>(new HashMap<>());
 
     public ComputeNode() {
         this.host = "";
@@ -86,7 +131,6 @@ public class ComputeNode implements IComputable, Writable {
         this.httpPort = 0;
         this.beRpcPort = 0;
 
-        this.ownerClusterName = "";
         this.backendState = Backend.BackendState.free.ordinal();
 
         this.decommissionType = DecommissionType.SystemDecommission.ordinal();
@@ -106,9 +150,16 @@ public class ComputeNode implements IComputable, Writable {
         this.isAlive = new AtomicBoolean(false);
         this.isDecommissioned = new AtomicBoolean(false);
 
-        this.ownerClusterName = "";
         this.backendState = Backend.BackendState.free.ordinal();
         this.decommissionType = DecommissionType.SystemDecommission.ordinal();
+    }
+
+    public void setLastWriteFail(boolean lastWriteFail) {
+        this.lastWriteFail = lastWriteFail;
+    }
+
+    public boolean getLastWriteFail() {
+        return this.lastWriteFail;
     }
 
     public int getStarletPort() {
@@ -120,12 +171,21 @@ public class ComputeNode implements IComputable, Writable {
         this.starletPort = starletPort;
     }
 
+    public boolean isSetStoragePath() {
+        return isSetStoragePath;
+    }
+
     public long getId() {
         return id;
     }
 
     public String getHost() {
         return host;
+    }
+
+    // The result will be in the IP string format.
+    public String getIP() {
+        return DnsCache.tryLookup(host);
     }
 
     public String getVersion() {
@@ -150,6 +210,22 @@ public class ComputeNode implements IComputable, Writable {
 
     public int getBrpcPort() {
         return brpcPort;
+    }
+
+    public TNetworkAddress getAddress() {
+        return new TNetworkAddress(host, bePort);
+    }
+
+    public TNetworkAddress getBrpcAddress() {
+        return new TNetworkAddress(host, brpcPort);
+    }
+
+    public TNetworkAddress getBrpcIpAddress() {
+        return new TNetworkAddress(getIP(), brpcPort);
+    }
+
+    public TNetworkAddress getHttpAddress() {
+        return new TNetworkAddress(host, httpPort);
     }
 
     public String getHeartbeatErrMsg() {
@@ -265,6 +341,51 @@ public class ComputeNode implements IComputable, Writable {
         return this.isAlive.get() && !this.isDecommissioned.get();
     }
 
+    public int getNumRunningQueries() {
+        return numRunningQueries;
+    }
+
+    public long getMemUsedBytes() {
+        return memUsedBytes;
+    }
+
+    public long getMemLimitBytes() {
+        return memLimitBytes;
+    }
+
+    public double getMemUsedPct() {
+        if (0 == memLimitBytes) {
+            return 0;
+        }
+        return ((double) memUsedBytes) / memLimitBytes;
+    }
+
+    public int getCpuUsedPermille() {
+        return cpuUsedPermille;
+    }
+
+    public void updateResourceUsage(int numRunningQueries, long memLimitBytes, long memUsedBytes,
+                                    int cpuUsedPermille) {
+
+        this.numRunningQueries = numRunningQueries;
+        this.memLimitBytes = memLimitBytes;
+        this.memUsedBytes = memUsedBytes;
+        this.cpuUsedPermille = cpuUsedPermille;
+        this.lastUpdateResourceUsageMs = System.currentTimeMillis();
+    }
+
+    public void updateDataCacheMetrics(DataCacheMetrics dataCacheMetrics) {
+        this.dataCacheMetrics = dataCacheMetrics;
+    }
+
+    public void updateResourceGroupUsage(List<Pair<ResourceGroup, TResourceGroupUsage>> groupAndUsages) {
+        Map<Long, ResourceGroupUsage> newGroupIdToUsage = groupAndUsages.stream().collect(Collectors.toMap(
+                groupAndUsage -> groupAndUsage.first.getId(),
+                groupAndUsage -> ResourceGroupUsage.fromThrift(groupAndUsage.second, groupAndUsage.first)
+        ));
+        groupIdToUsage.set(newGroupIdToUsage);
+    }
+
     @Override
     public void write(DataOutput out) throws IOException {
         String s = GsonUtils.GSON.toJson(this);
@@ -274,6 +395,11 @@ public class ComputeNode implements IComputable, Writable {
     public static ComputeNode read(DataInput in) throws IOException {
         String json = Text.readString(in);
         return GsonUtils.GSON.fromJson(json, ComputeNode.class);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(id);
     }
 
     @Override
@@ -295,10 +421,6 @@ public class ComputeNode implements IComputable, Writable {
     public String toString() {
         return "ComputeNode [id=" + id + ", host=" + host + ", heartbeatPort=" + heartbeatPort + ", alive=" +
                 isAlive.get() + "]";
-    }
-
-    public void clearClusterName() {
-        ownerClusterName = "";
     }
 
     public Backend.BackendState getBackendState() {
@@ -328,10 +450,6 @@ public class ComputeNode implements IComputable, Writable {
         this.isAlive = isAlive;
     }
 
-    public AtomicBoolean getIsDecommissioned() {
-        return isDecommissioned;
-    }
-
     public void setDecommissionType(int decommissionType) {
         this.decommissionType = decommissionType;
     }
@@ -351,17 +469,17 @@ public class ComputeNode implements IComputable, Writable {
         return cpuCores;
     }
 
-    public void setCpuCores(int cpuCores) {
-        this.cpuCores = cpuCores;
-    }
-
     /**
      * handle Compute node's heartbeat response.
      * return true if any port changed, or alive state is changed.
      */
-    public boolean handleHbResponse(BackendHbResponse hbResponse) {
+    public boolean handleHbResponse(BackendHbResponse hbResponse, boolean isReplay) {
+        boolean becomeDead = false;
         boolean isChanged = false;
         if (hbResponse.getStatus() == HeartbeatResponse.HbStatus.OK) {
+            if (this.version == null) {
+                return false;
+            }
             if (!this.version.equals(hbResponse.getVersion())) {
                 isChanged = true;
                 this.version = hbResponse.getVersion();
@@ -382,9 +500,14 @@ public class ComputeNode implements IComputable, Writable {
                 this.brpcPort = hbResponse.getBrpcPort();
             }
 
-            if (Config.integrate_starmgr && this.starletPort != hbResponse.getStarletPort()) {
+            if (RunMode.isSharedDataMode() && this.starletPort != hbResponse.getStarletPort()) {
                 isChanged = true;
                 this.starletPort = hbResponse.getStarletPort();
+            }
+
+            if (RunMode.isSharedDataMode() && this.isSetStoragePath != hbResponse.isSetStoragePath()) {
+                isChanged = true;
+                this.isSetStoragePath = hbResponse.isSetStoragePath();
             }
 
             this.lastUpdateMs = hbResponse.getHbTime();
@@ -392,7 +515,7 @@ public class ComputeNode implements IComputable, Writable {
                 isChanged = true;
                 // From version 2.5 we not use isAlive to determine whether to update the lastStartTime 
                 // This line to set 'lastStartTime' will be removed in due time
-                this.lastStartTime = hbResponse.getHbTime(); 
+                this.lastStartTime = hbResponse.getHbTime();
                 LOG.info("{} is alive, last start time: {}", this.toString(), hbResponse.getHbTime());
                 this.isAlive.set(true);
             } else if (this.lastStartTime <= 0) {
@@ -402,12 +525,20 @@ public class ComputeNode implements IComputable, Writable {
             if (hbResponse.getRebootTime() > this.lastStartTime) {
                 this.lastStartTime = hbResponse.getRebootTime();
                 isChanged = true;
+                // reboot time change means the BE has been restarted
+                // but alive state may be not changed since the BE may be restarted in a short time
+                // we need notify coordinator to cancel query
+                becomeDead = true;
             }
 
             if (this.cpuCores != hbResponse.getCpuCores()) {
                 isChanged = true;
                 this.cpuCores = hbResponse.getCpuCores();
-                BackendCoreStat.setNumOfHardwareCoresOfBe(hbResponse.getBeId(), hbResponse.getCpuCores());
+
+                // BackendCoreStat is a global state, checkpoint should not modify it.
+                if (!GlobalStateMgr.isCheckpointThread()) {
+                    BackendCoreStat.setNumOfHardwareCoresOfBe(hbResponse.getBeId(), hbResponse.getCpuCores());
+                }
             }
 
             heartbeatErrMsg = "";
@@ -417,8 +548,8 @@ public class ComputeNode implements IComputable, Writable {
                 this.heartbeatRetryTimes++;
             } else {
                 if (isAlive.compareAndSet(true, false)) {
-                    CoordinatorMonitor.getInstance().addDeadBackend(id);
-                    LOG.info("{} is dead,", this.toString());
+                    becomeDead = true;
+                    LOG.info("{} is dead due to exceed heartbeatRetryTimes", this);
                 }
                 heartbeatErrMsg = hbResponse.getMsg() == null ? "Unknown error" : hbResponse.getMsg();
                 lastMissingHeartbeatTime = System.currentTimeMillis();
@@ -427,10 +558,117 @@ public class ComputeNode implements IComputable, Writable {
             // this heartbeat info also need to be synced to follower.
             // Since the failed heartbeat info also modifies fe's memory, (this.heartbeatRetryTimes++;)
             // if this heartbeat is not synchronized to the follower, 
-            // that will cause the Follower and master’s memory to be inconsistent
+            // that will cause the Follower and leader’s memory to be inconsistent
             isChanged = true;
+        }
+        if (!isReplay) {
+            hbResponse.aliveStatus = isAlive.get() ?
+                    HeartbeatResponse.AliveStatus.ALIVE : HeartbeatResponse.AliveStatus.NOT_ALIVE;
+        } else {
+            if (hbResponse.aliveStatus != null) {
+                // The metadata before the upgrade does not contain hbResponse.aliveStatus,
+                // in which case the alive status needs to be handled according to the original logic
+                boolean newIsAlive = hbResponse.aliveStatus == HeartbeatResponse.AliveStatus.ALIVE;
+                if (isAlive.compareAndSet(!newIsAlive, newIsAlive)) {
+                    becomeDead = !newIsAlive;
+                    LOG.info("{} alive status is changed to {}", this, newIsAlive);
+                }
+                heartbeatRetryTimes = 0;
+            }
+        }
+
+        if (becomeDead && !GlobalStateMgr.isCheckpointThread()) {
+            CoordinatorMonitor.getInstance().addDeadBackend(id);
+            GlobalStateMgr.getCurrentState().getResourceUsageMonitor().notifyBackendDead();
         }
 
         return isChanged;
+    }
+
+    public Optional<DataCacheMetrics> getDataCacheMetrics() {
+        return Optional.ofNullable(dataCacheMetrics);
+    }
+
+    public boolean isResourceUsageFresh() {
+        if (!isAvailable()) {
+            return false;
+        }
+
+        long currentMs = System.currentTimeMillis();
+        // The resource usage is not fresh enough to decide whether it is overloaded.
+        return currentMs - lastUpdateResourceUsageMs <= GlobalVariable.getQueryQueueResourceUsageIntervalMs();
+    }
+
+    public boolean isResourceOverloaded() {
+        if (!isResourceUsageFresh()) {
+            return false;
+        }
+
+        if (GlobalVariable.isQueryQueueCpuUsedPermilleLimitEffective() &&
+                cpuUsedPermille >= GlobalVariable.getQueryQueueCpuUsedPermilleLimit()) {
+            return true;
+        }
+
+        return GlobalVariable.isQueryQueueMemUsedPctLimitEffective() &&
+                getMemUsedPct() >= GlobalVariable.getQueryQueueMemUsedPctLimit();
+    }
+
+    public Collection<ResourceGroupUsage> getResourceGroupUsages() {
+        return groupIdToUsage.get().values();
+    }
+
+    public boolean isResourceGroupOverloaded(long groupId) {
+        if (!isResourceUsageFresh()) {
+            return false;
+        }
+
+        Map<Long, ResourceGroupUsage> currGroupIdToUsage = groupIdToUsage.get();
+
+        if (!currGroupIdToUsage.containsKey(groupId)) {
+            return false;
+        }
+
+        ResourceGroupUsage usage = currGroupIdToUsage.get(groupId);
+        return usage.group.isMaxCpuCoresEffective() && usage.isCpuCoreUsagePermilleEffective() &&
+                usage.cpuCoreUsagePermille >= usage.group.getMaxCpuCores() * 1000;
+    }
+
+    public static class ResourceGroupUsage {
+        private final ResourceGroup group;
+        private final int cpuCoreUsagePermille;
+        private final long memUsageBytes;
+        private final int numRunningQueries;
+
+        private ResourceGroupUsage(ResourceGroup group, int cpuCoreUsagePermille, long memUsageBytes, int numRunningQueries) {
+            this.group = group;
+            this.cpuCoreUsagePermille = cpuCoreUsagePermille;
+            this.memUsageBytes = memUsageBytes;
+            this.numRunningQueries = numRunningQueries;
+        }
+
+        private static ResourceGroupUsage fromThrift(TResourceGroupUsage tUsage, ResourceGroup group) {
+            return new ResourceGroupUsage(group, tUsage.getCpu_core_used_permille(), tUsage.getMem_used_bytes(),
+                    tUsage.getNum_running_queries());
+        }
+
+        public boolean isCpuCoreUsagePermilleEffective() {
+            return cpuCoreUsagePermille > 0;
+        }
+
+        public ResourceGroup getGroup() {
+            return group;
+        }
+
+        public int getCpuCoreUsagePermille() {
+            return cpuCoreUsagePermille;
+        }
+
+        public long getMemUsageBytes() {
+            return memUsageBytes;
+        }
+
+        public int getNumRunningQueries() {
+            return numRunningQueries;
+        }
     }
 }

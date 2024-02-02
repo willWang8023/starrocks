@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/backup/BackupJob.java
 
@@ -38,16 +51,22 @@ import com.starrocks.catalog.FsBroker;
 import com.starrocks.catalog.LocalTablet;
 import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.MaterializedIndex.IndexExtState;
+import com.starrocks.catalog.MaterializedView;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PhysicalPartition;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Tablet;
+import com.starrocks.common.Config;
 import com.starrocks.common.UserException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.common.util.UUIDUtil;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.fs.HdfsUtil;
+import com.starrocks.metric.MetricRepo;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.task.AgentBatchTask;
 import com.starrocks.task.AgentTask;
@@ -78,6 +97,8 @@ import java.util.List;
 import java.util.Map;
 import java.util.stream.Collectors;
 import java.util.stream.Stream;
+
+import static com.starrocks.scheduler.MVActiveChecker.MV_BACKUP_INACTIVE_REASON;
 
 public class BackupJob extends AbstractJob {
     private static final Logger LOG = LogManager.getLogger(BackupJob.class);
@@ -129,6 +150,8 @@ public class BackupJob extends AbstractJob {
 
     private AgentBatchTask batchTask;
 
+    private boolean testPrimaryKey = false;
+
     public BackupJob() {
         super(JobType.BACKUP);
     }
@@ -138,6 +161,14 @@ public class BackupJob extends AbstractJob {
         super(JobType.BACKUP, label, dbId, dbName, timeoutMs, globalStateMgr, repoId);
         this.tableRefs = tableRefs;
         this.state = BackupJobState.PENDING;
+    }
+
+    public void setTestPrimaryKey() {
+        testPrimaryKey = true;
+    }
+
+    public Path getLocalJobDirPath() {
+        return localJobDirPath;
     }
 
     public BackupJobState getState() {
@@ -158,6 +189,10 @@ public class BackupJob extends AbstractJob {
 
     public String getLocalMetaInfoFilePath() {
         return localMetaInfoFilePath;
+    }
+
+    public List<TableRef> getTableRef() {
+        return tableRefs;
     }
 
     public synchronized boolean finishTabletSnapshotTask(SnapshotTask task, TFinishTaskRequest request) {
@@ -342,6 +377,7 @@ public class BackupJob extends AbstractJob {
 
         status = new Status(ErrCode.COMMON_ERROR, "user cancelled");
         cancelInternal();
+        MetricRepo.COUNTER_UNFINISHED_BACKUP_JOB.increase(-1L);
         return Status.OK;
     }
 
@@ -361,7 +397,7 @@ public class BackupJob extends AbstractJob {
                 status = new Status(ErrCode.NOT_FOUND, "table " + tblName + " does not exist");
                 return;
             }
-            if (!tbl.isOlapTable()) {
+            if (!tbl.isOlapTableOrMaterializedView()) {
                 status = new Status(ErrCode.COMMON_ERROR, "table " + tblName
                         + " is not OLAP table");
                 return;
@@ -381,7 +417,7 @@ public class BackupJob extends AbstractJob {
         }
     }
 
-    protected void prepareSnapshotTask(Partition partition, Table tbl, Tablet tablet, MaterializedIndex index,
+    protected void prepareSnapshotTask(PhysicalPartition partition, Table tbl, Tablet tablet, MaterializedIndex index,
                                        long visibleVersion, int schemaHash) {
         Replica replica = chooseReplica((LocalTablet) tablet, visibleVersion);
         if (replica == null) {
@@ -411,6 +447,7 @@ public class BackupJob extends AbstractJob {
     }
 
     private void prepareAndSendSnapshotTask() {
+        MetricRepo.COUNTER_UNFINISHED_BACKUP_JOB.increase(1L);
         Database db = globalStateMgr.getDb(dbId);
         if (db == null) {
             status = new Status(ErrCode.NOT_FOUND, "database " + dbId + " does not exist");
@@ -420,7 +457,8 @@ public class BackupJob extends AbstractJob {
         // generate job id
         jobId = globalStateMgr.getNextId();
         batchTask = new AgentBatchTask();
-        db.readLock();
+        Locker locker = new Locker();
+        locker.lockDatabase(db, LockType.READ);
         try {
             // check all backup tables again
             checkBackupTables(db);
@@ -447,20 +485,21 @@ public class BackupJob extends AbstractJob {
 
                 // snapshot partitions
                 for (Partition partition : partitions) {
-                    long visibleVersion = partition.getVisibleVersion();
-                    List<MaterializedIndex> indexes = partition.getMaterializedIndices(IndexExtState.VISIBLE);
-                    for (MaterializedIndex index : indexes) {
-                        int schemaHash = tbl.getSchemaHashByIndexId(index.getId());
-                        for (Tablet tablet : index.getTablets()) {
-                            prepareSnapshotTask(partition, tbl, tablet, index, visibleVersion, schemaHash);
-                            if (status != Status.OK) {
-                                return;
+                    for (PhysicalPartition physicalPartition : partition.getSubPartitions()) {
+                        long visibleVersion = physicalPartition.getVisibleVersion();
+                        List<MaterializedIndex> indexes = physicalPartition.getMaterializedIndices(IndexExtState.VISIBLE);
+                        for (MaterializedIndex index : indexes) {
+                            int schemaHash = tbl.getSchemaHashByIndexId(index.getId());
+                            for (Tablet tablet : index.getTablets()) {
+                                prepareSnapshotTask(physicalPartition, tbl, tablet, index, visibleVersion, schemaHash);
+                                if (status != Status.OK) {
+                                    return;
+                                }
                             }
                         }
-                    }
 
-                    LOG.info("snapshot for partition {}, version: {}",
-                            partition.getId(), visibleVersion);
+                        LOG.info("snapshot for partition {}, version: {}", partition.getId(), visibleVersion);
+                    }
                 }
             }
 
@@ -477,11 +516,16 @@ public class BackupJob extends AbstractJob {
                     status = new Status(ErrCode.COMMON_ERROR, "faild to copy table: " + tblName);
                     return;
                 }
+                if (copiedTbl.isMaterializedView()) {
+                    MaterializedView copiedMv = (MaterializedView) copiedTbl;
+                    copiedMv.setInactiveAndReason(String.format("Set the materialized view %s inactive in backup " +
+                            "because %s", copiedMv.getName(), MV_BACKUP_INACTIVE_REASON));
+                }
                 copiedTables.add(copiedTbl);
             }
             backupMeta = new BackupMeta(copiedTables);
         } finally {
-            db.readUnlock();
+            locker.unLockDatabase(db, LockType.READ);
         }
 
         // send tasks
@@ -516,8 +560,10 @@ public class BackupJob extends AbstractJob {
                                       THdfsProperties hdfsProperties, Long beId) {
         int index = 0;
         int totalNum = infos.size();
-        // each backend allot at most 3 tasks
-        int batchNum = Math.min(totalNum, 3);
+        int batchNum = totalNum;
+        if (Config.max_upload_task_per_be > 0) {
+            batchNum = Math.min(totalNum, Config.max_upload_task_per_be);
+        }
         // each task contains several upload subtasks
         int taskNumPerBatch = Math.max(totalNum / batchNum, 1);
         LOG.info("backend {} has {} batch, total {} tasks, {}", beId, batchNum, totalNum, this);
@@ -575,7 +621,7 @@ public class BackupJob extends AbstractJob {
                     HdfsUtil.getTProperties(repo.getLocation(), brokerDesc, hdfsProperties);
                 } catch (UserException e) {
                     status = new Status(ErrCode.COMMON_ERROR, "Get properties from " + repo.getLocation() + " error.");
-                    return;    
+                    return;
                 }
             }
 
@@ -608,9 +654,14 @@ public class BackupJob extends AbstractJob {
     private void saveMetaInfo() {
         String createTimeStr = TimeUtils.longToTimeString(createTime,
                 new SimpleDateFormat(TIMESTAMP_FORMAT));
-        // local job dir: backup/label__createtime/
-        localJobDirPath = Paths.get(BackupHandler.BACKUP_ROOT_DIR.toString(),
-                label + "__" + UUIDUtil.genUUID().toString()).normalize();
+        if (testPrimaryKey) {
+            localJobDirPath = Paths.get(BackupHandler.TEST_BACKUP_ROOT_DIR.toString(),
+                    label + "__" + UUIDUtil.genUUID().toString()).normalize();
+        } else {
+            // local job dir: backup/label__createtime/
+            localJobDirPath = Paths.get(BackupHandler.BACKUP_ROOT_DIR.toString(),
+                    label + "__" + UUIDUtil.genUUID().toString()).normalize();
+        }
 
         try {
             // 1. create local job dir of this backup job
@@ -623,7 +674,7 @@ public class BackupJob extends AbstractJob {
                             .forEach(File::delete);
                 }
             }
-            if (!jobDir.mkdir()) {
+            if (!jobDir.mkdirs()) {
                 status = new Status(ErrCode.COMMON_ERROR, "Failed to create tmp dir: " + localJobDirPath);
                 return;
             }
@@ -705,6 +756,8 @@ public class BackupJob extends AbstractJob {
         // log
         globalStateMgr.getEditLog().logBackupJob(this);
         LOG.info("job is finished. {}", this);
+
+        MetricRepo.COUNTER_UNFINISHED_BACKUP_JOB.increase(-1L);
     }
 
     private boolean uploadFile(String localFilePath, String remoteFilePath) {
@@ -719,7 +772,7 @@ public class BackupJob extends AbstractJob {
         return true;
     }
 
-    private boolean validateLocalFile(String filePath) {
+    protected boolean validateLocalFile(String filePath) {
         File file = new File(filePath);
         if (!file.exists() || !file.canRead()) {
             status = new Status(ErrCode.COMMON_ERROR, "file is invalid: " + filePath);

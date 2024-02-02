@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/test/env/env_posix_test.cpp
 
@@ -32,15 +45,14 @@ namespace starrocks {
 
 class PosixFileSystemTest : public testing::Test {
 public:
-    PosixFileSystemTest() {}
-    virtual ~PosixFileSystemTest() {}
+    PosixFileSystemTest() = default;
+    ~PosixFileSystemTest() override = default;
     void SetUp() override { ASSERT_TRUE(fs::create_directories("./ut_dir/fs_posix").ok()); }
     void TearDown() override { ASSERT_TRUE(fs::remove_all("./ut_dir").ok()); }
 };
 
 TEST_F(PosixFileSystemTest, random_access) {
     std::string fname = "./ut_dir/fs_posix/random_access";
-    WritableFileOptions ops;
     std::unique_ptr<WritableFile> wfile;
     auto fs = FileSystem::Default();
     WritableFileOptions opts{.sync_on_close = false, .mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE};
@@ -122,7 +134,7 @@ TEST_F(PosixFileSystemTest, random_access) {
 
 TEST_F(PosixFileSystemTest, iterate_dir) {
     const std::string dir_path = "./ut_dir/fs_posix/iterate_dir";
-    fs::remove_all(dir_path);
+    ASSERT_OK(fs::remove_all(dir_path));
     ASSERT_OK(FileSystem::Default()->create_dir_if_missing(dir_path));
 
     ASSERT_OK(FileSystem::Default()->create_dir_if_missing(dir_path + "/abc"));
@@ -184,6 +196,62 @@ TEST_F(PosixFileSystemTest, create_dir_recursive) {
 
     ASSERT_OK(FileSystem::Default()->delete_dir_recursive(dir_path));
     ASSERT_TRUE(FileSystem::Default()->path_exists(dir_path).is_not_found());
+}
+
+TEST_F(PosixFileSystemTest, iterate_dir2) {
+    auto fs = FileSystem::Default();
+    auto now = ::time(nullptr);
+    ASSERT_OK(fs->create_dir_recursive("./ut_dir/fs_posix/iterate_dir2.d"));
+    ASSIGN_OR_ABORT(auto f, fs->new_writable_file("./ut_dir/fs_posix/iterate_dir2"));
+    ASSERT_OK(f->append("test"));
+    ASSERT_OK(f->close());
+
+    ASSERT_OK(fs->iterate_dir2("./ut_dir/fs_posix/", [&](DirEntry entry) -> bool {
+        auto name = entry.name;
+        if (name == "iterate_dir2.d") {
+            CHECK(entry.is_dir.has_value());
+            CHECK(entry.is_dir.value());
+            CHECK(entry.mtime.has_value());
+            CHECK_GE(entry.mtime.value(), now);
+        } else if (name == "iterate_dir2") {
+            CHECK(entry.is_dir.has_value());
+            CHECK(!entry.is_dir.value());
+            CHECK(entry.size.has_value());
+            CHECK_EQ(4, entry.size.value());
+            CHECK(entry.mtime.has_value());
+            CHECK_GE(entry.mtime.value(), now);
+        } else {
+            CHECK(false) << "Unexpected file " << name;
+        }
+        return true;
+    }));
+}
+
+TEST_F(PosixFileSystemTest, test_delete_files) {
+    auto fs = FileSystem::Default();
+
+    auto path1 = std::string("./ut_dir/fs_posix/f1");
+    ASSIGN_OR_ABORT(auto wf1, fs->new_writable_file(path1));
+    EXPECT_OK(wf1->append("hello"));
+    EXPECT_OK(wf1->append(" world!"));
+    EXPECT_OK(wf1->sync());
+    EXPECT_OK(wf1->close());
+    EXPECT_EQ(sizeof("hello world!"), wf1->size() + 1);
+    EXPECT_OK(fs->path_exists(path1));
+
+    auto path2 = std::string("./ut_dir/fs_posix/f2");
+    ASSIGN_OR_ABORT(auto wf2, fs->new_writable_file(path2));
+    EXPECT_OK(wf2->append("hello"));
+    EXPECT_OK(wf2->append(" world!"));
+    EXPECT_OK(wf2->sync());
+    EXPECT_OK(wf2->close());
+    EXPECT_EQ(sizeof("hello world!"), wf2->size() + 1);
+    EXPECT_OK(fs->path_exists(path2));
+
+    std::vector<std::string> paths{path1, path2};
+    EXPECT_OK(fs->delete_files(paths));
+    EXPECT_TRUE(fs->path_exists(path1).is_not_found());
+    EXPECT_TRUE(fs->path_exists(path2).is_not_found());
 }
 
 } // namespace starrocks

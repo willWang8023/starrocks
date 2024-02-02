@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/catalog/ColocateTableTest.java
 
@@ -96,7 +109,7 @@ public class ColocateTableTest {
                 " \"colocate_with\" = \"" + groupName + "\"\n" +
                 ");");
 
-        ColocateTableIndex index = GlobalStateMgr.getCurrentColocateIndex();
+        ColocateTableIndex index = GlobalStateMgr.getCurrentState().getColocateTableIndex();
         Database db = GlobalStateMgr.getCurrentState().getDb(fullDbName);
         long tableId = db.getTable(tableName1).getId();
 
@@ -154,7 +167,7 @@ public class ColocateTableTest {
                 " \"colocate_with\" = \"" + groupName + "\"\n" +
                 ");");
 
-        ColocateTableIndex index = GlobalStateMgr.getCurrentColocateIndex();
+        ColocateTableIndex index = GlobalStateMgr.getCurrentState().getColocateTableIndex();
         Database db = GlobalStateMgr.getCurrentState().getDb(fullDbName);
         long firstTblId = db.getTable(tableName1).getId();
         long secondTblId = db.getTable(tableName2).getId();
@@ -174,7 +187,7 @@ public class ColocateTableTest {
         Assert.assertTrue(index.isSameGroup(firstTblId, secondTblId));
 
         // drop first
-        index.removeTable(firstTblId);
+        index.removeTable(firstTblId, null, false);
         Assert.assertEquals(1, Deencapsulation.<Multimap<GroupId, Long>>getField(index, "group2Tables").size());
         Assert.assertEquals(1, index.getAllGroupIds().size());
         Assert.assertEquals(1, Deencapsulation.<Map<Long, GroupId>>getField(index, "table2Group").size());
@@ -187,7 +200,7 @@ public class ColocateTableTest {
         Assert.assertFalse(index.isSameGroup(firstTblId, secondTblId));
 
         // drop second
-        index.removeTable(secondTblId);
+        index.removeTable(secondTblId, null, false);
         Assert.assertEquals(0, Deencapsulation.<Multimap<GroupId, Long>>getField(index, "group2Tables").size());
         Assert.assertEquals(0, index.getAllGroupIds().size());
         Assert.assertEquals(0, Deencapsulation.<Map<Long, GroupId>>getField(index, "table2Group").size());
@@ -226,7 +239,6 @@ public class ColocateTableTest {
                 " \"replication_num\" = \"1\",\n" +
                 " \"colocate_with\" = \"" + groupName + "\"\n" +
                 ");");
-
     }
 
     @Test
@@ -253,7 +265,7 @@ public class ColocateTableTest {
                 return Arrays.asList(10001L, 10002L, 10003L);       
             }
         };
-        
+
         createTable("create table " + dbName + "." + tableName2 + " (\n" +
                 " `k1` int NULL COMMENT \"\",\n" +
                 " `k2` varchar(10) NULL COMMENT \"\"\n" +
@@ -282,7 +294,7 @@ public class ColocateTableTest {
                 ");");
 
         expectedEx.expect(DdlException.class);
-        expectedEx.expectMessage("Colocate tables distribution columns size must be same : 2");
+        expectedEx.expectMessage("Colocate tables distribution columns size must be the same : 2");
         createTable("create table " + dbName + "." + tableName2 + " (\n" +
                 " `k1` int NULL COMMENT \"\",\n" +
                 " `k2` varchar(10) NULL COMMENT \"\"\n" +
@@ -311,7 +323,8 @@ public class ColocateTableTest {
                 ");");
 
         expectedEx.expect(DdlException.class);
-        expectedEx.expectMessage("Colocate tables distribution columns must have the same data type: k2 should be INT");
+        expectedEx.expectMessage("Colocate tables distribution columns must have the same data type");
+        expectedEx.expectMessage("current col: k2, should be: INT");
         createTable("create table " + dbName + "." + tableName2 + " (\n" +
                 " `k1` int NULL COMMENT \"\",\n" +
                 " `k2` varchar(10) NULL COMMENT \"\"\n" +

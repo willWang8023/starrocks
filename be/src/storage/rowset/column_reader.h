@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/segment_v2/column_reader.h
 
@@ -47,22 +60,16 @@
 namespace starrocks {
 
 class BlockCompressionCodec;
-class ColumnBlock;
-class ColumnBlockView;
-class ColumnVectorBatch;
 class MemTracker;
-class WrapperField;
 
-namespace vectorized {
 class ColumnPredicate;
 class Column;
 class ZoneMapDetail;
-} // namespace vectorized
 
 class BitmapIndexIterator;
 class BitmapIndexReader;
 class ColumnIterator;
-class ColumnIteratorOptions;
+struct ColumnIteratorOptions;
 class EncodingInfo;
 class PageDecoder;
 class PagePointer;
@@ -84,9 +91,9 @@ public:
     // Note that |meta| is mutable, this method may change its internal state.
     //
     // To developers: keep this method lightweight, should not incur any I/O.
-    static StatusOr<std::unique_ptr<ColumnReader>> create(ColumnMetaPB* meta, const Segment* segment);
+    static StatusOr<std::unique_ptr<ColumnReader>> create(ColumnMetaPB* meta, Segment* segment);
 
-    ColumnReader(const private_type&, const Segment* segment);
+    ColumnReader(const private_type&, Segment* segment);
     ~ColumnReader();
 
     ColumnReader(const ColumnReader&) = delete;
@@ -95,12 +102,11 @@ public:
     void operator=(ColumnReader&&) = delete;
 
     // create a new column iterator. Caller should free the returned iterator after unused.
-    // TODO: StatusOr<std::unique_ptr<ColumnIterator>> new_iterator()
-    Status new_iterator(ColumnIterator** iterator);
+    StatusOr<std::unique_ptr<ColumnIterator>> new_iterator(ColumnAccessPath* path = nullptr);
 
     // Caller should free returned iterator after unused.
     // TODO: StatusOr<std::unique_ptr<ColumnIterator>> new_bitmap_index_iterator()
-    Status new_bitmap_index_iterator(BitmapIndexIterator** iterator);
+    Status new_bitmap_index_iterator(const IndexReadOptions& opts, BitmapIndexIterator** iterator);
 
     // Seek to the first entry in the column.
     Status seek_to_first(OrdinalPageIndexIterator* iter);
@@ -121,7 +127,7 @@ public:
     ZoneMapPB* segment_zone_map() const { return _segment_zone_map.get(); }
 
     PagePointer get_dict_page_pointer() const { return _dict_page_pointer; }
-    FieldType column_type() const { return _column_type; }
+    LogicalType column_type() const { return _column_type; }
     bool has_all_dict_encoded() const { return _flags & kHasAllDictEncodedMask; }
     bool all_dict_encoded() const { return _flags & kAllDictEncodedMask; }
 
@@ -130,30 +136,30 @@ public:
     int32_t num_data_pages() { return _ordinal_index ? _ordinal_index->num_data_pages() : 0; }
 
     // page-level zone map filter.
-    Status zone_map_filter(const std::vector<const ::starrocks::vectorized::ColumnPredicate*>& p,
-                           const ::starrocks::vectorized::ColumnPredicate* del_predicate,
-                           std::unordered_set<uint32_t>* del_partial_filtered_pages,
-                           vectorized::SparseRange* row_ranges);
+    Status zone_map_filter(const std::vector<const ::starrocks::ColumnPredicate*>& p,
+                           const ::starrocks::ColumnPredicate* del_predicate,
+                           std::unordered_set<uint32_t>* del_partial_filtered_pages, SparseRange<>* row_ranges,
+                           const IndexReadOptions& opts);
 
     // segment-level zone map filter.
     // Return false to filter out this segment.
     // same as `match_condition`, used by vector engine.
-    bool segment_zone_map_filter(const std::vector<const ::starrocks::vectorized::ColumnPredicate*>& predicates) const;
+    bool segment_zone_map_filter(const std::vector<const ::starrocks::ColumnPredicate*>& predicates) const;
 
     // prerequisite: at least one predicate in |predicates| support bloom filter.
-    Status bloom_filter(const std::vector<const ::starrocks::vectorized::ColumnPredicate*>& p,
-                        vectorized::SparseRange* ranges);
+    Status bloom_filter(const std::vector<const ::starrocks::ColumnPredicate*>& p, SparseRange<>* ranges,
+                        const IndexReadOptions& opts);
 
-    Status load_ordinal_index();
+    Status load_ordinal_index(const IndexReadOptions& opts);
 
     uint32_t num_rows() const { return _segment->num_rows(); }
 
+    size_t mem_usage() const;
+
+    const std::string& name() const { return _name; }
+
 private:
     const std::string& file_name() const { return _segment->file_name(); }
-
-    FileSystem* file_system() const { return _segment->file_system(); }
-
-    bool keep_in_memory() const { return _segment->keep_in_memory(); }
 
     struct private_type {
         explicit private_type(int) {}
@@ -165,23 +171,21 @@ private:
 
     Status _init(ColumnMetaPB* meta);
 
-    Status _load_zonemap_index();
-    Status _load_ordinal_index();
-    Status _load_bitmap_index();
-    Status _load_bloom_filter_index();
+    Status _load_zonemap_index(const IndexReadOptions& opts);
+    Status _load_bitmap_index(const IndexReadOptions& opts);
+    Status _load_bloom_filter_index(const IndexReadOptions& opts);
 
-    Status _parse_zone_map(const ZoneMapPB& zm, vectorized::ZoneMapDetail* detail) const;
+    Status _parse_zone_map(const ZoneMapPB& zm, ZoneMapDetail* detail) const;
 
-    Status _calculate_row_ranges(const std::vector<uint32_t>& page_indexes, vectorized::SparseRange* row_ranges);
+    Status _calculate_row_ranges(const std::vector<uint32_t>& page_indexes, SparseRange<>* row_ranges);
 
-    Status _zone_map_filter(const std::vector<const vectorized::ColumnPredicate*>& predicates,
-                            const vectorized::ColumnPredicate* del_predicate,
+    Status _zone_map_filter(const std::vector<const ColumnPredicate*>& predicates, const ColumnPredicate* del_predicate,
                             std::unordered_set<uint32_t>* del_partial_filtered_pages, std::vector<uint32_t>* pages);
 
     // ColumnReader will be resident in memory. When there are many columns in the table,
     // the meta in ColumnReader takes up a lot of memory,
     // and now the content that is not needed in Meta is not saved to ColumnReader
-    FieldType _column_type = OLAP_FIELD_TYPE_UNKNOWN;
+    LogicalType _column_type = TYPE_UNKNOWN;
     PagePointer _dict_page_pointer;
     uint64_t _total_mem_footprint = 0;
 
@@ -207,9 +211,14 @@ private:
     // Pointer to its father segment, as the column reader
     // is never released before the end of the parent's life cycle,
     // so here we just use a normal pointer
-    const Segment* _segment = nullptr;
+    Segment* _segment = nullptr;
 
     uint8_t _flags = 0;
+    // counter to record the reader's mem usage, sub readers excluded.
+    std::atomic<size_t> _meta_mem_usage = 0;
+
+    // only for json flat column
+    std::string _name;
 };
 
 } // namespace starrocks

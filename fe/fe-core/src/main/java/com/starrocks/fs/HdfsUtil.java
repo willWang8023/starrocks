@@ -20,6 +20,7 @@ package com.starrocks.fs;
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.BrokerDesc;
+import com.starrocks.catalog.TableFunctionTable;
 import com.starrocks.common.ClientPool;
 import com.starrocks.common.UserException;
 import com.starrocks.fs.hdfs.HdfsService;
@@ -38,6 +39,9 @@ import com.starrocks.thrift.TBrokerPWriteRequest;
 import com.starrocks.thrift.TBrokerRenamePathRequest;
 import com.starrocks.thrift.TBrokerVersion;
 import com.starrocks.thrift.THdfsProperties;
+import org.apache.commons.lang3.StringUtils;
+import org.apache.hadoop.fs.FileStatus;
+import org.apache.hadoop.fs.Path;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -68,17 +72,29 @@ public class HdfsUtil {
      * @param fileStatuses: file path, size, isDir, isSplitable
      * @throws UserException if broker op failed
      */
-    public static void parseFile(String path, BrokerDesc brokerDesc, List<TBrokerFileStatus> fileStatuses, boolean skipDir, 
-            boolean fileNameOnly) throws UserException {
+    public static void parseFile(String path, BrokerDesc brokerDesc, List<TBrokerFileStatus> fileStatuses, boolean skipDir,
+                                 boolean fileNameOnly) throws UserException {
+        if (path.startsWith(TableFunctionTable.FAKE_PATH)) {
+            fileStatuses.add(new TBrokerFileStatus("file1", false, 1024, false));
+            return;
+        }
         TBrokerListPathRequest request = new TBrokerListPathRequest(
                 TBrokerVersion.VERSION_ONE, path, false, brokerDesc.getProperties());
         hdfsService.listPath(request, fileStatuses, skipDir, fileNameOnly);
     }
 
-    public static void parseFile(String path, BrokerDesc brokerDesc, List<TBrokerFileStatus> fileStatuses) throws UserException {
-        TBrokerListPathRequest request = new TBrokerListPathRequest(
-                TBrokerVersion.VERSION_ONE, path, false, brokerDesc.getProperties());
-        hdfsService.listPath(request, fileStatuses, true, false);
+    public static List<FileStatus> listFileMeta(String path, BrokerDesc brokerDesc) throws UserException {
+        if (path.startsWith(TableFunctionTable.FAKE_PATH)) {
+            path = StringUtils.removeStart(path, TableFunctionTable.FAKE_PATH);
+            FileStatus fakeFile = new FileStatus(1, false, 1, 1024, System.currentTimeMillis(), new Path(path));
+            return Lists.newArrayList(fakeFile);
+        }
+        return hdfsService.listFileMeta(path, brokerDesc.getProperties(), true);
+    }
+
+    public static void parseFile(String path, BrokerDesc brokerDesc, List<TBrokerFileStatus> fileStatuses)
+            throws UserException {
+        parseFile(path, brokerDesc, fileStatuses, true, false);
     }
 
     public static List<String> parseColumnsFromPath(String filePath, List<String> columnsFromPath)
@@ -92,34 +108,27 @@ public class HdfsUtil {
                     "Fail to parse columnsFromPath, expected: " + columnsFromPath + ", filePath: " + filePath);
         }
         String[] columns = new String[columnsFromPath.size()];
-        int size = 0;
-        for (int i = strings.length - 2; i >= 0; i--) {
+        for (int i = strings.length - 1; i >= 0; i--) {
             String str = strings[i];
-            if (str != null && str.isEmpty()) {
+            if (str == null || str.isEmpty() || !str.contains("=")) {
                 continue;
-            }
-            if (str == null || !str.contains("=")) {
-                throw new UserException(
-                        "Fail to parse columnsFromPath, expected: " + columnsFromPath + ", filePath: " + filePath);
             }
             String[] pair = str.split("=", 2);
             if (pair.length != 2) {
-                throw new UserException(
-                        "Fail to parse columnsFromPath, expected: " + columnsFromPath + ", filePath: " + filePath);
+                continue;
             }
             int index = columnsFromPath.indexOf(pair[0]);
             if (index == -1) {
                 continue;
             }
             columns[index] = pair[1];
-            size++;
-            if (size >= columnsFromPath.size()) {
-                break;
-            }
         }
-        if (size != columnsFromPath.size()) {
-            throw new UserException(
-                    "Fail to parse columnsFromPath, expected: " + columnsFromPath + ", filePath: " + filePath);
+
+        for (int i = 0; i < columns.length; i++) {
+            if (columns[i] == null) {
+                throw new UserException(
+                        "Fail to parse columnsFromPath, expected: " + columnsFromPath.get(i) + ", filePath: " + filePath);
+            }
         }
         return Lists.newArrayList(columns);
     }
@@ -195,14 +204,10 @@ public class HdfsUtil {
      */
     public static void writeFile(String srcFilePath, String destFilePath,
             BrokerDesc brokerDesc) throws UserException {
-        FileInputStream inputFs = null;
-        FileChannel channel = null;
         HdfsWriter writer = new HdfsWriter(destFilePath, brokerDesc);
         ByteBuffer byteBuffer = ByteBuffer.allocate(READ_BUFFER_SIZE_B);
-        try {
+        try (FileInputStream inputFs = new FileInputStream(srcFilePath); FileChannel channel = inputFs.getChannel()) {
             writer.open();
-            inputFs = new FileInputStream(srcFilePath);
-            channel = inputFs.getChannel();
             while (true) {
                 int readSize = channel.read(byteBuffer);
                 if (readSize == -1) {
@@ -221,16 +226,6 @@ public class HdfsUtil {
         } finally {
             // close broker file writer and local file input stream
             writer.close();
-            try {
-                if (channel != null) {
-                    channel.close();
-                }
-                if (inputFs != null) {
-                    inputFs.close();
-                }
-            } catch (IOException e) {
-                LOG.warn("Close local file failed. srcPath={}", srcFilePath, e);
-            }
         }
     }
 

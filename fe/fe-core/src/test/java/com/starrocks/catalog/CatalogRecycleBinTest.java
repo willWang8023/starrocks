@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.catalog;
 
@@ -73,9 +86,9 @@ public class CatalogRecycleBinTest {
                         BoundType.CLOSED);
         DataProperty dataProperty = new DataProperty(TStorageMedium.HDD);
         Partition partition = new Partition(1L, "pt", new MaterializedIndex(), null);
-        bin.recyclePartition(11L, 22L, partition, range, dataProperty, (short) 1, false, null, false);
+        bin.recyclePartition(11L, 22L, partition, range, dataProperty, (short) 1, false, null);
         Partition partition2 = new Partition(2L, "pt", new MaterializedIndex(), null);
-        bin.recyclePartition(11L, 22L, partition2, range, dataProperty, (short) 1, false, null, false);
+        bin.recyclePartition(11L, 22L, partition2, range, dataProperty, (short) 1, false, null);
 
         Partition recycledPart = bin.getPartition(1L);
         Assert.assertNull(recycledPart);
@@ -89,6 +102,27 @@ public class CatalogRecycleBinTest {
         List<Partition> partitions = bin.getPartitions(22L);
         Assert.assertEquals(1, partitions.size());
         Assert.assertEquals(2L, partitions.get(0).getId());
+    }
+
+    @Test
+    public void testGetPhysicalPartition() throws Exception {
+        CatalogRecycleBin bin = new CatalogRecycleBin();
+        List<Column> columns = Lists.newArrayList(new Column("k1", ScalarType.createVarcharType(10)));
+        Range<PartitionKey> range =
+                Range.range(PartitionKey.createPartitionKey(Lists.newArrayList(new PartitionValue("1")), columns),
+                        BoundType.CLOSED,
+                        PartitionKey.createPartitionKey(Lists.newArrayList(new PartitionValue("3")), columns),
+                        BoundType.CLOSED);
+        DataProperty dataProperty = new DataProperty(TStorageMedium.HDD);
+        Partition partition = new Partition(1L, "pt", new MaterializedIndex(), null);
+        bin.recyclePartition(11L, 22L, partition, range, dataProperty, (short) 1, false, null);
+        Partition partition2 = new Partition(2L, "pt", new MaterializedIndex(), null);
+        bin.recyclePartition(11L, 22L, partition2, range, dataProperty, (short) 1, false, null);
+
+        PhysicalPartition recycledPart = bin.getPhysicalPartition(1L);
+        Assert.assertNull(recycledPart);
+        recycledPart = bin.getPartition(2L);
+        Assert.assertEquals(2L, recycledPart.getId());
     }
 
     @Test
@@ -193,7 +227,7 @@ public class CatalogRecycleBinTest {
         TabletInvertedIndex invertedIndex = new TabletInvertedIndex();
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentInvertedIndex();
+                GlobalStateMgr.getCurrentState().getTabletInvertedIndex();
                 result = invertedIndex;
             }
         };
@@ -210,6 +244,70 @@ public class CatalogRecycleBinTest {
         Assert.assertEquals(replica1, invertedIndex.getReplica(tabletId, backendId));
         Assert.assertEquals(replica2, invertedIndex.getReplica(tabletId, backendId + 1));
         Assert.assertEquals(replica3, invertedIndex.getReplica(tabletId, backendId + 2));
+    }
+
+
+    @Test
+    public void testAddTabletToInvertedIndexWithLocalTabletError(@Mocked GlobalStateMgr globalStateMgr,
+                                                            @Mocked Database db) {
+        long dbId = 1L;
+        long tableId = 2L;
+        long partitionId = 3L;
+        long indexId = 4L;
+        long tabletId = 5L;
+        long replicaId = 10L;
+        long backendId = 20L;
+
+        // Columns
+        List<Column> columns = new ArrayList<Column>();
+        Column k1 = new Column("k1", Type.INT, true, null, "", "");
+        columns.add(k1);
+        columns.add(new Column("k2", Type.BIGINT, true, null, "", ""));
+        columns.add(new Column("v", Type.BIGINT, false, AggregateType.SUM, "0", ""));
+
+        // Replica
+        Replica replica1 = new Replica(replicaId, backendId, Replica.ReplicaState.NORMAL, 1, 0);
+        Replica replica2 = new Replica(replicaId + 1, backendId + 1, Replica.ReplicaState.NORMAL, 1, 0);
+        Replica replica3 = new Replica(replicaId + 2, backendId + 2, Replica.ReplicaState.NORMAL, 1, 0);
+
+        // Tablet
+        LocalTablet tablet = new LocalTablet(tabletId);
+        tablet.addReplica(replica1);
+        tablet.addReplica(replica2);
+        tablet.addReplica(replica3);
+
+        // Partition info and distribution info
+        DistributionInfo distributionInfo = new HashDistributionInfo(10, Lists.newArrayList(k1));
+        PartitionInfo partitionInfo = new SinglePartitionInfo();
+        partitionInfo.setIsInMemory(partitionId, false);
+        partitionInfo.setTabletType(partitionId, TTabletType.TABLET_TYPE_DISK);
+        partitionInfo.setReplicationNum(partitionId, (short) 3);
+
+        // Index
+        MaterializedIndex index = new MaterializedIndex(indexId, MaterializedIndex.IndexState.NORMAL);
+        TabletMeta tabletMeta = new TabletMeta(dbId, tableId, partitionId, indexId, 0, TStorageMedium.SSD);
+        index.addTablet(tablet, tabletMeta);
+
+        // Partition
+        Partition partition = new Partition(partitionId, "p1", index, distributionInfo);
+
+        // Table
+        OlapTable table = new OlapTable(tableId, "t1", columns, KeysType.AGG_KEYS, partitionInfo, distributionInfo);
+        Deencapsulation.setField(table, "baseIndexId", indexId);
+        table.addPartition(partition);
+        table.setIndexMeta(indexId, "t1", columns, 0, 0, (short) 3, TStorageType.COLUMN, KeysType.AGG_KEYS);
+
+        TabletInvertedIndex invertedIndex = new TabletInvertedIndex();
+        new Expectations() {
+            {
+                GlobalStateMgr.getCurrentState().getTabletInvertedIndex();
+                result = invertedIndex;
+            }
+        };
+
+        CatalogRecycleBin bin = new CatalogRecycleBin();
+        bin.recycleTable(dbId, table);
+        bin.addTabletToInvertedIndex();
     }
 
     @Test
@@ -272,7 +370,7 @@ public class CatalogRecycleBinTest {
         };
         new Expectations() {
             {
-                globalStateMgr.onEraseDatabase(anyLong);
+                globalStateMgr.getLocalMetastore().onEraseDatabase(anyLong);
                 minTimes = 0;
                 globalStateMgr.getEditLog();
                 minTimes = 0;
@@ -409,7 +507,7 @@ public class CatalogRecycleBinTest {
         };
         new Expectations() {
             {
-                globalStateMgr.onErasePartition((Partition) any);
+                globalStateMgr.getLocalMetastore().onErasePartition((Partition) any);
                 minTimes = 0;
 
                 globalStateMgr.getEditLog();
@@ -430,9 +528,9 @@ public class CatalogRecycleBinTest {
         DataProperty dataProperty = new DataProperty(TStorageMedium.HDD);
         CatalogRecycleBin recycleBin = new CatalogRecycleBin();
 
-        recycleBin.recyclePartition(dbId, tableId, p1, null, dataProperty, (short) 2, false, null, false);
-        recycleBin.recyclePartition(dbId, tableId, p2SameName, null, dataProperty, (short) 2, false, null, false);
-        recycleBin.recyclePartition(dbId, tableId, p2, null, dataProperty, (short) 2, false, null, false);
+        recycleBin.recyclePartition(dbId, tableId, p1, null, dataProperty, (short) 2, false, null);
+        recycleBin.recyclePartition(dbId, tableId, p2SameName, null, dataProperty, (short) 2, false, null);
+        recycleBin.recyclePartition(dbId, tableId, p2, null, dataProperty, (short) 2, false, null);
 
         Assert.assertEquals(recycleBin.getPartition(p1.getId()), p1);
         Assert.assertEquals(recycleBin.getPartition(p2.getId()), p2);
@@ -489,7 +587,7 @@ public class CatalogRecycleBinTest {
         };
         new Expectations() {
             {
-                globalStateMgr.onErasePartition((Partition) any);
+                globalStateMgr.getLocalMetastore().onErasePartition((Partition) any);
                 minTimes = 0;
 
                 globalStateMgr.getEditLog();
@@ -510,9 +608,9 @@ public class CatalogRecycleBinTest {
         DataProperty dataProperty = new DataProperty(TStorageMedium.HDD);
         CatalogRecycleBin recycleBin = new CatalogRecycleBin();
 
-        recycleBin.recyclePartition(dbId, tableId, p1, null, dataProperty, (short) 2, false, null, true);
-        recycleBin.recyclePartition(dbId, tableId, p2SameName, null, dataProperty, (short) 2, false, null, true);
-        recycleBin.recyclePartition(dbId, tableId, p2, null, dataProperty, (short) 2, false, null, true);
+        recycleBin.recyclePartition(dbId, tableId, p1, null, dataProperty, (short) 2, false, null);
+        recycleBin.recyclePartition(dbId, tableId, p2SameName, null, dataProperty, (short) 2, false, null);
+        recycleBin.recyclePartition(dbId, tableId, p2, null, dataProperty, (short) 2, false, null);
 
         Assert.assertEquals(recycleBin.getPartition(p1.getId()), p1);
         Assert.assertEquals(recycleBin.getPartition(p2.getId()), p2);

@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.analyzer;
 
@@ -29,7 +42,6 @@ public class AdminRepairStmtTest {
     @Test
     public void testAdminRepairTable() {
         AdminRepairTableStmt stmt = (AdminRepairTableStmt) analyzeSuccess("ADMIN REPAIR TABLE test;");
-        Assert.assertTrue(stmt.isSupportNewPlanner());
         Assert.assertEquals("test", stmt.getDbName());
         Assert.assertEquals("test", stmt.getTblName());
         stmt = (AdminRepairTableStmt) analyzeSuccess("ADMIN REPAIR TABLE test PARTITION(p1, p2, p3);");
@@ -48,7 +60,6 @@ public class AdminRepairStmtTest {
         Assert.assertEquals("test", stmt.getTblName());
         stmt = (AdminCancelRepairTableStmt) analyzeSuccess("ADMIN CANCEL REPAIR TABLE test PARTITION(p1, p2, p3);");
         Assert.assertEquals(Arrays.asList("p1", "p2", "p3"), stmt.getPartitions());
-        Assert.assertTrue(stmt.isSupportNewPlanner());
         analyzeFail("ADMIN CANCEL REPAIR TABLE");
         analyzeFail("ADMIN cancel REPAIR TABLE test TEMPORARY PARTITION(p1, p2, p3);");
     }
@@ -57,7 +68,7 @@ public class AdminRepairStmtTest {
     public void testAdminCheckTablets() {
         AdminCheckTabletsStmt stmt = (AdminCheckTabletsStmt) analyzeSuccess("ADMIN CHECK TABLET (10000, 10001) " +
                 "PROPERTIES(\"type\" = \"consistency\");");
-        Assert.assertFalse(stmt.getProperties().containsKey("type"));
+        Assert.assertTrue(stmt.getProperty().containsKey("type"));
         Assert.assertEquals("consistency", stmt.getType().name().toLowerCase());
         Assert.assertEquals(Long.valueOf(10001L), stmt.getTabletIds().get(1));
         Assert.assertEquals(RedirectStatus.FORWARD_NO_SYNC, stmt.getRedirectStatus());

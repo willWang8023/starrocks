@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/qe/QueryDetailQueueTest.java
 
@@ -34,7 +47,12 @@ public class QueryDetailQueueTest {
                 System.currentTimeMillis(), -1, -1, QueryDetail.QueryMemState.RUNNING,
                 "testDb", "select * from table1 limit 1",
                 "root", "");
-        QueryDetailQueue.addAndRemoveTimeoutQueryDetail(startQueryDetail);
+        startQueryDetail.setScanRows(100);
+        startQueryDetail.setScanBytes(10001);
+        startQueryDetail.setReturnRows(1);
+        startQueryDetail.setCpuCostNs(1002);
+        startQueryDetail.setMemCostBytes(100003);
+        QueryDetailQueue.addQueryDetail(startQueryDetail);
 
         List<QueryDetail> queryDetails = QueryDetailQueue.getQueryDetailsAfterTime(startQueryDetail.getEventTime() - 1);
         Assert.assertEquals(1, queryDetails.size());
@@ -49,7 +67,14 @@ public class QueryDetailQueueTest {
                 + "\"startTime\":" + startQueryDetail.getStartTime() + ",\"endTime\":-1,\"latency\":-1,"
                 + "\"state\":\"RUNNING\",\"database\":\"testDb\","
                 + "\"sql\":\"select * from table1 limit 1\","
-                + "\"user\":\"root\"}]";
+                + "\"user\":\"root\","
+                + "\"scanRows\":100,"
+                + "\"scanBytes\":10001,"
+                + "\"returnRows\":1,"
+                + "\"cpuCostNs\":1002,"
+                + "\"memCostBytes\":100003,"
+                + "\"spillBytes\":-1"
+                + "}]";
         Assert.assertEquals(jsonString, queryDetailString);
 
         queryDetails = QueryDetailQueue.getQueryDetailsAfterTime(startQueryDetail.getEventTime());
@@ -58,15 +83,8 @@ public class QueryDetailQueueTest {
         QueryDetail endQueryDetail = startQueryDetail.copy();
         endQueryDetail.setLatency(1);
         endQueryDetail.setState(QueryDetail.QueryMemState.FINISHED);
-        QueryDetailQueue.addAndRemoveTimeoutQueryDetail(endQueryDetail);
+        QueryDetailQueue.addQueryDetail(endQueryDetail);
 
-        queryDetails = QueryDetailQueue.getQueryDetailsAfterTime(startQueryDetail.getEventTime() - 1);
-        Assert.assertEquals(2, queryDetails.size());
-
-        //set first element eventTime to 1min ago to simulate queryDetail timeout
-        startQueryDetail.setEventTime(startQueryDetail.getEventTime() - 60000000000L);
-        //add new queryDetail, this will trigger delete
-        QueryDetailQueue.addAndRemoveTimeoutQueryDetail(new QueryDetail());
         queryDetails = QueryDetailQueue.getQueryDetailsAfterTime(startQueryDetail.getEventTime() - 1);
         Assert.assertEquals(2, queryDetails.size());
     }

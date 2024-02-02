@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -23,7 +35,7 @@ namespace starrocks {
 struct TypeDescriptor;
 } // namespace starrocks
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 class Column;
 
@@ -47,6 +59,7 @@ public:
         // TODO: user configurable.
         bool bool_alpha = true;
 
+        bool is_hive = false;
         // Here used to control array parse format.
         // Considering Hive array format is different from traditional array format,
         // so here we provide some variables to customize array format, and you can
@@ -80,9 +93,14 @@ public:
     virtual Status write_quoted_string(OutputStream* buff, const Column& column, size_t row_num,
                                        const Options& options) const = 0;
 
-    virtual bool read_string(Column* column, Slice s, const Options& options) const = 0;
+    virtual bool read_string_for_adaptive_null_column(Column* column, Slice s, const Options& options) const {
+        __builtin_unreachable();
+        return true;
+    }
 
-    virtual bool read_quoted_string(Column* column, Slice s, const Options& options) const = 0;
+    virtual bool read_string(Column* column, const Slice& s, const Options& options) const = 0;
+
+    virtual bool read_quoted_string(Column* column, const Slice& s, const Options& options) const = 0;
 
 protected:
     template <char quote>
@@ -100,6 +118,7 @@ protected:
 };
 
 std::unique_ptr<Converter> get_converter(const TypeDescriptor& type_desc, bool nullable);
+std::unique_ptr<Converter> get_hive_converter(const TypeDescriptor& type_desc, bool nullable);
 
 } // namespace csv
-} // namespace starrocks::vectorized
+} // namespace starrocks

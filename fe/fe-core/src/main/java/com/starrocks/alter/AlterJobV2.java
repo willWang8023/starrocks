@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/alter/AlterJobV2.java
 
@@ -21,16 +34,18 @@
 
 package com.starrocks.alter;
 
-import com.google.common.base.Preconditions;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.MaterializedIndexMeta;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.OlapTable.OlapTableState;
+import com.starrocks.catalog.TabletInvertedIndex;
 import com.starrocks.common.Config;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.TraceManager;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.server.GlobalStateMgr;
 import io.opentelemetry.api.trace.Span;
@@ -41,6 +56,7 @@ import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
 import java.util.List;
+import java.util.Optional;
 
 /*
  * Version 2 of AlterJob, for replacing the old version of AlterJob.
@@ -65,7 +81,7 @@ public abstract class AlterJobV2 implements Writable {
 
     public enum JobType {
         // DECOMMISSION_BACKEND is for compatible with older versions of metadata
-        ROLLUP, SCHEMA_CHANGE, DECOMMISSION_BACKEND
+        ROLLUP, SCHEMA_CHANGE, DECOMMISSION_BACKEND, OPTIMIZE
     }
 
     @SerializedName(value = "type")
@@ -121,6 +137,10 @@ public abstract class AlterJobV2 implements Writable {
         return jobState;
     }
 
+    public void setJobState(JobState jobState) {
+        this.jobState = jobState;
+    }
+
     public JobType getType() {
         return type;
     }
@@ -153,6 +173,10 @@ public abstract class AlterJobV2 implements Writable {
         return finishedTimeMs;
     }
 
+    public void setFinishedTimeMs(long finishedTimeMs) {
+        this.finishedTimeMs = finishedTimeMs;
+    }
+
     /**
      * The keyword 'synchronized' only protects 2 methods:
      * run() and cancel()
@@ -170,21 +194,27 @@ public abstract class AlterJobV2 implements Writable {
         }
 
         try {
-            switch (jobState) {
-                case PENDING:
-                    runPendingJob();
+            while (true) {
+                JobState prevState = jobState;
+                switch (prevState) {
+                    case PENDING:
+                        runPendingJob();
+                        break;
+                    case WAITING_TXN:
+                        runWaitingTxnJob();
+                        break;
+                    case RUNNING:
+                        runRunningJob();
+                        break;
+                    case FINISHED_REWRITING:
+                        runFinishedRewritingJob();
+                        break;
+                    default:
+                        break;
+                }
+                if (jobState == prevState) {
                     break;
-                case WAITING_TXN:
-                    runWaitingTxnJob();
-                    break;
-                case RUNNING:
-                    runRunningJob();
-                    break;
-                case FINISHED_REWRITING:
-                    runFinishedRewritingJob();
-                    break;
-                default:
-                    break;
+                } // else: handle the new state
             }
         } catch (AlterCancelException e) {
             cancelImpl(e.getMessage());
@@ -198,29 +228,31 @@ public abstract class AlterJobV2 implements Writable {
     }
 
     /**
-     * should be call before executing the job.
+     * should be called before executing the job.
      * return false if table is not stable.
      */
     protected boolean checkTableStable(Database db) throws AlterCancelException {
         OlapTable tbl;
-        boolean isStable;
-        db.readLock();
+        long unHealthyTabletId = TabletInvertedIndex.NOT_EXIST_VALUE;
+
+        Locker locker = new Locker();
+        locker.lockDatabase(db, LockType.READ);
         try {
             tbl = (OlapTable) db.getTable(tableId);
             if (tbl == null) {
                 throw new AlterCancelException("Table " + tableId + " does not exist");
             }
 
-            isStable = tbl.isStable(GlobalStateMgr.getCurrentSystemInfo(),
+            unHealthyTabletId = tbl.checkAndGetUnhealthyTablet(GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo(),
                     GlobalStateMgr.getCurrentState().getTabletScheduler());
         } finally {
-            db.readUnlock();
+            locker.unLockDatabase(db, LockType.READ);
         }
 
-        db.writeLock();
+        locker.lockDatabase(db, LockType.WRITE);
         try {
-            if (!isStable) {
-                errMsg = "table is unstable";
+            if (unHealthyTabletId != TabletInvertedIndex.NOT_EXIST_VALUE) {
+                errMsg = "table is unstable, unhealthy (or doing balance) tablet id: " + unHealthyTabletId;
                 LOG.warn("wait table {} to be stable before doing {} job", tableId, type);
                 tbl.setState(OlapTableState.WAITING_STABLE);
                 return false;
@@ -231,7 +263,7 @@ public abstract class AlterJobV2 implements Writable {
                 return true;
             }
         } finally {
-            db.writeUnlock();
+            locker.unLockDatabase(db, LockType.WRITE);
         }
     }
 
@@ -250,21 +282,8 @@ public abstract class AlterJobV2 implements Writable {
     public abstract void replay(AlterJobV2 replayedJob);
 
     public static AlterJobV2 read(DataInput in) throws IOException {
-        if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_86) {
-            JobType type = JobType.valueOf(Text.readString(in));
-            switch (type) {
-                case ROLLUP:
-                    return RollupJobV2.read(in);
-                case SCHEMA_CHANGE:
-                    return SchemaChangeJobV2.read(in);
-                default:
-                    Preconditions.checkState(false);
-                    return null;
-            }
-        } else {
-            String json = Text.readString(in);
-            return GsonUtils.GSON.fromJson(json, AlterJobV2.class);
-        }
+        String json = Text.readString(in);
+        return GsonUtils.GSON.fromJson(json, AlterJobV2.class);
     }
 
     @Override
@@ -297,5 +316,30 @@ public abstract class AlterJobV2 implements Writable {
         createTimeMs = in.readLong();
         finishedTimeMs = in.readLong();
         timeoutMs = in.readLong();
+    }
+
+    public abstract Optional<Long> getTransactionId();
+
+
+    /**
+     * Schema change will build a new MaterializedIndexMeta, we need rebuild it(add extra original meta)
+     * into it from original index meta. Otherwise, some necessary metas will be lost after fe restart.
+     *
+     * @param orgIndexMeta  : index meta before schema change.
+     * @param indexMeta     : new index meta after schema change.
+     */
+    protected void rebuildMaterializedIndexMeta(MaterializedIndexMeta orgIndexMeta,
+                                                MaterializedIndexMeta indexMeta) {
+        indexMeta.setViewDefineSql(orgIndexMeta.getViewDefineSql());
+        indexMeta.setColocateMVIndex(orgIndexMeta.isColocateMVIndex());
+        indexMeta.setDefineStmt(orgIndexMeta.getDefineStmt());
+        if (indexMeta.getDefineStmt() != null) {
+            try {
+                indexMeta.gsonPostProcess();
+            } catch (IOException e) {
+                LOG.warn("rebuild defined stmt of index meta {}(org)/{}(new) failed :",
+                        orgIndexMeta.getIndexId(), indexMeta.getIndexId(), e);
+            }
+        }
     }
 }

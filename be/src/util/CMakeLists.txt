@@ -1,25 +1,17 @@
-# This file is made available under Elastic License 2.0.
-# This file is based on code available under the Apache license here:
-#   https://github.com/apache/incubator-doris/blob/master/be/src/util/CMakeLists.txt
-
-# Licensed to the Apache Software Foundation (ASF) under one
-# or more contributor license agreements.  See the NOTICE file
-# distributed with this work for additional information
-# regarding copyright ownership.  The ASF licenses this file
-# to you under the Apache License, Version 2.0 (the
-# "License"); you may not use this file except in compliance
-# with the License.  You may obtain a copy of the License at
+# Copyright 2021-present StarRocks, Inc. All rights reserved.
 #
-#   http://www.apache.org/licenses/LICENSE-2.0
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
 #
-# Unless required by applicable law or agreed to in writing,
-# software distributed under the License is distributed on an
-# "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-# KIND, either express or implied.  See the License for the
-# specific language governing permissions and limitations
-# under the License.
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/util")
 
 # where to put generated binaries
@@ -30,13 +22,14 @@ set(UTIL_FILES
   arrow/row_batch.cpp
   arrow/starrocks_column_to_arrow.cpp
   arrow/utils.cpp
+  await.cpp
   bfd_parser.cpp
-  bitmap.cpp
   compression/block_compression.cpp
   compression/compression_context_pool_singletons.cpp
   compression/stream_compression.cpp
   coding.cpp
   cpu_info.cpp
+  cpu_usage_info.cpp
   crc32c.cpp
   date_func.cpp
   dynamic_util.cpp
@@ -51,6 +44,7 @@ set(UTIL_FILES
   starrocks_metrics.cpp
   mem_info.cpp
   metrics.cpp
+  misc.cpp
   murmur_hash3.cpp
   network_util.cpp
   parse_util.cpp
@@ -64,13 +58,13 @@ set(UTIL_FILES
   thrift_client.cpp
   thrift_server.cpp
   stack_util.cpp
-  symbols_util.cpp
   system_metrics.cpp
   url_parser.cpp
   url_coding.cpp
   mysql_row_buffer.cpp
   error_util.cc
   spinlock.cc
+  file_util.cpp
   filesystem_util.cc
   time.cpp
 # coding_util.cpp
@@ -95,8 +89,6 @@ set(UTIL_FILES
   timezone_utils.cpp
   easy_json.cc
   mustache/mustache.cc
-  percentile_value.h
-  buffered_stream.cpp
   int96.cpp
   hdfs_util.cpp
   gc_helper.cpp
@@ -105,14 +97,13 @@ set(UTIL_FILES
   lru_cache.cpp
   tdigest.cpp
   debug/query_trace_impl.cpp
+  random.cc
+  stack_trace_mutex.cpp
+  failpoint/fail_point.cpp
+  bthreads/future.h
+  bthreads/future_impl.cpp
+  hash_util.cpp
 )
-
-# simdjson Runtime Implement Dispatch: https://github.com/simdjson/simdjson/blob/master/doc/implementation-selection.md#runtime-cpu-detection
-# Unset architecture-specific flags to avoid breaking implement runtime dispatch.
-if ("${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86" OR "${CMAKE_BUILD_TARGET_ARCH}" STREQUAL "x86_64")
-    set_source_files_properties(json.cpp PROPERTIES COMPILE_FLAGS "-mno-avx -mno-avx2")
-    set_source_files_properties(json_converter.cpp PROPERTIES COMPILE_FLAGS "-mno-avx -mno-avx2")
-endif()
 
 add_library(Util STATIC
     ${UTIL_FILES}

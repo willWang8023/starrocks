@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #pragma once
 
 #include <atomic>
@@ -17,26 +30,26 @@ namespace starrocks {
 
 class DataDir;
 class ExecEnv;
+class MemTracker;
 class SegmentPB;
 class PTabletInfo;
 class FileSystem;
+struct DeltaWriterOptions;
 
-namespace vectorized {
-class DeltaWriterOptions;
-}
-
-using DeltaWriterOptions = starrocks::vectorized::DeltaWriterOptions;
+using DeltaWriterOptions = starrocks::DeltaWriterOptions;
 
 class ReplicateChannel {
 public:
-    ReplicateChannel(const DeltaWriterOptions* opt, const std::string& host, int32_t port, int64_t node_id);
+    ReplicateChannel(const DeltaWriterOptions* opt, std::string host, int32_t port, int64_t node_id);
     ~ReplicateChannel();
 
     Status sync_segment(SegmentPB* segment, butil::IOBuf& data, bool eos,
-                        std::vector<std::unique_ptr<PTabletInfo>>* replicate_tablet_infos);
+                        std::vector<std::unique_ptr<PTabletInfo>>* replicate_tablet_infos,
+                        std::vector<std::unique_ptr<PTabletInfo>>* failed_tablet_infos);
 
     Status async_segment(SegmentPB* segment, butil::IOBuf& data, bool eos,
-                         std::vector<std::unique_ptr<PTabletInfo>>* replicate_tablet_infos);
+                         std::vector<std::unique_ptr<PTabletInfo>>* replicate_tablet_infos,
+                         std::vector<std::unique_ptr<PTabletInfo>>* failed_tablet_infos);
 
     void cancel();
 
@@ -47,7 +60,8 @@ public:
 private:
     Status _init();
     void _send_request(SegmentPB* segment, butil::IOBuf& data, bool eos);
-    Status _wait_response(std::vector<std::unique_ptr<PTabletInfo>>* replicate_tablet_infos);
+    Status _wait_response(std::vector<std::unique_ptr<PTabletInfo>>* replicate_tablet_infos,
+                          std::vector<std::unique_ptr<PTabletInfo>>* failed_tablet_infos);
 
     const DeltaWriterOptions* _opt;
     const std::string _host;
@@ -55,7 +69,8 @@ private:
     const int64_t _node_id;
 
     ReusableClosure<PTabletWriterAddSegmentResult>* _closure = nullptr;
-    doris::PBackendService_Stub* _stub = nullptr;
+    PInternalService_Stub* _stub = nullptr;
+    MemTracker* _mem_tracker = nullptr;
 
     bool _inited = false;
     Status _st = Status::OK();
@@ -70,7 +85,9 @@ public:
 
     // when error has happpens, so we cancel this token
     // and remove all tasks in the queue.
-    void cancel();
+    void cancel(const Status& st);
+
+    void shutdown();
 
     // wait all tasks in token to be completed.
     Status wait();
@@ -92,6 +109,10 @@ public:
         return &_replicated_tablet_infos;
     }
 
+    const std::vector<std::unique_ptr<PTabletInfo>>* failed_tablet_infos() const { return &_failed_tablet_infos; }
+
+    const std::vector<int64_t> replica_node_ids() const { return _replica_node_ids; }
+
 private:
     friend class SegmentReplicateTask;
 
@@ -108,12 +129,14 @@ private:
     std::vector<std::unique_ptr<ReplicateChannel>> _replicate_channels;
 
     std::vector<std::unique_ptr<PTabletInfo>> _replicated_tablet_infos;
+    std::vector<std::unique_ptr<PTabletInfo>> _failed_tablet_infos;
 
     std::unique_ptr<FileSystem> _fs;
 
     std::set<int64_t> _failed_node_id;
 
     int64_t _max_fail_replica_num;
+    std::vector<int64_t> _replica_node_ids;
 };
 
 class SegmentReplicateExecutor {
@@ -124,6 +147,10 @@ public:
     // init should be called after storage engine is opened,
     // because it needs path hash of each data dir.
     Status init(const std::vector<DataDir*>& data_dirs);
+
+    Status update_max_threads(int max_threads);
+
+    ThreadPool* get_thread_pool() { return _replicate_pool.get(); }
 
     // NOTE: we use SERIAL mode here to ensure all segment from one tablet are synced in order.
     std::unique_ptr<ReplicateToken> create_replicate_token(

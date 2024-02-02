@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/projection_iterator.h"
 
@@ -10,12 +22,12 @@
 #include "column/datum.h"
 #include "storage/chunk_helper.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // Schema with 3 columns: INT, VARCHAR, INT.
 class VectorIterator final : public ChunkIterator {
 public:
-    explicit VectorIterator(std::vector<int32_t> c1, std::vector<string> c2, std::vector<int32_t> c3)
+    explicit VectorIterator(std::vector<int32_t> c1, std::vector<std::string> c2, std::vector<int32_t> c3)
             : ChunkIterator(schema()), _c1(std::move(c1)), _c2(std::move(c2)), _c3(std::move(c3)) {}
 
     // 10 elements at most every time.
@@ -36,9 +48,9 @@ public:
     }
 
     static Schema schema() {
-        FieldPtr f1 = std::make_shared<Field>(0, "c1", get_type_info(OLAP_FIELD_TYPE_INT), false);
-        FieldPtr f2 = std::make_shared<Field>(1, "c2", get_type_info(OLAP_FIELD_TYPE_VARCHAR), false);
-        FieldPtr f3 = std::make_shared<Field>(2, "c3", get_type_info(OLAP_FIELD_TYPE_INT), false);
+        FieldPtr f1 = std::make_shared<Field>(0, "c1", get_type_info(TYPE_INT), false);
+        FieldPtr f2 = std::make_shared<Field>(1, "c2", get_type_info(TYPE_VARCHAR), false);
+        FieldPtr f3 = std::make_shared<Field>(2, "c3", get_type_info(TYPE_INT), false);
         f1->set_is_key(true);
         return Schema(std::vector<FieldPtr>{f1, f2, f3});
     }
@@ -71,7 +83,7 @@ TEST_F(ProjectionIteratorTest, all) {
         schema.remove(2);
         schema.remove(1);
         auto iter = new_projection_iterator(schema, child);
-        iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS);
+        ASSERT_TRUE(iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(iter->encoded_schema(), config::vector_chunk_size);
         auto st = iter->get_next(chunk.get());
         ASSERT_TRUE(st.ok());
@@ -87,7 +99,7 @@ TEST_F(ProjectionIteratorTest, all) {
         Schema schema = child->schema();
         schema.remove(0);
         auto iter = new_projection_iterator(schema, child);
-        iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS);
+        ASSERT_TRUE(iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(iter->encoded_schema(), config::vector_chunk_size);
         auto st = iter->get_next(chunk.get());
         ASSERT_TRUE(st.ok());
@@ -105,7 +117,7 @@ TEST_F(ProjectionIteratorTest, all) {
         FieldPtr f3 = child->schema().field(2);
         Schema schema({f3, f1});
         auto iter = new_projection_iterator(schema, child);
-        iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS);
+        ASSERT_TRUE(iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(iter->encoded_schema(), config::vector_chunk_size);
         auto st = iter->get_next(chunk.get());
         ASSERT_TRUE(st.ok());
@@ -118,4 +130,4 @@ TEST_F(ProjectionIteratorTest, all) {
     }
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

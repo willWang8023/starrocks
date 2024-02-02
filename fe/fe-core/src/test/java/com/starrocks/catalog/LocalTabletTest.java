@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/catalog/TabletTest.java
 
@@ -23,9 +36,12 @@ package com.starrocks.catalog;
 
 import com.google.common.collect.Sets;
 import com.starrocks.catalog.Replica.ReplicaState;
-import com.starrocks.common.FeConstants;
+import com.starrocks.clone.TabletChecker;
 import com.starrocks.persist.gson.GsonUtils;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.NodeMgr;
+import com.starrocks.system.Backend;
+import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TStorageMedium;
 import mockit.Expectations;
 import mockit.Mocked;
@@ -49,24 +65,38 @@ public class LocalTabletTest {
     private TabletInvertedIndex invertedIndex;
 
     @Mocked
+    private SystemInfoService infoService;
+
+    @Mocked
     private GlobalStateMgr globalStateMgr;
+
+    @Mocked
+    private NodeMgr nodeMgr;
 
     @Before
     public void makeTablet() {
         invertedIndex = new TabletInvertedIndex();
         new Expectations(globalStateMgr) {
             {
-                GlobalStateMgr.getCurrentStateJournalVersion();
-                minTimes = 0;
-                result = FeConstants.meta_version;
-
-                GlobalStateMgr.getCurrentInvertedIndex();
+                GlobalStateMgr.getCurrentState().getTabletInvertedIndex();
                 minTimes = 0;
                 result = invertedIndex;
 
                 GlobalStateMgr.isCheckpointThread();
                 minTimes = 0;
                 result = false;
+
+                globalStateMgr.getNodeMgr();
+                minTimes = 0;
+                result = nodeMgr;
+            }
+        };
+
+        new Expectations(nodeMgr) {
+            {
+                nodeMgr.getClusterInfo();
+                minTimes = 0;
+                result = infoService;
             }
         };
 
@@ -79,6 +109,10 @@ public class LocalTabletTest {
         tablet.addReplica(replica1);
         tablet.addReplica(replica2);
         tablet.addReplica(replica3);
+
+        infoService = globalStateMgr.getNodeMgr().getClusterInfo();
+        infoService.addBackend(new Backend(10001L, "host1", 9050));
+        infoService.addBackend(new Backend(10002L, "host2", 9050));
     }
 
     @Test
@@ -173,9 +207,41 @@ public class LocalTabletTest {
                 -1, 10, 10, ReplicaState.NORMAL, 9, 8);
         Replica normalReplica = new Replica(1L, 10002L, 9,
                 -1, 10, 10, ReplicaState.NORMAL, -1, 9);
-        tablet.addReplica(versionIncompleteReplica, true);
-        tablet.addReplica(normalReplica, true);
-        Assert.assertEquals(LocalTablet.TabletStatus.COLOCATE_REDUNDANT,
-                tablet.getColocateHealthStatus(9, 1, Sets.newHashSet(10002L)));
+        tablet.addReplica(versionIncompleteReplica, false);
+        tablet.addReplica(normalReplica, false);
+        Assert.assertEquals(LocalTablet.TabletHealthStatus.COLOCATE_REDUNDANT,
+                TabletChecker.getColocateTabletHealthStatus(
+                        tablet, 9, 1, Sets.newHashSet(10002L)));
+    }
+
+
+    @Test
+    public void testGetBackends() throws Exception {
+        LocalTablet tablet = new LocalTablet();
+
+        Replica replica1 = new Replica(1L, 10001L, 8,
+                -1, 10, 10, ReplicaState.NORMAL, 9, 8);
+        Replica replica2 = new Replica(1L, 10002L, 9,
+                -1, 10, 10, ReplicaState.NORMAL, -1, 9);
+        tablet.addReplica(replica1, false);
+        tablet.addReplica(replica2, false);
+
+        Assert.assertEquals(tablet.getBackends().size(), 2);
+
+    }
+
+    @Test
+    public void testGetReplicaInfos() {
+        LocalTablet tablet = new LocalTablet();
+
+        Replica replica1 = new Replica(1L, 10001L, 8,
+                -1, 10, 10, ReplicaState.NORMAL, 9, 8);
+        Replica replica2 = new Replica(1L, 10002L, 9,
+                -1, 10, 10, ReplicaState.NORMAL, -1, 9);
+        tablet.addReplica(replica1, false);
+        tablet.addReplica(replica2, false);
+
+        String infos = tablet.getReplicaInfos();
+        System.out.println(infos);
     }
 }

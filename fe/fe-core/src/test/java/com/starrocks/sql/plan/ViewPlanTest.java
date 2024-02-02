@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.plan;
 
@@ -14,6 +26,7 @@ public class ViewPlanTest extends PlanTestBase {
     private static final AtomicInteger INDEX = new AtomicInteger(0);
 
     private void testView(String sql) throws Exception {
+        starRocksAssert.getCtx().getSessionVariable().setEnableViewBasedMvRewrite(false);
         String viewName = "view" + INDEX.getAndIncrement();
         String createView = "create view " + viewName + " as " + sql;
         starRocksAssert.withView(createView);
@@ -26,6 +39,7 @@ public class ViewPlanTest extends PlanTestBase {
     }
 
     private void testViewIgnoreObjectCountDistinct(String sql) throws Exception {
+        starRocksAssert.getCtx().getSessionVariable().setEnableViewBasedMvRewrite(false);
         String viewName = "view" + INDEX.getAndIncrement();
         String createView = "create view " + viewName + " as " + sql;
         starRocksAssert.withView(createView);
@@ -880,7 +894,7 @@ public class ViewPlanTest extends PlanTestBase {
     @Test
     public void testSql196() throws Exception {
         String sql = "select k2 from baseall group by ((10800861)/(((NULL)%(((-1114980787)+(-1182952114)))))), " +
-                        "((10800861)*(-9223372036854775808)), k2";
+                "((10800861)*(-9223372036854775808)), k2";
         testView(sql);
     }
 
@@ -1592,6 +1606,16 @@ public class ViewPlanTest extends PlanTestBase {
     }
 
     @Test
+    public void testAliasView3() throws Exception {
+        String createView = "create view alias_view(a, b) as select v1,v2 from test.t0";
+        starRocksAssert.withView(createView);
+
+        String plan = getFragmentPlan("select test.t.a from test.alias_view t");
+        assertContains(plan, "OUTPUT EXPRS:1: v1");
+        starRocksAssert.dropView("alias_view");
+    }
+
+    @Test
     public void testExpressionRewriteView() throws Exception {
         String sql =
                 "select from_unixtime(unix_timestamp(id_datetime, 'yyyy-MM-dd'), 'yyyy-MM-dd') as x1, sum(t1c) as x3 " +
@@ -1698,10 +1722,58 @@ public class ViewPlanTest extends PlanTestBase {
 
         AlterViewStmt alterViewStmt =
                 (AlterViewStmt) UtFrameUtils.parseStmtWithNewParser(alterView, starRocksAssert.getCtx());
-        GlobalStateMgr.getCurrentState().alterView(alterViewStmt);
+        GlobalStateMgr.getCurrentState().getLocalMetastore().alterView(alterViewStmt);
 
         sqlPlan = getFragmentPlan(alterStmt);
         viewPlan = getFragmentPlan("select * from " + viewName);
         Assert.assertEquals(sqlPlan, viewPlan);
+    }
+
+    @Test
+    public void testLateralJoin() throws Exception {
+        starRocksAssert.withTable("CREATE TABLE json_test (" +
+                " v_id INT," +
+                " v_json json, " +
+                " v_SMALLINT SMALLINT" +
+                ") DUPLICATE KEY (v_id) " +
+                "DISTRIBUTED BY HASH (v_id) " +
+                "properties(\"replication_num\"=\"1\") ;"
+        );
+        String sql = "    SELECT\n" +
+                "         v_id\n" +
+                "        , get_json_string(ie.value,'$.b') as b\n" +
+                "        ,get_json_string(ie.value,'$.c') as c\n" +
+                "    FROM\n" +
+                "      json_test ge\n" +
+                "      ,lateral json_each(cast (ge.v_json as json) -> '$.')ie";
+
+        testView(sql);
+
+        sql = "    SELECT\n" +
+                "         v_id\n" +
+                "        , get_json_string(ie.value,'$.b') as b\n" +
+                "        ,get_json_string(ie.value,'$.c') as c\n" +
+                "    FROM\n" +
+                "      json_test ge\n" +
+                "      ,lateral json_each(cast (ge.v_json as json) -> '$.') ie(`key`, `value`)";
+        testView(sql);
+    }
+
+    @Test
+    public void testArrayMapView() throws Exception {
+        String sql = "SELECT [1,2,3]";
+        testView(sql);
+        sql = "SELECT ARRAY<INT>[1,2,3]";
+        testView(sql);
+        sql = "SELECT Map<INT, INT>{1:10,2:20,3:30}";
+        testView(sql);
+        sql = "SELECT Map{1:10,2:20,3:30}";
+        testView(sql);
+    }
+
+    @Test
+    public void testBackquoteAlias() throws Exception {
+        String sql = "select `select` from (select v1 from t0) `abc.bcd`(`select`);";
+        testView(sql);
     }
 }

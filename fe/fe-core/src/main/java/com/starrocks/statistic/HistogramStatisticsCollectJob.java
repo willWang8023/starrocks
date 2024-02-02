@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.statistic;
 
 import com.google.common.base.Joiner;
@@ -21,12 +34,12 @@ import static com.starrocks.statistic.StatsConstants.HISTOGRAM_STATISTICS_TABLE_
 public class HistogramStatisticsCollectJob extends StatisticsCollectJob {
     private static final String COLLECT_HISTOGRAM_STATISTIC_TEMPLATE =
             "SELECT $tableId, '$columnName', $dbId, '$dbName.$tableName'," +
-                    " histogram($columnName, cast($bucketNum as int), cast($sampleRatio as double)), " +
+                    " histogram(`$columnName`, cast($bucketNum as int), cast($sampleRatio as double)), " +
                     " $mcv," +
                     " NOW()" +
-                    " FROM (SELECT $columnName FROM $dbName.$tableName where rand() <= $sampleRatio" +
-                    " and $columnName is not null $MCVExclude" +
-                    " ORDER BY $columnName LIMIT $totalRows) t";
+                    " FROM (SELECT `$columnName` FROM `$dbName`.`$tableName` where rand() <= $sampleRatio" +
+                    " and `$columnName` is not null $MCVExclude" +
+                    " ORDER BY `$columnName` LIMIT $totalRows) t";
 
     private static final String COLLECT_MCV_STATISTIC_TEMPLATE =
             "select cast(version as INT), cast(db_id as BIGINT), cast(table_id as BIGINT), " +
@@ -36,7 +49,7 @@ public class HistogramStatisticsCollectJob extends StatisticsCollectJob {
                     "$tableId as table_id, " +
                     "`$columnName` as column_key, " +
                     "count(`$columnName`) as column_value " +
-                    "from $dbName.$tableName where `$columnName` is not null " +
+                    "from `$dbName`.`$tableName` where `$columnName` is not null " +
                     "group by `$columnName` " +
                     "order by count(`$columnName`) desc limit $topN ) t";
 
@@ -60,7 +73,7 @@ public class HistogramStatisticsCollectJob extends StatisticsCollectJob {
         for (String column : columns) {
             String sql = buildCollectMCV(db, table, mcvSize, column);
             StatisticExecutor statisticExecutor = new StatisticExecutor();
-            List<TStatisticData> mcv = statisticExecutor.queryMCV(sql);
+            List<TStatisticData> mcv = statisticExecutor.queryMCV(context, sql);
 
             Map<String, String> mostCommonValues = new HashMap<>();
             for (TStatisticData tStatisticData : mcv) {
@@ -72,7 +85,7 @@ public class HistogramStatisticsCollectJob extends StatisticsCollectJob {
 
             finishedSQLNum++;
             analyzeStatus.setProgress(finishedSQLNum * 100 / totalCollectSQL);
-            GlobalStateMgr.getCurrentAnalyzeMgr().addAnalyzeStatus(analyzeStatus);
+            GlobalStateMgr.getCurrentState().getAnalyzeMgr().addAnalyzeStatus(analyzeStatus);
         }
     }
 
@@ -119,10 +132,10 @@ public class HistogramStatisticsCollectJob extends StatisticsCollectJob {
 
         if (!mostCommonValues.isEmpty()) {
             if (column.getType().getPrimitiveType().isDateType() || column.getType().getPrimitiveType().isCharFamily()) {
-                context.put("MCVExclude", " and " + columnName + " not in (\"" +
+                context.put("MCVExclude", " and " + StatisticUtils.quoting(columnName) + " not in (\"" +
                         Joiner.on("\",\"").join(mostCommonValues.keySet()) + "\")");
             } else {
-                context.put("MCVExclude", " and " + columnName + " not in (" +
+                context.put("MCVExclude", " and " + StatisticUtils.quoting(columnName) + " not in (" +
                         Joiner.on(",").join(mostCommonValues.keySet()) + ")");
             }
         } else {

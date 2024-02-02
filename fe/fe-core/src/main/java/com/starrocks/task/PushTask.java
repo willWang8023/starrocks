@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/task/PushTask.java
 
@@ -23,20 +36,23 @@ package com.starrocks.task;
 
 import com.google.common.base.Preconditions;
 import com.starrocks.analysis.BinaryPredicate;
-import com.starrocks.analysis.BinaryPredicate.Operator;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.InPredicate;
 import com.starrocks.analysis.IsNullPredicate;
 import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.analysis.Predicate;
 import com.starrocks.analysis.SlotRef;
-import com.starrocks.common.MarkedCountDownLatch;
+import com.starrocks.common.Status;
+import com.starrocks.common.util.concurrent.MarkedCountDownLatch;
 import com.starrocks.thrift.TBrokerScanRange;
+import com.starrocks.thrift.TColumn;
 import com.starrocks.thrift.TCondition;
 import com.starrocks.thrift.TDescriptorTable;
 import com.starrocks.thrift.TPriority;
 import com.starrocks.thrift.TPushReq;
 import com.starrocks.thrift.TPushType;
 import com.starrocks.thrift.TResourceInfo;
+import com.starrocks.thrift.TStatusCode;
 import com.starrocks.thrift.TTabletType;
 import com.starrocks.thrift.TTaskType;
 import org.apache.logging.log4j.LogManager;
@@ -73,11 +89,14 @@ public class PushTask extends AgentTask {
 
     private TTabletType tabletType;
 
+    // for light schema change
+    private List<TColumn> columnsDesc = null;
+
     public PushTask(TResourceInfo resourceInfo, long backendId, long dbId, long tableId, long partitionId,
                     long indexId, long tabletId, long replicaId, int schemaHash, long version,
                     int timeoutSecond, long loadJobId, TPushType pushType,
                     List<Predicate> conditions, TPriority priority, TTaskType taskType,
-                    long transactionId, long signature) {
+                    long transactionId, long signature, List<TColumn> columnsDesc) {
         super(resourceInfo, backendId, taskType, dbId, tableId, partitionId, indexId, tabletId, signature);
         this.replicaId = replicaId;
         this.schemaHash = schemaHash;
@@ -94,6 +113,7 @@ public class PushTask extends AgentTask {
         this.tBrokerScanRange = null;
         this.tDescriptorTable = null;
         this.useVectorized = true;
+        this.columnsDesc = columnsDesc;
     }
 
     // for cancel delete
@@ -110,19 +130,19 @@ public class PushTask extends AgentTask {
     public PushTask(long backendId, long dbId, long tableId, long partitionId, long indexId, long tabletId,
                     long replicaId, int schemaHash, int timeoutSecond, long loadJobId, TPushType pushType,
                     TPriority priority, long transactionId, long signature, TBrokerScanRange tBrokerScanRange,
-                    TDescriptorTable tDescriptorTable, boolean useVectorized, String timezone, TTabletType tabletType) {
+                    TDescriptorTable tDescriptorTable, String timezone, TTabletType tabletType, List<TColumn> columnsDesc) {
         this(null, backendId, dbId, tableId, partitionId, indexId,
                 tabletId, replicaId, schemaHash, -1, timeoutSecond, loadJobId, pushType, null,
-                priority, TTaskType.REALTIME_PUSH, transactionId, signature);
+                priority, TTaskType.REALTIME_PUSH, transactionId, signature, columnsDesc);
         this.tBrokerScanRange = tBrokerScanRange;
         this.tDescriptorTable = tDescriptorTable;
-        this.useVectorized = useVectorized;
+        this.useVectorized = true;
         this.timezone = timezone;
         this.tabletType = tabletType;
     }
 
     public TPushReq toThrift() {
-        TPushReq request = new TPushReq(tabletId, schemaHash, version, timeoutSecond, pushType);
+        TPushReq request = new TPushReq(tabletId, schemaHash, version, 0, timeoutSecond, pushType);
         if (taskType == TTaskType.REALTIME_PUSH) {
             request.setPartition_id(partitionId);
             request.setTransaction_id(transactionId);
@@ -143,7 +163,7 @@ public class PushTask extends AgentTask {
                         BinaryPredicate binaryPredicate = (BinaryPredicate) condition;
                         String columnName = ((SlotRef) binaryPredicate.getChild(0)).getColumnName();
                         String value = ((LiteralExpr) binaryPredicate.getChild(1)).getStringValue();
-                        Operator op = binaryPredicate.getOp();
+                        BinaryType op = binaryPredicate.getOp();
                         tCondition.setColumn_name(columnName);
                         tCondition.setCondition_op(op.toString());
                         conditionValues.add(value);
@@ -174,12 +194,10 @@ public class PushTask extends AgentTask {
                     tConditions.add(tCondition);
                 }
                 request.setDelete_conditions(tConditions);
-                request.setUse_vectorized(useVectorized);
                 break;
             case LOAD_V2:
                 request.setBroker_scan_range(tBrokerScanRange);
                 request.setDesc_tbl(tDescriptorTable);
-                request.setUse_vectorized(useVectorized);
                 request.setTablet_type(tabletType);
                 break;
             case CANCEL_DELETE:
@@ -189,6 +207,7 @@ public class PushTask extends AgentTask {
                 LOG.warn("unknown push type. type: " + pushType.name());
                 break;
         }
+        request.setColumns_desc(columnsDesc);
 
         return request;
     }
@@ -200,6 +219,15 @@ public class PushTask extends AgentTask {
     public void countDownLatch(long backendId, long tabletId) {
         if (this.latch != null) {
             if (latch.markedCountDown(backendId, tabletId)) {
+                LOG.info("pushTask current latch count: {}. backend: {}, tablet:{}",
+                        latch.getCount(), backendId, tabletId);
+            }
+        }
+    }
+
+    public void countDownLatch(long backendId, long tabletId, String errMsg) {
+        if (this.latch != null) {
+            if (latch.markedCountDown(backendId, tabletId, new Status(TStatusCode.INTERNAL_ERROR, errMsg))) {
                 LOG.info("pushTask current latch count: {}. backend: {}, tablet:{}",
                         latch.getCount(), backendId, tabletId);
             }

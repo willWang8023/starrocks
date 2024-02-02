@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -12,7 +24,7 @@
 #include "storage/column_aggregate_func.h"
 #include "storage/row_source_mask.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 class ChunkAggregator {
 private:
@@ -61,9 +73,9 @@ private:
     // chunk mate
     const Schema* _schema;
 
-    uint16_t _key_fields;
+    size_t _key_fields;
 
-    uint16_t _num_fields;
+    size_t _num_fields;
 
     uint32_t _reserve_rows;
 
@@ -71,7 +83,7 @@ private:
 
     uint32_t _source_row;
 
-    uint32_t _source_size;
+    size_t _source_size;
 
     // aggregate chunk info
     std::vector<uint8_t> _is_eq;
@@ -101,8 +113,8 @@ private:
 
     // element memory usage and bytes usage calculation cost of object column is high,
     // so cache calculated element memory usage and bytes usage to avoid repeated calculation.
-    size_t _element_memory_usage = 0;
-    size_t _element_memory_usage_num_rows = 0;
+    size_t _reference_memory_usage = 0;
+    size_t _reference_memory_usage_num_rows = 0;
     size_t _bytes_usage = 0;
     size_t _bytes_usage_num_rows = 0;
 
@@ -111,4 +123,4 @@ private:
     bool _is_key = false;
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

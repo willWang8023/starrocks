@@ -1,171 +1,72 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.catalog;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.starrocks.common.DdlException;
-import com.starrocks.external.iceberg.IcebergCatalog;
-import com.starrocks.external.iceberg.IcebergCustomCatalogTest;
-import com.starrocks.external.iceberg.IcebergUtil;
-import com.starrocks.server.GlobalStateMgr;
-import mockit.Expectations;
-import mockit.Mock;
-import mockit.MockUp;
+import com.starrocks.connector.iceberg.TableTestBase;
+import com.starrocks.server.IcebergTableFactory;
 import mockit.Mocked;
-import org.apache.iceberg.Schema;
 import org.apache.iceberg.Table;
-import org.apache.iceberg.catalog.TableIdentifier;
-import org.apache.iceberg.types.Types;
 import org.junit.Assert;
-import org.junit.Before;
 import org.junit.Test;
 
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 
-public class IcebergTableTest {
-    private String db;
-    private String tableName;
-    String resourceName;
-    private List<Column> columns;
-    private Map<String, String> properties;
+import static com.starrocks.catalog.Type.INT;
+import static com.starrocks.server.ExternalTableFactory.RESOURCE;
 
-    @Before
-    public void setUp() {
-        db = "db0";
-        tableName = "table0";
-        resourceName = "iceberg0";
+public class IcebergTableTest extends TableTestBase {
 
-        columns = Lists.newArrayList();
-        Column column = new Column("col1", Type.BIGINT, true);
-        columns.add(column);
-
-        properties = Maps.newHashMap();
-        properties.put("database", db);
-        properties.put("table", tableName);
-        properties.put("resource", resourceName);
+    @Test(expected = DdlException.class)
+    public void testValidateIcebergColumnType() throws DdlException {
+        List<Column> columns = Lists.newArrayList(new Column("k1", INT), new Column("k2", INT));
+        IcebergTable oTable = new IcebergTable(1, "srTableName", "iceberg_catalog",
+                "resource_name", "iceberg_db", "iceberg_table", columns, mockedNativeTableB, Maps.newHashMap());
+        List<Column> inputColumns = Lists.newArrayList(new Column("k1", INT, true));
+        IcebergTableFactory.validateIcebergColumnType(inputColumns, oTable);
     }
 
     @Test
-    public void testWithResourceName(@Mocked GlobalStateMgr globalStateMgr,
-                                     @Mocked ResourceMgr resourceMgr,
-                                     @Mocked IcebergCatalog icebergCatalog,
-                                     @Mocked Table iTable) throws DdlException {
-        Resource icebergResource = new IcebergResource(resourceName);
-        Map<String, String> resourceProperties = Maps.newHashMap();
-        resourceProperties.put("iceberg.catalog.hive.metastore.uris", "thrift://127.0.0.1:9083");
-        resourceProperties.put("iceberg.catalog.type", "hive");
-        icebergResource.setProperties(resourceProperties);
+    public void testCreateTableResourceName(@Mocked Table icebergNativeTable) throws DdlException {
 
-        List<Types.NestedField> fields = new ArrayList<>();
-        fields.add(Types.NestedField.of(1, false, "col1", new Types.LongType()));
-        Schema schema = new Schema(fields);
-
-        new MockUp<IcebergUtil>() {
-            @Mock
-            public IcebergCatalog getIcebergHiveCatalog(String uris, Map<String, String> icebergProperties) {
-                return icebergCatalog;
-            }
-        };
-
-        new Expectations() {
+        String resourceName = "Iceberg_resource_29bb53dc_7e04_11ee_9b35_00163e0e489a";
+        Map<String, String> properties = new HashMap() {
             {
-                GlobalStateMgr.getCurrentState();
-                result = globalStateMgr;
-                minTimes = 0;
-
-                globalStateMgr.getResourceMgr();
-                result = resourceMgr;
-
-                resourceMgr.getResource("iceberg0");
-                result = icebergResource;
-
-                icebergCatalog.loadTable((TableIdentifier) any);
-                result = iTable;
-
-                iTable.schema();
-                result = schema;
+                put(RESOURCE, resourceName);
             }
         };
 
-        properties.put("resource", resourceName);
-        IcebergTable table = new IcebergTable(1000, "iceberg_table", columns, properties);
-        Assert.assertEquals(tableName, table.getTable());
-        Assert.assertEquals(db, table.getDb());
-    }
-
-    @Test
-    public void testCustomWithResourceName(@Mocked GlobalStateMgr globalStateMgr,
-                                           @Mocked ResourceMgr resourceMgr,
-                                           @Mocked IcebergCatalog icebergCatalog,
-                                           @Mocked Table iTable) throws DdlException {
-        Resource icebergResource = new IcebergResource(resourceName);
-        Map<String, String> resourceProperties = Maps.newHashMap();
-        resourceProperties.put("iceberg.catalog.type", "custom");
-        resourceProperties.put("iceberg.catalog-impl",
-                IcebergCustomCatalogTest.IcebergCustomTestingCatalog.class.getName());
-        icebergResource.setProperties(resourceProperties);
-
-        List<Types.NestedField> fields = new ArrayList<>();
-        fields.add(Types.NestedField.of(1, false, "col1", new Types.LongType()));
-        Schema schema = new Schema(fields);
-
-        new MockUp<IcebergUtil>() {
-            @Mock
-            public IcebergCatalog getIcebergCustomCatalog(String catalogImpl, Map<String, String> icebergProperties) {
-                return icebergCatalog;
-            }
-        };
-
-        new Expectations() {
-            {
-                GlobalStateMgr.getCurrentState();
-                result = globalStateMgr;
-                minTimes = 0;
-
-                globalStateMgr.getResourceMgr();
-                result = resourceMgr;
-
-                resourceMgr.getResource("iceberg0");
-                result = icebergResource;
-
-                icebergCatalog.loadTable((TableIdentifier) any);
-                result = iTable;
-
-                iTable.schema();
-                result = schema;
-            }
-        };
-
-        properties.put("resource", resourceName);
-        IcebergTable table = new IcebergTable(1000, "iceberg_table", columns, properties);
-        Assert.assertEquals(tableName, table.getTable());
-        Assert.assertEquals(db, table.getDb());
-    }
-
-    @Test(expected = DdlException.class)
-    public void testNoDb() throws DdlException {
-        properties.remove("database");
-        new IcebergTable(1000, "iceberg_table", columns, properties);
-        Assert.fail("No exception throws.");
-    }
-
-    @Test(expected = DdlException.class)
-    public void testNoTbl() throws DdlException {
-        properties.remove("table");
-        new IcebergTable(1000, "iceberg_table", columns, properties);
-        Assert.fail("No exception throws.");
-    }
-
-    @Test(expected = DdlException.class)
-    public void testNonNullAbleColumn() throws DdlException {
-        List<Column> columns1 = Lists.newArrayList();
-        Column column = new Column("col1", Type.BIGINT, false);
-        columns1.add(column);
-        properties.remove("table");
-        new IcebergTable(1000, "iceberg_table", columns1, properties);
-        Assert.fail("No exception throws.");
+        IcebergTable.Builder tableBuilder = IcebergTable.builder()
+                .setId(1000)
+                .setSrTableName("supplier")
+                .setCatalogName("iceberg_catalog")
+                .setRemoteDbName("iceberg_oss_tpch_1g_parquet_gzip")
+                .setRemoteTableName("supplier")
+                .setResourceName(resourceName)
+                .setFullSchema(new ArrayList<>())
+                .setNativeTable(icebergNativeTable)
+                .setIcebergProperties(new HashMap<>());
+        IcebergTable oTable = tableBuilder.build();
+        IcebergTable.Builder newBuilder = IcebergTable.builder();
+        IcebergTableFactory.copyFromCatalogTable(newBuilder, oTable, properties);
+        IcebergTable table = newBuilder.build();
+        Assert.assertEquals(table.getResourceName(), resourceName);
     }
 }

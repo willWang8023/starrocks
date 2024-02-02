@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <benchmark/benchmark.h>
 #include <gtest/gtest.h>
@@ -11,21 +23,24 @@
 #include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/datum_tuple.h"
+#include "column/vectorized_fwd.h"
 #include "common/config.h"
-#include "exec/vectorized/chunks_sorter.h"
-#include "exec/vectorized/chunks_sorter_full_sort.h"
-#include "exec/vectorized/chunks_sorter_heap_sort.h"
-#include "exec/vectorized/chunks_sorter_topn.h"
-#include "exec/vectorized/sorting/merge.h"
-#include "exec/vectorized/sorting/sort_helper.h"
-#include "exec/vectorized/sorting/sorting.h"
-#include "exprs/vectorized/column_ref.h"
+#include "exec/chunks_sorter.h"
+#include "exec/chunks_sorter_full_sort.h"
+#include "exec/chunks_sorter_heap_sort.h"
+#include "exec/chunks_sorter_topn.h"
+#include "exec/sorting/merge.h"
+#include "exec/sorting/sort_helper.h"
+#include "exec/sorting/sorting.h"
+#include "exprs/column_ref.h"
 #include "runtime/chunk_cursor.h"
 #include "runtime/runtime_state.h"
 #include "runtime/sorted_chunks_merger.h"
 #include "runtime/types.h"
+#include "types/logical_type.h"
+#include "util/runtime_profile.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 inline int kTestChunkSize = 4096;
 
@@ -39,7 +54,7 @@ public:
 
     void TearDown() { _runtime_state.reset(); }
 
-    static std::tuple<ColumnPtr, std::unique_ptr<ColumnRef>> build_sorted_column(TypeDescriptor type_desc,
+    static std::tuple<ColumnPtr, std::unique_ptr<ColumnRef>> build_sorted_column(const TypeDescriptor& type_desc,
                                                                                  int slot_index, bool low_card,
                                                                                  bool nullable) {
         DCHECK_EQ(TYPE_INT, type_desc.type);
@@ -67,8 +82,9 @@ public:
         return {column, std::move(expr)};
     }
 
-    static std::tuple<ColumnPtr, std::unique_ptr<ColumnRef>> build_column(TypeDescriptor type_desc, int slot_index,
-                                                                          bool low_card, bool nullable) {
+    static std::tuple<ColumnPtr, std::unique_ptr<ColumnRef>> build_column(const TypeDescriptor& type_desc,
+                                                                          int slot_index, bool low_card,
+                                                                          bool nullable) {
         using UniformInt = std::uniform_int_distribution<std::mt19937::result_type>;
         using PoissonInt = std::poisson_distribution<std::mt19937::result_type>;
         ColumnPtr column = ColumnHelper::create_column(type_desc, nullable);
@@ -77,6 +93,7 @@ public:
         std::random_device dev;
         std::mt19937 rng(dev());
         UniformInt uniform_int;
+        std::uniform_real_distribution<> niform_real(1, 10);
         if (low_card) {
             uniform_int.param(UniformInt::param_type(1, 100 * std::pow(2, slot_index)));
         } else {
@@ -108,6 +125,8 @@ public:
                 column->append_datum(Datum(x));
             } else if (type_desc.type == TYPE_VARCHAR) {
                 column->append_datum(Datum(gen_rand_str()));
+            } else if (type_desc.type == TYPE_DOUBLE) {
+                column->append_datum(Datum(niform_real(rng)));
             } else {
                 std::cerr << "not supported" << std::endl;
             }
@@ -141,30 +160,34 @@ struct SortParameters {
     bool nullable = false;
     int max_buffered_chunks = ChunksSorterTopn::kDefaultBufferedChunks;
 
-    SortParameters() {}
+    SortParameters() = default;
 
-    static SortParameters with_limit(int limit, SortParameters params = SortParameters()) {
+    static SortParameters with_limit(int limit) {
+        SortParameters params;
         params.limit = limit;
         return params;
     }
 
-    static SortParameters with_low_card(bool low_card, SortParameters params = SortParameters()) {
+    static SortParameters with_low_card(bool low_card) {
+        SortParameters params;
         params.low_card = low_card;
         return params;
     }
 
-    static SortParameters with_nullable(bool nullable, SortParameters params = SortParameters()) {
+    static SortParameters with_nullable(bool nullable) {
+        SortParameters params;
         params.nullable = nullable;
         return params;
     }
 
-    static SortParameters with_max_buffered_chunks(int max_buffered_chunks, SortParameters params = SortParameters()) {
+    static SortParameters with_max_buffered_chunks(int max_buffered_chunks) {
+        SortParameters params;
         params.max_buffered_chunks = max_buffered_chunks;
         return params;
     }
 };
 
-static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, PrimitiveType data_type, int num_chunks,
+static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, LogicalType data_type, int num_chunks,
                      int num_columns, SortParameters params = SortParameters()) {
     // state.PauseTiming();
     ChunkSorterBase suite;
@@ -175,6 +198,8 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Primiti
         type_desc = TypeDescriptor(TYPE_INT);
     } else if (data_type == TYPE_VARCHAR) {
         type_desc = TypeDescriptor::create_varchar_type(TypeDescriptor::MAX_VARCHAR_LENGTH);
+    } else if (data_type == TYPE_DOUBLE) {
+        type_desc = TypeDescriptor(TYPE_DOUBLE);
     } else {
         ASSERT_TRUE(false) << "not support type: " << data_type;
     }
@@ -190,7 +215,10 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Primiti
         auto [column, expr] = suite.build_column(type_desc, i, params.low_card, params.nullable);
         columns.push_back(column);
         exprs.emplace_back(std::move(expr));
-        sort_exprs.push_back(new ExprContext(exprs.back().get()));
+        auto sort_expr = new ExprContext(exprs.back().get());
+        ASSERT_OK(sort_expr->prepare(suite._runtime_state.get()));
+        ASSERT_OK(sort_expr->open(suite._runtime_state.get()));
+        sort_exprs.push_back(sort_expr);
         asc_arr.push_back(true);
         null_first.push_back(true);
         map[i] = i;
@@ -201,8 +229,13 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Primiti
     int64_t item_processed = 0;
     int64_t data_size = 0;
     int64_t mem_usage = 0;
+    const int64_t max_buffered_rows = 1024 * 1024;
+    const int64_t max_buffered_bytes = max_buffered_rows * 256;
+    const std::vector<SlotId> early_materialized_slots;
+
     for (auto _ : state) {
         state.PauseTiming();
+        RuntimeProfile profile("dummy");
         std::unique_ptr<ChunksSorter> sorter;
         size_t expected_rows = 0;
         size_t total_rows = chunk->num_rows() * num_chunks;
@@ -210,25 +243,29 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Primiti
 
         switch (sorter_algo) {
         case FullSort: {
-            sorter.reset(new ChunksSorterFullSort(suite._runtime_state.get(), &sort_exprs, &asc_arr, &null_first, ""));
+            sorter = std::make_unique<ChunksSorterFullSort>(suite._runtime_state.get(), &sort_exprs, &asc_arr,
+                                                            &null_first, "", max_buffered_rows, max_buffered_bytes,
+                                                            early_materialized_slots);
             expected_rows = total_rows;
             break;
         }
         case HeapSort: {
-            sorter.reset(new ChunksSorterHeapSort(suite._runtime_state.get(), &sort_exprs, &asc_arr, &null_first, "", 0,
-                                                  limit_rows));
+            sorter = std::make_unique<ChunksSorterHeapSort>(suite._runtime_state.get(), &sort_exprs, &asc_arr,
+                                                            &null_first, "", 0, limit_rows);
             expected_rows = limit_rows;
             break;
         }
         case MergeSort: {
-            sorter.reset(new ChunksSorterTopn(suite._runtime_state.get(), &sort_exprs, &asc_arr, &null_first, "", 0,
-                                              limit_rows, TTopNType::ROW_NUMBER, params.max_buffered_chunks));
+            sorter = std::make_unique<ChunksSorterTopn>(suite._runtime_state.get(), &sort_exprs, &asc_arr, &null_first,
+                                                        "", 0, limit_rows, TTopNType::ROW_NUMBER,
+                                                        params.max_buffered_chunks);
             expected_rows = limit_rows;
             break;
         }
         default:
             ASSERT_TRUE(false) << "unknown algorithm " << (int)sorter_algo;
         }
+        sorter->setup_runtime(suite._runtime_state.get(), &profile, suite._runtime_state->instance_mem_tracker());
 
         int64_t iteration_data_size = 0;
         for (int i = 0; i < num_chunks; i++) {
@@ -262,7 +299,7 @@ static void do_bench(benchmark::State& state, SortAlgorithm sorter_algo, Primiti
         }
         ASSERT_TRUE(eos);
         ASSERT_EQ(expected_rows, actual_rows);
-        sorter->finish(suite._runtime_state.get());
+        sorter->done(suite._runtime_state.get());
     }
     state.counters["rows_sorted"] += item_processed;
     state.counters["data_size"] += data_size;
@@ -292,7 +329,11 @@ static void do_heap_merge(benchmark::State& state, int num_runs, bool use_merger
         auto [column, expr] = suite.build_sorted_column(type_desc, i, false, false);
         columns.push_back(column);
         exprs.emplace_back(std::move(expr));
-        sort_exprs.push_back(new ExprContext(exprs.back().get()));
+        auto sort_expr = new ExprContext(exprs.back().get());
+        ASSERT_OK(sort_expr->prepare(suite._runtime_state.get()));
+        ASSERT_OK(sort_expr->open(suite._runtime_state.get()));
+        sort_exprs.push_back(sort_expr);
+
         asc_arr.push_back(true);
         null_first.push_back(true);
         map[i] = i;
@@ -373,7 +414,10 @@ static void do_merge_columnwise(benchmark::State& state, int num_runs, bool null
         auto [column, expr] = suite.build_sorted_column(type_desc, i, false, nullable);
         columns.push_back(column);
         exprs.emplace_back(std::move(expr));
-        sort_exprs.push_back(new ExprContext(exprs.back().get()));
+        auto sort_expr = new ExprContext(exprs.back().get());
+        ASSERT_OK(sort_expr->prepare(suite._runtime_state.get()));
+        ASSERT_OK(sort_expr->open(suite._runtime_state.get()));
+        sort_exprs.push_back(sort_expr);
         asc_arr.push_back(true);
         null_first.push_back(true);
         map[i] = i;
@@ -384,17 +428,17 @@ static void do_merge_columnwise(benchmark::State& state, int num_runs, bool null
     int64_t num_rows = 0;
     SortDescs sort_desc(std::vector<int>{1, 1, 1}, std::vector<int>{-1, -1, -1});
     for (auto _ : state) {
-        std::vector<ChunkPtr> inputs;
+        std::vector<ChunkUniquePtr> inputs;
         size_t input_rows = num_runs * chunk1->num_rows();
         for (int i = 0; i < num_runs; i++) {
             if (i % 2 == 0) {
-                inputs.push_back(chunk1);
+                inputs.push_back(chunk1->clone_unique());
             } else {
-                inputs.push_back(chunk2);
+                inputs.push_back(chunk2->clone_unique());
             }
         }
         SortedRuns merged;
-        merge_sorted_chunks(sort_desc, &sort_exprs, inputs, &merged, 0);
+        merge_sorted_chunks(sort_desc, &sort_exprs, inputs, &merged);
         ASSERT_EQ(input_rows, merged.num_rows());
 
         num_rows += merged.num_rows();
@@ -407,6 +451,9 @@ static void do_merge_columnwise(benchmark::State& state, int num_runs, bool null
 // Sort full data: ORDER BY
 static void BM_fullsort_notnull(benchmark::State& state) {
     do_bench(state, FullSort, TYPE_INT, state.range(0), state.range(1));
+}
+static void BM_fullsort_float_notnull(benchmark::State& state) {
+    do_bench(state, FullSort, TYPE_DOUBLE, state.range(0), state.range(1));
 }
 static void BM_fullsort_nullable(benchmark::State& state) {
     do_bench(state, FullSort, TYPE_INT, state.range(0), state.range(1), SortParameters::with_nullable(true));
@@ -486,6 +533,7 @@ static void CustomArgsLimit(benchmark::internal::Benchmark* b) {
 // Full sort
 BENCHMARK(BM_fullsort_notnull)->Apply(CustomArgsFull);
 BENCHMARK(BM_fullsort_nullable)->Apply(CustomArgsFull);
+BENCHMARK(BM_fullsort_float_notnull)->Apply(CustomArgsFull);
 BENCHMARK(BM_fullsort_varchar_column_incr)->Apply(CustomArgsFull);
 
 // Low-Cardinality Sort
@@ -559,6 +607,6 @@ static void BM_find_zero_memchr(benchmark::State& state) {
 }
 BENCHMARK(BM_find_zero_memchr)->Range(8, 8 << 12);
 
-} // namespace starrocks::vectorized
+} // namespace starrocks
 
 BENCHMARK_MAIN();

@@ -1,37 +1,63 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.ast;
 
-import com.google.common.base.Strings;
-import com.starrocks.analysis.DdlStmt;
 import com.starrocks.analysis.UserDesc;
-import com.starrocks.analysis.UserIdentity;
+import com.starrocks.authentication.UserAuthenticationInfo;
+import com.starrocks.sql.parser.NodePosition;
+
+import java.util.List;
 
 // CreateUserStmt and AlterUserStmt share the same parameter and check logic
 public class BaseCreateAlterUserStmt extends DdlStmt {
-    protected UserIdentity userIdent;
+    protected UserIdentity userIdentity;
     protected String password;
-    protected byte[] scramblePassword;
     protected boolean isPasswordPlain;
-    protected String authPlugin;
-    protected String authString;
-    protected String userForAuthPlugin;
-    protected String role;
-    private final String operationName;   // CREATE or ALTER
+    protected String authPluginName;
+    protected String authStringUnResolved;
 
-    public BaseCreateAlterUserStmt(UserDesc userDesc, String prepositionName) {
-        this.userIdent = userDesc.getUserIdent();
+    protected SetRoleType setRoleType;
+    protected List<String> defaultRoles;
+    // used in new RBAC privilege framework
+    private UserAuthenticationInfo authenticationInfo = null;
+
+    @Deprecated
+    protected String userForAuthPlugin;
+    @Deprecated
+    protected byte[] scramblePassword;
+
+    public BaseCreateAlterUserStmt(UserDesc userDesc, SetRoleType setRoleType, List<String> defaultRoles) {
+        this(userDesc, setRoleType, defaultRoles, NodePosition.ZERO);
+    }
+
+    public BaseCreateAlterUserStmt(UserDesc userDesc, SetRoleType setRoleType, List<String> defaultRoles,
+                                   NodePosition pos) {
+        super(pos);
+        this.userIdentity = userDesc.getUserIdentity();
         this.password = userDesc.getPassword();
         this.isPasswordPlain = userDesc.isPasswordPlain();
-        this.authPlugin = userDesc.getAuthPlugin();
-        this.authString = userDesc.getAuthString();
-        this.operationName = prepositionName;
+        this.authPluginName = userDesc.getAuthPlugin();
+        this.authStringUnResolved = userDesc.getAuthString();
+
+        this.setRoleType = setRoleType;
+        this.defaultRoles = defaultRoles;
     }
 
-    public BaseCreateAlterUserStmt(UserDesc userDesc, String role, String prepositionName) {
-        this(userDesc, prepositionName);
-        this.role = role;
+    public UserIdentity getUserIdentity() {
+        return userIdentity;
     }
-
 
     public String getOriginalPassword() {
         return password;
@@ -41,48 +67,29 @@ public class BaseCreateAlterUserStmt extends DdlStmt {
         return isPasswordPlain;
     }
 
-    public String getAuthString() {
-        return authString;
+    public String getAuthPluginName() {
+        return authPluginName;
     }
 
-    public void setScramblePassword(byte[] scramblePassword) {
-        this.scramblePassword = scramblePassword;
+    public String getAuthStringUnResolved() {
+        return authStringUnResolved;
     }
 
-    public void setAuthPlugin(String authPlugin) {
-        this.authPlugin = authPlugin;
+    public List<String> getDefaultRoles() {
+        return defaultRoles;
     }
 
-    public void setUserForAuthPlugin(String userForAuthPlugin) {
-        this.userForAuthPlugin = userForAuthPlugin;
+    public UserAuthenticationInfo getAuthenticationInfo() {
+        return authenticationInfo;
     }
 
-    public byte[] getPassword() {
-        return scramblePassword;
+    public void setAuthenticationInfo(UserAuthenticationInfo authenticationInfo) {
+        this.authenticationInfo = authenticationInfo;
     }
 
-    public UserIdentity getUserIdent() {
-        return userIdent;
-    }
-
-    public String getAuthPlugin() {
-        return authPlugin;
-    }
-
-    public String getUserForAuthPlugin() {
-        return userForAuthPlugin;
-    }
-
-    public boolean hasRole() {
-        return role != null;
-    }
-
-    public String getQualifiedRole() {
-        return role;
-    }
-
-    public void setRole(String role) {
-        this.role = role;
+    @Override
+    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
+        return visitor.visitBaseCreateAlterUserStmt(this, context);
     }
 
     @Override
@@ -90,49 +97,23 @@ public class BaseCreateAlterUserStmt extends DdlStmt {
         return true;
     }
 
-    @Override
-    public String toSql() {
-        StringBuilder sb = new StringBuilder();
-        sb.append(operationName).append(" USER ").append(userIdent);
-        if (!Strings.isNullOrEmpty(password)) {
-            if (isPasswordPlain) {
-                sb.append(" IDENTIFIED BY '").append("*XXX").append("'");
-            } else {
-                sb.append(" IDENTIFIED BY PASSWORD '").append(password).append("'");
-            }
-        }
-
-        if (!Strings.isNullOrEmpty(authPlugin)) {
-            sb.append(" IDENTIFIED WITH ").append(authPlugin);
-            if (!Strings.isNullOrEmpty(authString)) {
-                if (isPasswordPlain) {
-                    sb.append(" BY '");
-                } else {
-                    sb.append(" AS '");
-                }
-                sb.append(authString).append("'");
-            }
-        }
-
-        if (!Strings.isNullOrEmpty(role)) {
-            sb.append(" DEFAULT ROLE '").append(role).append("'");
-        }
-
-        return sb.toString();
+    @Deprecated
+    public void setScramblePassword(byte[] scramblePassword) {
+        this.scramblePassword = scramblePassword;
     }
 
-    @Override
-    public String toString() {
-        return toSql();
+    @Deprecated
+    public byte[] getPassword() {
+        return scramblePassword;
     }
 
-    @Override
-    public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
-        return visitor.visitCreateAlterUserStmt(this, context);
+    @Deprecated
+    public String getUserForAuthPlugin() {
+        return userForAuthPlugin;
     }
 
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
+    @Deprecated
+    public void setUserForAuthPlugin(String userForAuthPlugin) {
+        this.userForAuthPlugin = userForAuthPlugin;
     }
 }

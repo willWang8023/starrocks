@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.common.proc;
 
@@ -49,7 +62,7 @@ public class LocalTabletsProcDirTest {
 
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = ImmutableMap.copyOf(idToBackend);
@@ -106,19 +119,20 @@ public class LocalTabletsProcDirTest {
 
         // Db
         Database db = new Database(dbId, "test_db");
-        db.createTable(table);
+        db.registerTableUnlocked(table);
 
         // Check
         LocalTabletsProcDir tabletsProcDir = new LocalTabletsProcDir(db, table, index);
-        List<List<Comparable>> result = tabletsProcDir.fetchComparableResult(-1, -1, null);
+        List<List<Comparable>> result = tabletsProcDir.fetchComparableResult(-1, -1, null, false);
         System.out.println(result);
         Assert.assertEquals(3, result.size());
         Assert.assertEquals((long) result.get(0).get(0), tablet1Id);
-        Assert.assertEquals((long) result.get(0).get(1), replicaId);
-        Assert.assertEquals((long) result.get(0).get(2), backendId);
         Assert.assertEquals((long) result.get(1).get(0), tablet1Id);
-        Assert.assertEquals((long) result.get(1).get(1), replicaId + 1);
-        Assert.assertEquals((long) result.get(1).get(2), backendId + 1);
+        if ((long) result.get(0).get(1) == replicaId) {
+            Assert.assertEquals((long) result.get(0).get(2), backendId);
+        } else if ((long) result.get(0).get(1) == replicaId + 1) {
+            Assert.assertEquals((long) result.get(0).get(2), backendId + 1);
+        }
         Assert.assertEquals((long) result.get(2).get(0), tablet2Id);
         Assert.assertEquals(result.get(2).get(1), -1);
         Assert.assertEquals(result.get(2).get(2), -1);

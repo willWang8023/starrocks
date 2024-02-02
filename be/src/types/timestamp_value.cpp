@@ -1,11 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "types/timestamp_value.h"
 
 #include "runtime/time_types.h"
 #include "util/timezone_utils.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 TimestampValue TimestampValue::MAX_TIMESTAMP_VALUE{timestamp::MAX_TIMESTAMP};
 TimestampValue TimestampValue::MIN_TIMESTAMP_VALUE{timestamp::MIN_TIMESTAMP};
 
@@ -19,6 +31,12 @@ static const char* s_ab_month_name[] = {"",    "Jan", "Feb", "Mar", "Apr", "May"
 static const char* s_day_name[] = {"Monday", "Tuesday",  "Wednesday", "Thursday",
                                    "Friday", "Saturday", "Sunday",    nullptr};
 static const char* s_ab_day_name[] = {"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun", nullptr};
+
+TimestampValue TimestampValue::create_from_unixtime(int64_t ts, const cctz::time_zone& ctz) {
+    TimestampValue value;
+    value.from_unixtime(ts, ctz);
+    return value;
+}
 
 bool TimestampValue::from_timestamp_literal(uint64_t timestamp) {
     uint64_t date = timestamp / 1000000;
@@ -109,10 +127,10 @@ bool TimestampValue::from_date_format_str(const char* value, int value_len, cons
     uint8_t month2;
     uint8_t day1;
     uint8_t day2;
-    if (vectorized::date::char_to_digit(value, 0, &year1) || vectorized::date::char_to_digit(value, 1, &year2) ||
-        vectorized::date::char_to_digit(value, 2, &year3) || vectorized::date::char_to_digit(value, 3, &year4) ||
-        vectorized::date::char_to_digit(value, 5, &month1) || vectorized::date::char_to_digit(value, 6, &month2) ||
-        vectorized::date::char_to_digit(value, 8, &day1) || vectorized::date::char_to_digit(value, 9, &day2)) {
+    if (date::char_to_digit(value, 0, &year1) || date::char_to_digit(value, 1, &year2) ||
+        date::char_to_digit(value, 2, &year3) || date::char_to_digit(value, 3, &year4) ||
+        date::char_to_digit(value, 5, &month1) || date::char_to_digit(value, 6, &month2) ||
+        date::char_to_digit(value, 8, &day1) || date::char_to_digit(value, 9, &day2)) {
         return false;
     }
 
@@ -120,7 +138,7 @@ bool TimestampValue::from_date_format_str(const char* value, int value_len, cons
     uint8_t month = month1 * 10 + month2;
     uint8_t day = day1 * 10 + day2;
 
-    if (month > 12 || (day > s_days_in_month[month] && (month != 2 || day != 29 || !vectorized::date::is_leap(year)))) {
+    if (month > 12 || (day > s_days_in_month[month] && (month != 2 || day != 29 || !date::is_leap(year)))) {
         return false;
     }
 
@@ -151,13 +169,13 @@ bool TimestampValue::from_datetime_format_str(const char* value, int value_len, 
     uint8_t minute2;
     uint8_t second1;
     uint8_t second2;
-    if (vectorized::date::char_to_digit(value, 0, &year1) || vectorized::date::char_to_digit(value, 1, &year2) ||
-        vectorized::date::char_to_digit(value, 2, &year3) || vectorized::date::char_to_digit(value, 3, &year4) ||
-        vectorized::date::char_to_digit(value, 5, &month1) || vectorized::date::char_to_digit(value, 6, &month2) ||
-        vectorized::date::char_to_digit(value, 8, &day1) || vectorized::date::char_to_digit(value, 9, &day2) ||
-        vectorized::date::char_to_digit(value, 11, &hour1) || vectorized::date::char_to_digit(value, 12, &hour2) ||
-        vectorized::date::char_to_digit(value, 14, &minute1) || vectorized::date::char_to_digit(value, 15, &minute2) ||
-        vectorized::date::char_to_digit(value, 17, &second1) || vectorized::date::char_to_digit(value, 18, &second2)) {
+    if (date::char_to_digit(value, 0, &year1) || date::char_to_digit(value, 1, &year2) ||
+        date::char_to_digit(value, 2, &year3) || date::char_to_digit(value, 3, &year4) ||
+        date::char_to_digit(value, 5, &month1) || date::char_to_digit(value, 6, &month2) ||
+        date::char_to_digit(value, 8, &day1) || date::char_to_digit(value, 9, &day2) ||
+        date::char_to_digit(value, 11, &hour1) || date::char_to_digit(value, 12, &hour2) ||
+        date::char_to_digit(value, 14, &minute1) || date::char_to_digit(value, 15, &minute2) ||
+        date::char_to_digit(value, 17, &second1) || date::char_to_digit(value, 18, &second2)) {
         return false;
     }
 
@@ -168,7 +186,7 @@ bool TimestampValue::from_datetime_format_str(const char* value, int value_len, 
     uint8_t minute = minute1 * 10 + minute2;
     uint8_t second = second1 * 10 + second2;
 
-    if (month > 12 || (day > s_days_in_month[month] && (month != 2 || day != 29 || !vectorized::date::is_leap(year))) ||
+    if (month > 12 || (day > s_days_in_month[month] && (month != 2 || day != 29 || !date::is_leap(year))) ||
         hour > 23 || minute > 59 || second > 59) {
         return false;
     }
@@ -228,7 +246,7 @@ static bool str_to_int64(const char* ptr, const char** endptr, int64_t* ret) {
     }
     if (ptr == end || !isdigit(*ptr)) {
         *endptr = ptr;
-        *ret = neg ? -value_1 : value_1;
+        *ret = neg ? (~value_1 + 1) : value_1;
         return true;
     }
     // TODO
@@ -329,7 +347,7 @@ bool TimestampValue::get_date_from_daynr(uint64_t daynr, DatetimeContent* conten
     }
     uint32_t days_of_year = daynr - days_befor_year + 1;
     int leap_day = 0;
-    if (vectorized::date::is_leap(content->_year)) {
+    if (date::is_leap(content->_year)) {
         if (days_of_year > 31 + 28) {
             days_of_year--;
             if (days_of_year == 31 + 28) {
@@ -360,7 +378,7 @@ bool TimestampValue::check_date(const DatetimeContent* content) const {
     }
     if (content->_day > s_days_in_month[content->_month]) {
         // Feb 29 in leap year is valid.
-        if (content->_month == 2 && content->_day == 29 && vectorized::date::is_leap(content->_year)) {
+        if (content->_month == 2 && content->_day == 29 && date::is_leap(content->_year)) {
             return false;
         }
         return true;
@@ -745,59 +763,10 @@ void TimestampValue::to_timestamp(int* year, int* month, int* day, int* hour, in
     timestamp::to_datetime(_timestamp, year, month, day, hour, minute, second, usec);
 }
 
-void TimestampValue::floor_to_second_period(int period) {
-    int64_t seconds = timestamp::to_julian(_timestamp);
-    seconds -= date::AD_EPOCH_JULIAN;
-    seconds *= SECS_PER_DAY;
-    seconds += timestamp::to_time(_timestamp) / USECS_PER_SEC;
-    seconds -= seconds % period;
-
-    JulianDate day = seconds / SECS_PER_DAY + date::AD_EPOCH_JULIAN;
-    Timestamp s = seconds % SECS_PER_DAY;
-    _timestamp = timestamp::from_julian_and_time(day, s * USECS_PER_SEC);
-}
-
-void TimestampValue::floor_to_minute_period(int period) {
-    TimestampValue::floor_to_second_period(period * 60);
-}
-
-void TimestampValue::floor_to_hour_period(int period) {
-    TimestampValue::floor_to_second_period(period * 60 * 60);
-}
-
-void TimestampValue::floor_to_day_period(int period) {
-    int64_t days = timestamp::to_julian(_timestamp);
-    days -= date::AD_EPOCH_JULIAN;
-    days -= days % period;
-    days += date::AD_EPOCH_JULIAN;
-    _timestamp = timestamp::from_julian_and_time(days, 0);
-}
-
-void TimestampValue::floor_to_month_period(int period) {
-    int year, month, day;
-    date::to_date_with_cache(timestamp::to_julian(_timestamp), &year, &month, &day);
-
-    int months = (year - 1) * 12 + month;
-    months -= (months - 1) % period;
-    year = months / 12 + 1;
-    month = months - months / 12 * 12;
-    _timestamp = timestamp::from_datetime(year, month, 1, 0, 0, 0, 0);
-}
-
-void TimestampValue::floor_to_year_period(int period) {
-    int year, month, day;
-    date::to_date_with_cache(timestamp::to_julian(_timestamp), &year, &month, &day);
-
-    year -= (year - 1) % period;
-    _timestamp = timestamp::from_datetime(year, 1, 1, 0, 0, 0, 0);
-}
-
-void TimestampValue::floor_to_week_period(int period) {
-    TimestampValue::floor_to_day_period(period * 7);
-}
-
-void TimestampValue::floor_to_quarter_period(int period) {
-    TimestampValue::floor_to_month_period(period * 3);
+void TimestampValue::trunc_to_millisecond() {
+    Timestamp time = _timestamp & TIMESTAMP_BITS_TIME;
+    uint64_t microseconds = time % USECS_PER_MILLIS;
+    _timestamp -= microseconds;
 }
 
 void TimestampValue::trunc_to_second() {
@@ -859,24 +828,30 @@ bool TimestampValue::from_unixtime(int64_t second, const std::string& timezone) 
     if (!TimezoneUtils::find_cctz_time_zone(timezone, ctz)) {
         return false;
     }
-    return from_unixtime(second, ctz);
+    from_unixtime(second, ctz);
+    return true;
 }
 
-bool TimestampValue::from_unixtime(int64_t second, const cctz::time_zone& ctz) {
+void TimestampValue::from_unixtime(int64_t second, const cctz::time_zone& ctz) {
     static const cctz::time_point<cctz::sys_seconds> epoch =
             std::chrono::time_point_cast<cctz::sys_seconds>(std::chrono::system_clock::from_time_t(0));
     cctz::time_point<cctz::sys_seconds> t = epoch + cctz::seconds(second);
 
     const auto tp = cctz::convert(t, ctz);
     from_timestamp(tp.year(), tp.month(), tp.day(), tp.hour(), tp.minute(), tp.second(), 0);
-    return true;
 }
 
-void TimestampValue::from_unix_second(int64_t second) {
+void TimestampValue::from_unixtime(int64_t second, int64_t microsecond, const cctz::time_zone& ctz) {
+    from_unixtime(second, ctz);
+    _timestamp += microsecond;
+    return;
+}
+
+void TimestampValue::from_unix_second(int64_t second, int64_t microsecond) {
     second += timestamp::UNIX_EPOCH_SECONDS;
     JulianDate day = second / SECS_PER_DAY;
     Timestamp s = second % SECS_PER_DAY;
-    _timestamp = timestamp::from_julian_and_time(day, s * USECS_PER_SEC);
+    _timestamp = timestamp::from_julian_and_time(day, s * USECS_PER_SEC + microsecond);
 }
 
 bool TimestampValue::is_valid() const {
@@ -895,4 +870,4 @@ int TimestampValue::to_string(char* s, size_t n) const {
     return timestamp::to_string(_timestamp, s, n);
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

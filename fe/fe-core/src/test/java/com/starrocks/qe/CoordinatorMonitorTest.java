@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.qe;
 
@@ -7,6 +20,7 @@ import com.starrocks.common.Config;
 import com.starrocks.proto.PPlanFragmentCancelReason;
 import com.starrocks.thrift.TUniqueId;
 import mockit.Expectations;
+import mockit.Mocked;
 import org.junit.Assert;
 import org.junit.Test;
 
@@ -17,18 +31,14 @@ import java.util.concurrent.TimeUnit;
 public class CoordinatorMonitorTest {
 
     @Test
-    public void testDeadBackendAndComputeNodeChecker() throws InterruptedException {
+    public void testDeadBackendAndComputeNodeChecker(@Mocked DefaultCoordinator coord1,
+                                                     @Mocked DefaultCoordinator coord2,
+                                                     @Mocked DefaultCoordinator coord3) throws InterruptedException {
         int prevHeartbeatTimeout = Config.heartbeat_timeout_second;
         Config.heartbeat_timeout_second = 1;
 
         try {
-            // Prepare coordinators.
-            ConnectContext connCtx = new ConnectContext();
-            connCtx.setExecutionId(new TUniqueId(0, 0));
-            Coordinator coord1 = new Coordinator(connCtx, null, null, null);
-            Coordinator coord2 = new Coordinator(connCtx, null, null, null);
-            Coordinator coord3 = new Coordinator(connCtx, null, null, null);
-            List<Coordinator> coordinators = ImmutableList.of(coord1, coord2, coord3);
+            List<DefaultCoordinator> coordinators = ImmutableList.of(coord1, coord2, coord3);
 
             final QeProcessor qeProcessor = QeProcessorImpl.INSTANCE;
 
@@ -37,6 +47,24 @@ public class CoordinatorMonitorTest {
                 {
                     qeProcessor.getCoordinators();
                     result = coordinators;
+                }
+
+                {
+                    coord1.getQueryId();
+                    result = new TUniqueId();
+                    minTimes = 0;
+                }
+
+                {
+                    coord2.getQueryId();
+                    result = new TUniqueId();
+                    minTimes = 0;
+                }
+
+                {
+                    coord3.getQueryId();
+                    result = new TUniqueId();
+                    minTimes = 0;
                 }
 
                 {

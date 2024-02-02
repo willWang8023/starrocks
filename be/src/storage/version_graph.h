@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/version_graph.h
 
@@ -65,6 +78,8 @@ public:
     // Get max continuous version from 0
     int64_t max_continuous_version() const { return _max_continuous_version; }
 
+    void update_max_continuous_version();
+
     int64_t min_readable_version() const { return _min_readable_version; }
 
 private:
@@ -93,6 +108,9 @@ private:
     // [0-5] [6-10] 11 12
     // minReadableVersion will be updated to 10
     int64_t _min_readable_version{-1};
+
+    // print log rate limit by tablet id
+    int64_t _tablet_id{0};
 };
 
 /// TimestampedVersion class which is implemented to maintain multi-version path of rowsets.
@@ -132,7 +150,7 @@ using TimestampedVersionSharedPtr = std::shared_ptr<TimestampedVersion>;
 class TimestampedVersionPathContainer {
 public:
     /// TimestampedVersionPathContainer construction function, max_create_time is assigned to 0.
-    TimestampedVersionPathContainer() {}
+    TimestampedVersionPathContainer() = default;
 
     /// Return the max create time in a path version.
     int64_t max_create_time() { return _max_create_time; }
@@ -194,6 +212,8 @@ public:
 
     // Get max continuous version from 0
     int64_t get_max_continuous_version() const;
+
+    void update_max_continuous_version();
 
     int64_t get_min_readable_version() const;
 

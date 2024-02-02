@@ -31,7 +31,7 @@ namespace starrocks {
 
 class SnapshotLoaderTest : public testing::Test {
 public:
-    SnapshotLoaderTest() {}
+    SnapshotLoaderTest() = default;
 
 private:
     ExecEnv* _exec_env;
@@ -89,6 +89,14 @@ TEST_F(SnapshotLoaderTest, NormalCase) {
     st = loader._replace_tablet_id("1234_2_5_12345_1.dat", 5678, &new_name);
     ASSERT_TRUE(st.ok());
     ASSERT_EQ("1234_2_5_12345_1.dat", new_name);
+
+    st = loader._replace_tablet_id("1234_2_5_12345_1.upt", 5678, &new_name);
+    ASSERT_TRUE(st.ok());
+    ASSERT_EQ("1234_2_5_12345_1.upt", new_name);
+
+    st = loader._replace_tablet_id("1234_2_5_12345_1.cols", 5678, &new_name);
+    ASSERT_TRUE(st.ok());
+    ASSERT_EQ("1234_2_5_12345_1.cols", new_name);
 
     st = loader._replace_tablet_id("1234_2_5_12345_1.idx", 5678, &new_name);
     ASSERT_TRUE(st.ok());

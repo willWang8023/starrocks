@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/TableName.java
 
@@ -21,6 +34,8 @@
 
 package com.starrocks.analysis;
 
+import com.google.common.base.Joiner;
+import com.google.common.base.Splitter;
 import com.google.common.base.Strings;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.cluster.ClusterNamespace;
@@ -34,10 +49,14 @@ import com.starrocks.persist.gson.GsonPreProcessable;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.parser.NodePosition;
+import org.apache.commons.lang3.StringUtils;
 
 import java.io.DataInput;
 import java.io.DataOutput;
 import java.io.IOException;
+import java.util.List;
+import java.util.Objects;
 
 public class TableName implements Writable, GsonPreProcessable, GsonPostProcessable {
     public static final String LAMBDA_FUNC_TABLE = "__LAMBDA_TABLE";
@@ -48,18 +67,45 @@ public class TableName implements Writable, GsonPreProcessable, GsonPostProcessa
     @SerializedName(value = "fullDb")
     private String fullDb;
 
-    public TableName() {
+    private final NodePosition pos;
 
+    public TableName() {
+        pos = NodePosition.ZERO;
     }
 
     public TableName(String db, String tbl) {
-        this(null, db, tbl);
+        this(null, db, tbl, NodePosition.ZERO);
     }
 
     public TableName(String catalog, String db, String tbl) {
+        this(catalog, db, tbl, NodePosition.ZERO);
+    }
+
+    public TableName(String catalog, String db, String tbl, NodePosition pos) {
+        this.pos = pos;
         this.catalog = catalog;
         this.db = db;
         this.tbl = tbl;
+    }
+
+    public static TableName fromString(String name) {
+        List<String> pieces = Splitter.on(".").splitToList(name);
+        String catalog = ConnectContext.get().getCurrentCatalog();
+        String db = ConnectContext.get().getDatabase();
+        if (pieces.isEmpty()) {
+            throw new IllegalArgumentException("empty table name");
+        } else if (pieces.size() == 1) {
+            if (StringUtils.isEmpty(db)) {
+                throw new IllegalArgumentException("no database");
+            }
+            return new TableName(catalog, db, pieces.get(0));
+        } else if (pieces.size() == 2) {
+            return new TableName(catalog, pieces.get(0), pieces.get(1));
+        } else if (pieces.size() == 3) {
+            return new TableName(pieces.get(0), pieces.get(1), pieces.get(2));
+        } else {
+            throw new IllegalArgumentException("illegal table name: " + name);
+        }
     }
 
     public void analyze(Analyzer analyzer) throws AnalysisException {
@@ -132,6 +178,10 @@ public class TableName implements Writable, GsonPreProcessable, GsonPostProcessa
         return tbl.isEmpty();
     }
 
+    public String getCatalogAndDb() {
+        return Joiner.on(".").skipNulls().join(catalog, db);
+    }
+
     /**
      * Returns true if this name has a non-empty database field and a non-empty
      * table name.
@@ -148,24 +198,21 @@ public class TableName implements Writable, GsonPreProcessable, GsonPostProcessa
         }
     }
 
-    @Override
-    public String toString() {
-        if (db == null) {
-            return tbl;
-        } else {
-            return db + "." + tbl;
-        }
+    public NodePosition getPos() {
+        return pos;
     }
 
     @Override
-    public boolean equals(Object other) {
-        if (this == other) {
-            return true;
+    public String toString() {
+        StringBuilder stringBuilder = new StringBuilder();
+        if (catalog != null && !CatalogMgr.isInternalCatalog(catalog)) {
+            stringBuilder.append(catalog).append(".");
         }
-        if (other instanceof TableName) {
-            return toString().equals(other.toString());
+        if (db != null) {
+            stringBuilder.append(db).append(".");
         }
-        return false;
+        stringBuilder.append(tbl);
+        return stringBuilder.toString();
     }
 
     public String toSql() {
@@ -200,5 +247,20 @@ public class TableName implements Writable, GsonPreProcessable, GsonPostProcessa
     @Override
     public void gsonPreProcess() throws IOException {
         fullDb = ClusterNamespace.getFullName(db);
+    }
+
+    @Override
+    public boolean equals(Object o) {
+        if (this == o) return true;
+        if (o == null || getClass() != o.getClass()) return false;
+        TableName tableName = (TableName) o;
+        return Objects.equals(catalog, tableName.catalog)
+                && Objects.equals(tbl, tableName.tbl)
+                && Objects.equals(db, tableName.db);
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hash(catalog, tbl, db);
     }
 }

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "fs/fs_memory.h"
 
@@ -82,7 +94,7 @@ TEST_F(MemoryFileSystemTest, test_canonicalize) {
 
     for (const auto& t : cases) {
         std::string result;
-        Status st = _fs->canonicalize(t.input, &result);
+        auto st = _fs->canonicalize(t.input, &result);
         if (t.success) {
             EXPECT_EQ(t.output, result) << st.to_string();
         } else {
@@ -199,8 +211,8 @@ TEST_F(MemoryFileSystemTest, test_new_writable_file) {
     WritableFileOptions opts{.sync_on_close = false, .mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE};
     EXPECT_STATUS(Status::IOError(""), _fs->new_writable_file(opts, "/").status());
     file = *_fs->new_writable_file(opts, "/1.csv");
-    file->append("abc");
-    file->close();
+    ASSERT_OK(file->append("abc"));
+    ASSERT_OK(file->close());
     std::vector<std::string> children;
     EXPECT_STATUS(Status::OK(), _fs->get_children("/", &children));
     ASSERT_EQ(1, children.size()) << JoinStrings(children, ",");
@@ -213,8 +225,8 @@ TEST_F(MemoryFileSystemTest, test_new_writable_file) {
 TEST_F(MemoryFileSystemTest, test_delete_file) {
     WritableFileOptions opts{.sync_on_close = false, .mode = FileSystem::CREATE_OR_OPEN_WITH_TRUNCATE};
     auto file = *_fs->new_writable_file(opts, "/1.csv");
-    file->append("abc");
-    file->close();
+    ASSERT_OK(file->append("abc"));
+    ASSERT_OK(file->close());
 
     EXPECT_STATUS(Status::NotFound(""), _fs->delete_file("/tmp"));
     EXPECT_STATUS(Status::NotFound(""), _fs->delete_dir("/1.csv"));
@@ -246,7 +258,7 @@ TEST_F(MemoryFileSystemTest, test_CREATE_OR_OPEN_WITH_TRUNCATE) {
     auto writable_file = *_fs->new_writable_file(opts, "/a.txt");
     EXPECT_STATUS(Status::OK(), writable_file->append("first line\n"));
     EXPECT_STATUS(Status::OK(), writable_file->append("second line\n"));
-    writable_file->close();
+    ASSERT_OK(writable_file->close());
 
     writable_file = *_fs->new_writable_file(opts, "/a.txt");
 
@@ -261,7 +273,7 @@ TEST_F(MemoryFileSystemTest, test_CREATE_OR_OPEN) {
     auto writable_file = *_fs->new_writable_file(opts, "/a.txt");
     EXPECT_STATUS(Status::OK(), writable_file->append("first line\n"));
     EXPECT_STATUS(Status::OK(), writable_file->append("second line\n"));
-    writable_file->close();
+    ASSERT_OK(writable_file->close());
 
     opts.mode = FileSystem::CREATE_OR_OPEN;
     writable_file = *_fs->new_writable_file(opts, "/a.txt");
@@ -278,7 +290,7 @@ TEST_F(MemoryFileSystemTest, test_MUST_EXIST) {
     auto writable_file = *_fs->new_writable_file(opts, "/a.txt");
     EXPECT_STATUS(Status::OK(), writable_file->append("first line\n"));
     EXPECT_STATUS(Status::OK(), writable_file->append("second line\n"));
-    writable_file->close();
+    ASSERT_OK(writable_file->close());
 
     opts.mode = FileSystem::MUST_EXIST;
     writable_file = *_fs->new_writable_file(opts, "/a.txt");
@@ -295,7 +307,7 @@ TEST_F(MemoryFileSystemTest, test_MUST_CREATE) {
     std::unique_ptr<WritableFile> writable_file = *_fs->new_writable_file(opts, "/a.txt");
     EXPECT_STATUS(Status::OK(), writable_file->append("first line\n"));
     EXPECT_STATUS(Status::OK(), writable_file->append("second line\n"));
-    writable_file->close();
+    ASSERT_OK(writable_file->close());
 
     opts.mode = FileSystem::MUST_CREATE;
     EXPECT_STATUS(Status::AlreadyExist(""), _fs->new_writable_file(opts, "/a.txt").status());
@@ -441,6 +453,33 @@ TEST_F(MemoryFileSystemTest, test_random_access_file) {
     EXPECT_EQ("ish", slice);
 
     EXPECT_ERROR(f->read_at_fully(22, slice.data, slice.size));
+}
+
+TEST_F(MemoryFileSystemTest, test_iterate_dir2) {
+    ASSERT_OK(_fs->create_dir("/home"));
+    ASSERT_OK(_fs->create_dir("/home/code"));
+    ASSIGN_OR_ABORT(auto f, _fs->new_writable_file("/home/gcc"));
+    ASSERT_OK(f->append("test"));
+    ASSERT_OK(f->close());
+
+    ASSERT_OK(_fs->iterate_dir2("/home", [](DirEntry entry) -> bool {
+        auto name = entry.name;
+        if (name == "code") {
+            CHECK(entry.is_dir.has_value());
+            CHECK(entry.is_dir.value());
+            CHECK(!entry.mtime.has_value());
+            CHECK(!entry.size.has_value());
+        } else if (name == "gcc") {
+            CHECK(entry.is_dir.has_value());
+            CHECK(!entry.is_dir.value());
+            CHECK(!entry.mtime.has_value());
+            CHECK(entry.size.has_value());
+            CHECK_EQ(4, entry.size.value());
+        } else {
+            CHECK(false) << "Unexpected file " << name;
+        }
+        return true;
+    }));
 }
 
 } // namespace starrocks

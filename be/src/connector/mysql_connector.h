@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -8,14 +20,12 @@
 #include "connector/connector.h"
 #include "exec/mysql_scanner.h"
 
-namespace starrocks {
-
-namespace connector {
+namespace starrocks::connector {
 class MySQLConnector final : public Connector {
 public:
     ~MySQLConnector() override = default;
 
-    DataSourceProviderPtr create_data_source_provider(vectorized::ConnectorScanNode* scan_node,
+    DataSourceProviderPtr create_data_source_provider(ConnectorScanNode* scan_node,
                                                       const TPlanNode& plan_node) const override;
 
     ConnectorType connector_type() const override { return ConnectorType::MYSQL; }
@@ -28,14 +38,15 @@ class MySQLDataSourceProvider final : public DataSourceProvider {
 public:
     ~MySQLDataSourceProvider() override = default;
     friend class MySQLDataSource;
-    MySQLDataSourceProvider(vectorized::ConnectorScanNode* scan_node, const TPlanNode& plan_node);
+    MySQLDataSourceProvider(ConnectorScanNode* scan_node, const TPlanNode& plan_node);
     DataSourcePtr create_data_source(const TScanRange& scan_range) override;
 
     bool insert_local_exchange_operator() const override { return true; }
     bool accept_empty_scan_ranges() const override { return false; }
+    const TupleDescriptor* tuple_descriptor(RuntimeState* state) const override;
 
 protected:
-    vectorized::ConnectorScanNode* _scan_node;
+    ConnectorScanNode* _scan_node;
     const TMySQLScanNode _mysql_scan_node;
 };
 
@@ -44,9 +55,10 @@ public:
     ~MySQLDataSource() override = default;
 
     MySQLDataSource(const MySQLDataSourceProvider* provider, const TScanRange& scan_range);
+    std::string name() const override;
     Status open(RuntimeState* state) override;
     void close(RuntimeState* state) override;
-    Status get_next(RuntimeState* state, vectorized::ChunkPtr* chunk) override;
+    Status get_next(RuntimeState* state, ChunkPtr* chunk) override;
 
     int64_t raw_rows_read() const override;
     int64_t num_rows_read() const override;
@@ -61,9 +73,6 @@ private:
 
     // =====================================
     bool _is_finished = false;
-    ObjectPool _obj_pool;
-    ObjectPool* _pool = &_obj_pool;
-    RuntimeState* _runtime_state = nullptr;
 
     MysqlScannerParam _my_param;
     // Name of Mysql table
@@ -73,6 +82,8 @@ private:
     std::vector<std::string> _columns;
     // where clause
     std::vector<std::string> _filters;
+    // temporal clause
+    std::string _temporal_clause;
 
     // Tuple index in tuple row.
     size_t _slot_num = 0;
@@ -80,16 +91,14 @@ private:
 
     int64_t _rows_read = 0;
     int64_t _bytes_read = 0;
-    int64_t _cpu_time_spent_ns = 0;
+    int64_t _cpu_time_ns = 0;
 
-    Status fill_chunk(vectorized::ChunkPtr* chunk, char** data, size_t* length);
+    Status fill_chunk(ChunkPtr* chunk, char** data, size_t* length);
 
-    Status append_text_to_column(const char* data, const int& len, const SlotDescriptor* slot_desc,
-                                 vectorized::Column* column);
+    Status append_text_to_column(const char* data, const int& len, const SlotDescriptor* slot_desc, Column* column);
 
-    template <PrimitiveType PT, typename CppType = vectorized::RunTimeCppType<PT>>
-    void append_value_to_column(vectorized::Column* column, CppType& value);
+    template <LogicalType LT, typename CppType = RunTimeCppType<LT>>
+    void append_value_to_column(Column* column, CppType& value);
 };
 
-} // namespace connector
-} // namespace starrocks
+} // namespace starrocks::connector

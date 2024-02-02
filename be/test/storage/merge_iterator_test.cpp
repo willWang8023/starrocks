@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/merge_iterator.h"
 
@@ -10,9 +22,10 @@
 
 #include "column/fixed_length_column.h"
 #include "column/schema.h"
+#include "common/config.h"
 #include "storage/vector_chunk_iterator.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 template <typename T>
 static inline std::string to_string(const std::vector<T>& v) {
@@ -28,7 +41,7 @@ static inline std::string to_string(const std::vector<T>& v) {
 class MergeIteratorTest : public testing::Test {
 protected:
     void SetUp() override {
-        auto f = std::make_shared<Field>(0, "c1", get_type_info(OLAP_FIELD_TYPE_INT), false);
+        auto f = std::make_shared<Field>(0, "c1", get_type_info(TYPE_INT), false);
         f->set_is_key(true);
         _schema = Schema(std::vector<FieldPtr>{f});
     }
@@ -50,7 +63,7 @@ TEST_F(MergeIteratorTest, heap_merge_overlapping) {
     std::vector<RowSourceMask> source_masks;
 
     auto iter = new_heap_merge_iterator(std::vector<ChunkIteratorPtr>{sub1, sub2, sub3});
-    iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS);
+    ASSERT_TRUE(iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
 
     std::vector<int32_t> expected;
     expected.insert(expected.end(), v1.begin(), v1.end());
@@ -91,7 +104,7 @@ TEST_F(MergeIteratorTest, heap_merge_no_overlapping) {
     auto sub3 = std::make_shared<VectorChunkIterator>(_schema, COL_INT(v3));
 
     auto iter = new_heap_merge_iterator(std::vector<ChunkIteratorPtr>{sub1, sub2, sub3});
-    iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS);
+    ASSERT_TRUE(iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
 
     std::vector<int32_t> expected;
     expected.insert(expected.end(), v1.begin(), v1.end());
@@ -119,7 +132,7 @@ TEST_F(MergeIteratorTest, heap_merge_no_overlapping) {
 TEST_F(MergeIteratorTest, merge_one) {
     auto sub1 = std::make_shared<VectorChunkIterator>(_schema, COL_INT({1, 1, 2, 3, 4, 5}));
     auto iter = new_heap_merge_iterator(std::vector<ChunkIteratorPtr>{sub1});
-    iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS);
+    ASSERT_TRUE(iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
 
     auto get_row = [](const ChunkPtr& chunk, size_t row) -> int32_t {
         auto c = std::dynamic_pointer_cast<FixedLengthColumn<int32_t>>(chunk->get_column_by_index(0));
@@ -146,7 +159,7 @@ TEST_F(MergeIteratorTest, test_issue_DSDB_2715) {
     auto sub1 = std::make_shared<VectorChunkIterator>(_schema, COL_INT({1, 1, 2, 3, 4, 5}));
     auto sub2 = std::make_shared<VectorChunkIterator>(_schema, COL_INT({1, 1, 2, 3, 4, 5}));
     auto iter = new_heap_merge_iterator(std::vector<ChunkIteratorPtr>{sub1, sub2});
-    iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS);
+    ASSERT_TRUE(iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
 
     iter->close();
 }
@@ -223,8 +236,8 @@ TEST_F(MergeIteratorTest, mask_merge) {
 
     std::vector<RowSourceMask> source_masks;
     std::vector<uint16_t> expected_sources{0, 0, 0, 0, 0, 0, 1, 1, 2, 1, 2, 2, 1, 1, 1, 1, 2, 2};
-    for (size_t i = 0; i < expected_sources.size(); ++i) {
-        source_masks.emplace_back(RowSourceMask(expected_sources[i], false));
+    for (unsigned short expected_source : expected_sources) {
+        source_masks.emplace_back(RowSourceMask(expected_source, false));
     }
     RowSourceMaskBuffer mask_buffer(0, config::storage_root_path);
     mask_buffer.write(source_masks);
@@ -233,7 +246,7 @@ TEST_F(MergeIteratorTest, mask_merge) {
     source_masks.clear();
 
     auto iter = new_mask_merge_iterator(std::vector<ChunkIteratorPtr>{sub1, sub2, sub3}, &mask_buffer);
-    iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS);
+    ASSERT_TRUE(iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
 
     std::vector<int32_t> expected;
     expected.insert(expected.end(), v1.begin(), v1.end());
@@ -314,8 +327,8 @@ TEST_F(MergeIteratorTest, mask_merge_boundary_test) {
         expected_sources.push_back(3);
     }
 
-    for (size_t i = 0; i < expected_sources.size(); ++i) {
-        source_masks.emplace_back(RowSourceMask(expected_sources[i], false));
+    for (unsigned short expected_source : expected_sources) {
+        source_masks.emplace_back(RowSourceMask(expected_source, false));
     }
 
     auto sub1 = std::make_shared<VectorChunkIterator>(_schema, COL_INT(v1));
@@ -329,7 +342,7 @@ TEST_F(MergeIteratorTest, mask_merge_boundary_test) {
     source_masks.clear();
 
     auto iter = new_mask_merge_iterator(std::vector<ChunkIteratorPtr>{sub1, sub2, sub3, sub4}, &mask_buffer);
-    iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS);
+    ASSERT_TRUE(iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
 
     std::vector<int32_t> real;
     ChunkPtr chunk = ChunkHelper::new_chunk(iter->schema(), config::vector_chunk_size);
@@ -353,4 +366,4 @@ TEST_F(MergeIteratorTest, mask_merge_boundary_test) {
     }
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

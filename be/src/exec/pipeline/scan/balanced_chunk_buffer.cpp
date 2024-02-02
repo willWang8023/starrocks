@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exec/pipeline/scan/balanced_chunk_buffer.h"
 
@@ -50,34 +62,60 @@ void BalancedChunkBuffer::close() {
     }
 }
 
-bool BalancedChunkBuffer::try_get(int buffer_index, vectorized::ChunkPtr* output_chunk) {
+bool BalancedChunkBuffer::try_get(int buffer_index, ChunkPtr* output_chunk) {
     // Will release the token after exiting this scope.
     ChunkWithToken chunk_with_token = std::make_pair(nullptr, nullptr);
     bool ok = _get_sub_buffer(buffer_index)->try_get(&chunk_with_token);
     if (ok) {
         *output_chunk = std::move(chunk_with_token.first);
+        _memory_usage -= (*output_chunk)->memory_usage();
     }
     return ok;
 }
 
-bool BalancedChunkBuffer::put(int buffer_index, vectorized::ChunkPtr chunk, ChunkBufferTokenPtr chunk_token) {
+bool BalancedChunkBuffer::put(int buffer_index, ChunkPtr chunk, ChunkBufferTokenPtr chunk_token) {
+    // CRITICAL (by satanson)
+    // EOS chunks may be empty and must be delivered in order to notify CacheOperator that all chunks of the tablet
+    // has been processed.
+    if (!chunk || (!chunk->owner_info().is_last_chunk() && chunk->num_rows() == 0)) return true;
+    bool ret;
+    size_t memory_usage = chunk->memory_usage();
     if (_strategy == BalanceStrategy::kDirect) {
-        return _get_sub_buffer(buffer_index)->put(std::make_pair(std::move(chunk), std::move(chunk_token)));
+        ret = _get_sub_buffer(buffer_index)->put(std::make_pair(std::move(chunk), std::move(chunk_token)));
     } else if (_strategy == BalanceStrategy::kRoundRobin) {
         // TODO: try to balance data according to number of rows
         // But the hard part is, that may needs to maintain a min-heap to account the rows of each
         // output operator, which would introduce some extra overhead
         int target_index = _output_index.fetch_add(1);
         target_index %= _output_operators;
-        return _get_sub_buffer(target_index)->put(std::make_pair(std::move(chunk), std::move(chunk_token)));
+        ret = _get_sub_buffer(target_index)->put(std::make_pair(std::move(chunk), std::move(chunk_token)));
     } else {
         CHECK(false) << "unreachable";
     }
+    if (ret) {
+        _memory_usage += memory_usage;
+    }
+    return ret;
 }
 
 void BalancedChunkBuffer::set_finished(int buffer_index) {
     _get_sub_buffer(buffer_index)->shutdown();
     _get_sub_buffer(buffer_index)->clear();
+}
+
+void BalancedChunkBuffer::update_limiter(Chunk* chunk) {
+    static constexpr int UPDATE_AVG_ROW_BYTES_FREQUENCY = 8;
+    // Update local counters.
+    LimiterContext& ctx = _limiter_context;
+    ctx.local_sum_row_bytes += chunk->memory_usage();
+    ctx.local_num_rows += chunk->num_rows();
+    ctx.local_max_chunk_rows = std::max(ctx.local_max_chunk_rows, chunk->num_rows());
+
+    if (ctx.local_sum_chunks++ % UPDATE_AVG_ROW_BYTES_FREQUENCY == 0) {
+        _limiter->update_avg_row_bytes(ctx.local_sum_row_bytes, ctx.local_num_rows, ctx.local_max_chunk_rows);
+        ctx.local_sum_row_bytes = 0;
+        ctx.local_num_rows = 0;
+    }
 }
 
 } // namespace starrocks::pipeline

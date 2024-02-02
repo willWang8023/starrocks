@@ -18,9 +18,12 @@
 package com.starrocks.analysis;
 
 import com.google.common.collect.Maps;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
 import com.starrocks.common.util.PrintableMap;
+import com.starrocks.sql.ast.LoadStmt;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -35,16 +38,29 @@ import java.util.Map;
 //   "username" = "user0",
 //   "password" = "password0"
 // )
-public class BrokerDesc implements Writable {
+public class BrokerDesc implements ParseNode, Writable {
+    @SerializedName("n")
     private String name;
+    @SerializedName("p")
     private Map<String, String> properties;
     private boolean hasBroker;
 
+    private final NodePosition pos;
+
     // Only used for recovery
     private BrokerDesc() {
+        pos = NodePosition.ZERO;
+    }
+
+    public BrokerDesc(Map<String, String> properties) {
+        this(properties, NodePosition.ZERO);
     }
 
     public BrokerDesc(String name, Map<String, String> properties) {
+        this(name, properties, NodePosition.ZERO);
+    }
+    public BrokerDesc(String name, Map<String, String> properties, NodePosition pos) {
+        this.pos = pos;
         this.hasBroker = true;
         this.name = name;
         this.properties = properties;
@@ -53,7 +69,8 @@ public class BrokerDesc implements Writable {
         }
     }
 
-    public BrokerDesc(Map<String, String> properties) {
+    public BrokerDesc(Map<String, String> properties, NodePosition pos) {
+        this.pos = pos;
         this.hasBroker = false;
         this.name = "";
         this.properties = properties;
@@ -72,6 +89,13 @@ public class BrokerDesc implements Writable {
 
     public Map<String, String> getProperties() {
         return properties;
+    }
+
+    public String getMergeConditionStr() {
+        if (properties.containsKey(LoadStmt.MERGE_CONDITION)) {
+            return properties.get(LoadStmt.MERGE_CONDITION);
+        }
+        return "";
     }
 
     @Override
@@ -101,13 +125,18 @@ public class BrokerDesc implements Writable {
         return desc;
     }
 
-    public String toSql() {
+    public String toString() {
         StringBuilder sb = new StringBuilder();
-        sb.append("WITH BROKER ").append(name);
+        sb.append(" WITH BROKER ").append(name);
         if (properties != null && !properties.isEmpty()) {
             PrintableMap<String, String> printableMap = new PrintableMap<>(properties, " = ", true, false, true);
             sb.append(" (").append(printableMap.toString()).append(")");
         }
         return sb.toString();
+    }
+
+    @Override
+    public NodePosition getPos() {
+        return pos;
     }
 }

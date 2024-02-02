@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/util/Util.java
 
@@ -28,13 +41,16 @@ import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.TimeoutException;
+import com.starrocks.sql.analyzer.SemanticException;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.io.BufferedReader;
+import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
+import java.lang.management.ThreadInfo;
 import java.net.URI;
 import java.net.URL;
 import java.net.URLConnection;
@@ -48,12 +64,15 @@ import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.function.Predicate;
 import java.util.zip.Adler32;
+import java.util.zip.DeflaterOutputStream;
 
 public class Util {
     private static final Logger LOG = LogManager.getLogger(Util.class);
     private static final Map<PrimitiveType, String> TYPE_STRING_MAP = new HashMap<PrimitiveType, String>();
 
     private static final long DEFAULT_EXEC_CMD_TIMEOUT_MS = 600000L;
+
+    public static final String AUTO_GENERATED_EXPR_ALIAS_PREFIX = "EXPR$";
 
     private static final String[] ORDINAL_SUFFIX =
             new String[] {"th", "st", "nd", "rd", "th", "th", "th", "th", "th", "th"};
@@ -79,6 +98,7 @@ public class Util {
         TYPE_STRING_MAP.put(PrimitiveType.BITMAP, "bitmap");
         TYPE_STRING_MAP.put(PrimitiveType.PERCENTILE, "percentile");
         TYPE_STRING_MAP.put(PrimitiveType.JSON, "json");
+        TYPE_STRING_MAP.put(PrimitiveType.VARBINARY, "varbinary(%d)");
     }
 
     private static class CmdWorker extends Thread {
@@ -252,6 +272,10 @@ public class Util {
         for (Column column : columns) {
             adler32.update(column.getName().getBytes(StandardCharsets.UTF_8));
             String typeString = columnHashString(column);
+            if (typeString == null) {
+                throw new SemanticException("Type:%s of column:%s does not support",
+                        column.getType().toString(), column.getName());
+            }
             adler32.update(typeString.getBytes(StandardCharsets.UTF_8));
 
             String columnName = column.getName();
@@ -285,13 +309,20 @@ public class Util {
     }
 
     public static int generateSchemaHash() {
-        return Math.abs(ThreadLocalRandom.current().nextInt());
+        return Math.abs(ThreadLocalRandom.current().nextInt(Integer.MAX_VALUE));
     }
 
     public static String dumpThread(Thread t, int lineNum) {
+        return dumpThread(t.getName(), t.getId(), t.getStackTrace(), lineNum);
+    }
+
+    public static String dumpThread(ThreadInfo t, int lineNum) {
+        return dumpThread(t.getThreadName(), t.getThreadId(), t.getStackTrace(), lineNum);
+    }
+
+    public static String dumpThread(String name, long id, StackTraceElement[] elements, int lineNum) {
         StringBuilder sb = new StringBuilder();
-        StackTraceElement[] elements = t.getStackTrace();
-        sb.append("dump thread: ").append(t.getName()).append(", id: ").append(t.getId()).append("\n");
+        sb.append("dump thread: ").append(name).append(", id: ").append(id).append("\n");
         int count = lineNum;
         for (StackTraceElement element : elements) {
             if (count == 0) {
@@ -413,6 +444,10 @@ public class Util {
     }
 
     public static void validateMetastoreUris(String uris) {
+        if (uris == null) {
+            throw new IllegalArgumentException("Null hive.metastore.uris, " +
+                    "please check your property's key and value of catalog or resource.");
+        }
         URI[] parsedUris = Arrays.stream(uris.split(",")).map(URI::create).toArray(URI[]::new);
         for (URI uri : parsedUris) {
             if (Strings.isNullOrEmpty(uri.getScheme()) || !uri.getScheme().equals("thrift")) {
@@ -427,5 +462,16 @@ public class Util {
             }
         }
     }
-}
 
+    public static String deriveAliasFromOrdinal(int ordinal) {
+        return AUTO_GENERATED_EXPR_ALIAS_PREFIX + ordinal;
+    }
+
+    public static byte[] compress(byte[] input) throws IOException {
+        ByteArrayOutputStream outputStream = new ByteArrayOutputStream();
+        try (DeflaterOutputStream dos = new DeflaterOutputStream(outputStream)) {
+            dos.write(input);
+        }
+        return outputStream.toByteArray();
+    }
+}

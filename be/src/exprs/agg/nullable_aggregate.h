@@ -1,7 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
+#include "column/column.h"
 #ifdef __x86_64__
 #include <immintrin.h>
 #endif
@@ -11,20 +24,31 @@
 #include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/nullable_column.h"
+#include "exprs/agg/approx_top_k.h"
 #include "exprs/agg/maxmin.h"
+#include "exprs/function_context.h"
+#include "exprs/function_helper.h"
 #include "simd/simd.h"
-#include "udf/udf.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 template <typename T>
-constexpr bool IsWindowFunctionSliceState = false;
+constexpr bool IsUnresizableWindowFunctionState = false;
 
 template <>
-constexpr bool IsWindowFunctionSliceState<MaxAggregateData<TYPE_VARCHAR>> = true;
+inline constexpr bool IsUnresizableWindowFunctionState<MaxAggregateData<TYPE_VARCHAR>> = true;
 
 template <>
-constexpr bool IsWindowFunctionSliceState<MinAggregateData<TYPE_VARCHAR>> = true;
+inline constexpr bool IsUnresizableWindowFunctionState<MinAggregateData<TYPE_VARCHAR>> = true;
+
+template <LogicalType LT>
+inline constexpr bool IsUnresizableWindowFunctionState<ApproxTopKState<LT>> = true;
+
+template <typename T>
+constexpr bool IsNeverNullFunctionState = false;
+
+template <LogicalType LT>
+inline constexpr bool IsNeverNullFunctionState<ApproxTopKState<LT>> = true;
 
 struct NullableAggregateWindowFunctionState {
     // The following two fields are only used in "update_state_removable_cumulatively"
@@ -57,6 +81,7 @@ class NullableAggregateFunctionBase : public AggregateFunctionStateHelper<State>
 public:
     explicit NullableAggregateFunctionBase(NestedAggregateFunctionPtr nested_function_)
             : nested_function(std::move(nested_function_)) {}
+    // as array_agg is not nullable, so it needn't create() here.
 
     std::string get_name() const override { return "nullable " + nested_function->get_name(); }
 
@@ -134,7 +159,10 @@ public:
         auto* dst_nullable_column = down_cast<NullableColumn*>((*dst).get());
         if (src[0]->is_nullable()) {
             const auto* nullable_column = down_cast<const NullableColumn*>(src[0].get());
-            if (nullable_column->has_null()) {
+            if constexpr (IsNeverNullFunctionState<State>) {
+                dst_nullable_column->null_column_data().resize(chunk_size);
+                nested_function->convert_to_serialize_format(ctx, src, chunk_size, &dst_nullable_column->data_column());
+            } else if (nullable_column->has_null()) {
                 dst_nullable_column->set_has_null(true);
                 const NullData& src_null_data = nullable_column->immutable_null_column_data();
                 size_t null_size = SIMD::count_nonzero(src_null_data);
@@ -176,16 +204,16 @@ public:
         // binary column couldn't call resize method like Numeric Column
         // for non-slice type, null column data has been reset to zero in AnalyticNode
         // for slice type, we need to emplace back null data
-        if (!this->data(state).is_null) {
+        if (IsNeverNullFunctionState<NestedState> || !this->data(state).is_null) {
             nested_function->get_values(ctx, this->data(state).nested_state(), nullable_column->mutable_data_column(),
                                         start, end);
-            if constexpr (IsWindowFunctionSliceState<NestedState>) {
+            if constexpr (IsUnresizableWindowFunctionState<NestedState>) {
                 NullData& null_data = nullable_column->null_column_data();
                 null_data.insert(null_data.end(), end - start, 0);
             }
         } else {
             NullData& null_data = nullable_column->null_column_data();
-            if constexpr (IsWindowFunctionSliceState<NestedState>) {
+            if constexpr (IsUnresizableWindowFunctionState<NestedState>) {
                 nullable_column->append_nulls(end - start);
             } else {
                 for (size_t i = start; i < end; ++i) {
@@ -213,11 +241,15 @@ public:
         }
     }
 
-    void merge_batch_single_state(FunctionContext* ctx, size_t chunk_size, const Column* column,
-                                  AggDataPtr __restrict state) const override {
-        for (size_t i = 0; i < chunk_size; ++i) {
+    void merge_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column* column, size_t start,
+                                  size_t size) const override {
+        for (size_t i = start; i < start + size; ++i) {
             merge(ctx, column, state, i);
         }
+    }
+
+    AggStateTableKind agg_state_table_kind(bool is_append_only) const override {
+        return nested_function->agg_state_table_kind(is_append_only);
     }
 
 protected:
@@ -232,9 +264,25 @@ public:
             : NullableAggregateFunctionBase<NestedAggregateFunctionPtr, State, IsWindowFunc, IgnoreNull>(
                       nested_function) {}
 
+    // NOTE: In stream MV, need handle input row by row, so need support single update.
     void update(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
                 size_t row_num) const override {
-        CHECK(false) << "unsupported update in NullableAggregateFunctionUnary";
+        DCHECK_EQ(1, ctx->get_num_args());
+        // This container stores the columns we really pass to the nested function.
+        const Column* data_columns[1];
+
+        if (columns[0]->is_nullable()) {
+            if (columns[0]->is_null(row_num)) {
+                // Always ingore nulls.
+                return;
+            }
+            const auto* column = down_cast<const NullableColumn*>(columns[0]);
+            data_columns[0] = &column->data_column_ref();
+        } else {
+            data_columns[0] = columns[0];
+        }
+        this->data(state).is_null = false;
+        this->nested_function->update(ctx, data_columns, this->data(state).mutable_nest_state(), row_num);
     }
 
     // TODO(kks): abstract the AVX2 filter process later
@@ -247,6 +295,17 @@ public:
             const Column* data_column = &column->data_column_ref();
             const uint8_t* f_data = column->null_column()->raw_data();
             int offset = 0;
+
+            // all not null
+            if (!columns[0]->has_null()) {
+                for (size_t i = 0; i < chunk_size; i++) {
+                    this->data(states[i] + state_offset).is_null = false;
+                    this->nested_function->update(ctx, &data_column,
+                                                  this->data(states[i] + state_offset).mutable_nest_state(), i);
+                }
+                return;
+            }
+
 #ifdef __AVX2__
             // !important: filter must be an uint8_t container
             constexpr int batch_nums = 256 / (8 * sizeof(uint8_t));
@@ -338,9 +397,11 @@ public:
                     // all null
                     if constexpr (!IgnoreNull) {
                         for (size_t i = offset; i < offset + batch_nums; i++) {
-                            this->data(states[i] + state_offset).is_null = false;
-                            this->nested_function->process_null(
-                                    ctx, this->data(states[i] + state_offset).mutable_nest_state());
+                            if (!selection[i]) {
+                                this->data(states[i] + state_offset).is_null = false;
+                                this->nested_function->process_null(
+                                        ctx, this->data(states[i] + state_offset).mutable_nest_state());
+                            }
                         }
                     }
                 } else {
@@ -358,7 +419,7 @@ public:
                                 }
                             }
                         } else {
-                            if (!f_data[i] & !selection[i]) {
+                            if (!f_data[i] && !selection[i]) {
                                 this->data(states[i] + state_offset).is_null = false;
                                 this->nested_function->update(ctx, &data_column,
                                                               this->data(states[i] + state_offset).mutable_nest_state(),
@@ -384,7 +445,7 @@ public:
                         }
                     }
                 } else {
-                    if (!f_data[i] & !selection[i]) {
+                    if (!f_data[i] && !selection[i]) {
                         this->data(states[i] + state_offset).is_null = false;
                         this->nested_function->update(ctx, &data_column,
                                                       this->data(states[i] + state_offset).mutable_nest_state(), i);
@@ -605,6 +666,84 @@ public:
             }
         }
     }
+
+    void merge_batch(FunctionContext* ctx, size_t chunk_size, size_t state_offset, const Column* column,
+                     AggDataPtr* states) const override {
+        auto fast_call_path = [&](const Column* data_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                auto& state_data = this->data(states[i] + state_offset);
+                state_data.is_null = false;
+                this->nested_function->merge(ctx, data_column, state_data.mutable_nest_state(), i);
+            }
+        };
+        auto slow_call_path = [&](const NullData& null_data, const Column* data_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                auto& state_data = this->data(states[i] + state_offset);
+                if (null_data[i] == 0) {
+                    state_data.is_null = false;
+                    this->nested_function->merge(ctx, data_column, state_data.mutable_nest_state(), i);
+                } else if constexpr (!IgnoreNull) {
+                    state_data.is_null = false;
+                    this->nested_function->process_null(ctx, state_data.mutable_nest_state());
+                }
+            }
+        };
+        ColumnHelper::call_nullable_func(column, std::move(fast_call_path), std::move(slow_call_path));
+    }
+
+    void merge_batch_selectively(FunctionContext* ctx, size_t chunk_size, size_t state_offset, const Column* column,
+                                 AggDataPtr* states, const std::vector<uint8_t>& filter) const override {
+        auto fast_call_path = [&](const Column* data_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                if (filter[i] == 0) {
+                    auto& state_data = this->data(states[i] + state_offset);
+                    state_data.is_null = false;
+                    this->nested_function->merge(ctx, data_column, state_data.mutable_nest_state(), i);
+                }
+            }
+        };
+
+        auto slow_call_path = [&](const NullData& null_data, const Column* data_column) {
+            for (size_t i = 0; i < chunk_size; ++i) {
+                if (filter[i] == 0) {
+                    auto& state_data = this->data(states[i] + state_offset);
+                    if (null_data[i] == 0) {
+                        state_data.is_null = false;
+                        this->nested_function->merge(ctx, data_column, state_data.mutable_nest_state(), i);
+                    } else if constexpr (!IgnoreNull) {
+                        state_data.is_null = false;
+                        this->nested_function->process_null(ctx, state_data.mutable_nest_state());
+                    }
+                }
+            }
+        };
+
+        ColumnHelper::call_nullable_func(column, std::move(fast_call_path), std::move(slow_call_path));
+    }
+
+    void merge_batch_single_state(FunctionContext* ctx, AggDataPtr __restrict state, const Column* column, size_t start,
+                                  size_t size) const override {
+        auto fast_call_path = [&](const Column* data_column) {
+            for (size_t i = start; i < start + size; ++i) {
+                auto& state_data = this->data(state);
+                state_data.is_null = false;
+                this->nested_function->merge(ctx, data_column, state_data.mutable_nest_state(), i);
+            }
+        };
+        auto slow_call_path = [&](const NullData& null_data, const Column* data_column) {
+            for (size_t i = start; i < start + size; ++i) {
+                auto& state_data = this->data(state);
+                if (null_data[i] == 0) {
+                    state_data.is_null = false;
+                    this->nested_function->merge(ctx, data_column, state_data.mutable_nest_state(), i);
+                } else if constexpr (!IgnoreNull) {
+                    state_data.is_null = false;
+                    this->nested_function->process_null(ctx, state_data.mutable_nest_state());
+                }
+            }
+        };
+        ColumnHelper::call_nullable_func(column, std::move(fast_call_path), std::move(slow_call_path));
+    }
 };
 
 template <typename State>
@@ -621,6 +760,9 @@ public:
         const Column* data_columns[column_size];
 
         for (size_t i = 0; i < column_size; i++) {
+            if (columns[i]->only_null()) {
+                return;
+            }
             if (columns[i]->is_nullable()) {
                 if (columns[i]->is_null(row_num)) {
                     // If at least one column has a null value in the current row,
@@ -647,6 +789,11 @@ public:
     void update_batch_selectively(FunctionContext* ctx, size_t chunk_size, size_t state_offset, const Column** columns,
                                   AggDataPtr* states, const std::vector<uint8_t>& selection) const override {
         auto column_size = ctx->get_num_args();
+        for (size_t i = 0; i < column_size; i++) {
+            if (columns[i]->only_null()) {
+                return;
+            }
+        }
         // This container stores the columns we really pass to the nested function.
         const Column* data_columns[column_size];
 
@@ -712,6 +859,14 @@ public:
         }
     }
 
+    void update_batch_single_state_with_frame(FunctionContext* ctx, AggDataPtr __restrict state, const Column** columns,
+                                              int64_t peer_group_start, int64_t peer_group_end, int64_t frame_start,
+                                              int64_t frame_end) const override {
+        for (size_t i = frame_start; i < frame_end; ++i) {
+            update(ctx, columns, state, i);
+        }
+    }
+
     void convert_to_serialize_format(FunctionContext* ctx, const Columns& src, size_t chunk_size,
                                      ColumnPtr* dst) const override {
         auto* dst_nullable_column = down_cast<NullableColumn*>((*dst).get());
@@ -730,10 +885,22 @@ public:
             if (i->is_nullable()) {
                 has_nullable_column = true;
 
-                const auto* nullable_column = down_cast<const NullableColumn*>(i.get());
+                const auto* nullable_column = down_cast<const NullableColumn*>(
+                        ColumnHelper::unpack_and_duplicate_const_column(i->size(), i).get());
                 data_columns.emplace_back(nullable_column->data_column());
                 if (i->has_null()) {
+                    dst_nullable_column->set_has_null(true);
                     const NullData& src_null_data = nullable_column->immutable_null_column_data();
+
+                    size_t null_size = SIMD::count_nonzero(src_null_data);
+                    // if one column only has null element, set dst_column all null
+                    if (null_size == chunk_size) {
+                        dst_nullable_column->data_column()->resize(chunk_size);
+                        for (int j = 0; j < chunk_size; ++j) {
+                            dst_null_data[j] |= 1;
+                        }
+                        return;
+                    }
 
                     // for one row, every columns should be probing to obtain null column.
                     for (int j = 0; j < chunk_size; ++j) {
@@ -753,6 +920,28 @@ public:
                                                                &dst_nullable_column->data_column());
         }
     }
+
+    void retract(FunctionContext* ctx, const Column** columns, AggDataPtr __restrict state,
+                 size_t row_num) const override {
+        auto column_size = ctx->get_num_args();
+        // This container stores the columns we really pass to the nested function.
+        const Column* data_columns[column_size];
+
+        for (size_t i = 0; i < column_size; i++) {
+            if (columns[i]->is_nullable()) {
+                if (columns[i]->is_null(row_num)) {
+                    // Always ingore nulls.
+                    return;
+                }
+                const auto* column = down_cast<const NullableColumn*>(columns[i]);
+                data_columns[i] = &column->data_column_ref();
+            } else {
+                data_columns[i] = columns[i];
+            }
+        }
+        this->data(state).is_null = false;
+        this->nested_function->retract(ctx, data_columns, this->data(state).mutable_nest_state(), row_num);
+    }
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

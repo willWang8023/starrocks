@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/stream_load/stream_load_context.cpp
 
@@ -20,6 +33,8 @@
 // under the License.
 
 #include "runtime/stream_load/stream_load_context.h"
+
+#include <fmt/format.h>
 
 namespace starrocks {
 
@@ -44,8 +59,9 @@ std::string StreamLoadContext::to_resp_json(const std::string& txn_op, const Sta
         break;
     }
     // msg
+    std::string_view msg = st.message();
     writer.Key("Message");
-    writer.String(st.get_error_msg().c_str());
+    writer.String(msg.data(), msg.size());
 
     if (st.ok()) {
         // label
@@ -101,6 +117,10 @@ std::string StreamLoadContext::to_resp_json(const std::string& txn_op, const Sta
         writer.Key("ErrorURL");
         writer.String(error_url.c_str());
     }
+    if (!rejected_record_path.empty()) {
+        writer.Key("RejectedRecordPath");
+        writer.String(rejected_record_path.c_str());
+    }
     writer.EndObject();
     return s.GetString();
 }
@@ -141,7 +161,8 @@ std::string StreamLoadContext::to_json() const {
     if (status.ok()) {
         writer.String("OK");
     } else {
-        writer.String(status.get_error_msg().c_str());
+        std::string_view msg = status.message();
+        writer.String(msg.data(), msg.size());
     }
     // number_load_rows
     writer.Key("NumberTotalRows");
@@ -171,6 +192,10 @@ std::string StreamLoadContext::to_json() const {
         writer.Key("ErrorURL");
         writer.String(error_url.c_str());
     }
+    if (!rejected_record_path.empty()) {
+        writer.Key("RejectedRecordPath");
+        writer.String(rejected_record_path.c_str());
+    }
     writer.EndObject();
     return s.GetString();
 }
@@ -182,11 +207,30 @@ std::string StreamLoadContext::brief(bool detail) const {
         switch (load_src_type) {
         case TLoadSourceType::KAFKA:
             if (kafka_info != nullptr) {
-                ss << ", kafka"
+                ss << ", load type: kafka routine load"
                    << ", brokers: " << kafka_info->brokers << ", topic: " << kafka_info->topic << ", partition: ";
                 for (auto& entry : kafka_info->begin_offset) {
                     ss << "[" << entry.first << ": " << entry.second << "]";
                 }
+            }
+            break;
+        case TLoadSourceType::PULSAR:
+            if (pulsar_info != nullptr) {
+                ss << ", load type: pulsar routine load"
+                   << ", source_url: " << pulsar_info->service_url << ", topic: " << pulsar_info->topic
+                   << ", subscription" << pulsar_info->subscription << ", partitions: [";
+                for (auto& partition : pulsar_info->partitions) {
+                    ss << partition << ",";
+                }
+                ss << "], initial positions: [";
+                for (const auto& [key, value] : pulsar_info->initial_positions) {
+                    ss << key << ":" << value << ",";
+                }
+                ss << "], properties: [";
+                for (auto& propertie : pulsar_info->properties) {
+                    ss << propertie.first << ": " << propertie.second << ",";
+                }
+                ss << "].";
             }
             break;
         default:
@@ -194,6 +238,11 @@ std::string StreamLoadContext::brief(bool detail) const {
         }
     }
     return ss.str();
+}
+
+bool StreamLoadContext::check_and_set_http_limiter(ConcurrentLimiter* limiter) {
+    _http_limiter_guard = std::make_unique<ConcurrentLimiterGuard>();
+    return _http_limiter_guard->set_limiter(limiter);
 }
 
 } // namespace starrocks

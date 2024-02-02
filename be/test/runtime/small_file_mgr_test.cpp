@@ -82,8 +82,8 @@ static int real_port = 0;
 
 class SmallFileMgrTest : public testing::Test {
 public:
-    SmallFileMgrTest() {}
-    virtual ~SmallFileMgrTest() {}
+    SmallFileMgrTest() = default;
+    ~SmallFileMgrTest() override = default;
 
     static void SetUpTestCase() {
         s_server = new EvHttpServer(0);
@@ -95,6 +95,7 @@ public:
 
     static void TearDownTestCase() {
         s_server->stop();
+        s_server->join();
         delete s_server;
         std::stringstream ss;
         ss << g_download_path << "/" << g_file_12345 << "." << g_md5_12345;
@@ -139,8 +140,3 @@ TEST_F(SmallFileMgrTest, test_get_file) {
 }
 
 } // namespace starrocks
-
-int main(int argc, char* argv[]) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
-}

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.ast;
 
@@ -7,9 +19,7 @@ import com.google.common.base.Strings;
 import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.ImmutableSortedMap;
 import com.google.common.collect.Lists;
-import com.starrocks.analysis.DdlStmt;
 import com.starrocks.analysis.FunctionName;
-import com.starrocks.analysis.HdfsURI;
 import com.starrocks.analysis.RedirectStatus;
 import com.starrocks.analysis.TypeDef;
 import com.starrocks.catalog.AggregateFunction;
@@ -20,8 +30,10 @@ import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.TableFunction;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TFunctionBinaryType;
 import org.apache.commons.codec.binary.Hex;
 
@@ -30,12 +42,12 @@ import java.io.InputStream;
 import java.lang.reflect.Method;
 import java.lang.reflect.Modifier;
 import java.lang.reflect.Parameter;
-import java.net.MalformedURLException;
 import java.net.URL;
 import java.net.URLClassLoader;
 import java.net.URLConnection;
 import java.security.MessageDigest;
 import java.security.NoSuchAlgorithmException;
+import java.security.Permission;
 import java.util.Arrays;
 import java.util.HashMap;
 import java.util.List;
@@ -48,6 +60,7 @@ public class CreateFunctionStmt extends DdlStmt {
     public static final String SYMBOL_KEY = "symbol";
     public static final String MD5_CHECKSUM = "md5";
     public static final String TYPE_KEY = "type";
+    public static final String ISOLATION_KEY = "isolation";
     public static final String TYPE_STARROCKS_JAR = "StarrocksJar";
     public static final String EVAL_METHOD_NAME = "evaluate";
     public static final String CREATE_METHOD_NAME = "create";
@@ -77,6 +90,7 @@ public class CreateFunctionStmt extends DdlStmt {
     private String objectFile;
     private Function function;
     private String checksum;
+    private String isolation;
 
     private static final ImmutableMap<PrimitiveType, Class> PRIMITIVE_TYPE_TO_JAVA_CLASS_TYPE =
             new ImmutableMap.Builder<PrimitiveType, Class>()
@@ -198,11 +212,58 @@ public class CreateFunctionStmt extends DdlStmt {
         }
     }
 
+    public static class UDFInternalClassLoader extends URLClassLoader {
+        public UDFInternalClassLoader(String udfPath) throws IOException {
+            super(new URL[] {new URL("jar:" + udfPath + "!/")});
+        }
+    }
+
+    public class UDFSecurityManager extends SecurityManager {
+        private Class<?> clazz;
+
+        public UDFSecurityManager(Class<?> clazz) {
+            this.clazz = clazz;
+        }
+
+        @Override
+        public void checkPermission(Permission perm) {
+            if (isCreateFromUDFClassLoader()) {
+                super.checkPermission(perm);
+            }
+        }
+
+        public void checkPermission(Permission perm, Object context) {
+            if (isCreateFromUDFClassLoader()) {
+                super.checkPermission(perm, context);
+            }
+        }
+
+        private boolean isCreateFromUDFClassLoader() {
+            Class<?>[] classContext = getClassContext();
+            if (classContext.length >= 2) {
+                for (int i = 1; i < classContext.length; i++) {
+                    if (classContext[i].getClassLoader() != null &&
+                            clazz.equals(classContext[i].getClassLoader().getClass())) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+    }
+
     private UDFInternalClass mainClass;
     private UDFInternalClass udafStateClass;
 
     public CreateFunctionStmt(String functionType, FunctionName functionName, FunctionArgsDef argsDef,
                               TypeDef returnType, TypeDef intermediateType, Map<String, String> properties) {
+        this(functionType, functionName, argsDef, returnType, intermediateType, properties, NodePosition.ZERO);
+    }
+
+    public CreateFunctionStmt(String functionType, FunctionName functionName, FunctionArgsDef argsDef,
+                              TypeDef returnType, TypeDef intermediateType, Map<String, String> properties,
+                              NodePosition pos) {
+        super(pos);
         this.functionName = functionName;
         this.isAggregate = functionType.equalsIgnoreCase("AGGREGATE");
         this.isTable = functionType.equalsIgnoreCase("TABLE");
@@ -233,7 +294,15 @@ public class CreateFunctionStmt extends DdlStmt {
         return function;
     }
 
+    public void setFunction(Function function) {
+        this.function = function;
+    }
+
     public void analyze(ConnectContext context) throws AnalysisException {
+        if (!Config.enable_udf) {
+            throw new AnalysisException(
+                    "UDF is not enabled in FE, please configure enable_udf=true in fe/conf/fe.conf or ");
+        }
         analyzeCommon(context.getDatabase());
         Preconditions.checkArgument(isStarrocksJar);
         analyzeUdfClassInStarrocksJar();
@@ -254,7 +323,7 @@ public class CreateFunctionStmt extends DdlStmt {
         argsDef.analyze();
         returnType.analyze();
 
-        intermediateType = TypeDef.createVarchar(ScalarType.MAX_VARCHAR_LENGTH);
+        intermediateType = TypeDef.createVarchar(ScalarType.OLAP_MAX_VARCHAR_LENGTH);
 
         String type = properties.get(TYPE_KEY);
         if (TYPE_STARROCKS_JAR.equals(type)) {
@@ -265,10 +334,13 @@ public class CreateFunctionStmt extends DdlStmt {
         if (Strings.isNullOrEmpty(objectFile)) {
             throw new AnalysisException("No 'object_file' in properties");
         }
+
+        isolation = properties.get(ISOLATION_KEY);
+
         try {
             computeObjectChecksum();
         } catch (IOException | NoSuchAlgorithmException e) {
-            throw new AnalysisException("cannot to compute object's checksum");
+            throw new AnalysisException("cannot to compute object's checksum", e);
         }
 
         String md5sum = properties.get(MD5_CHECKSUM);
@@ -284,8 +356,8 @@ public class CreateFunctionStmt extends DdlStmt {
         }
 
         try {
-            URL[] urls = {new URL("jar:" + objectFile + "!/")};
-            try (URLClassLoader classLoader = URLClassLoader.newInstance(urls)) {
+            System.setSecurityManager(new UDFSecurityManager(UDFInternalClass.class));
+            try (URLClassLoader classLoader = new UDFInternalClassLoader(objectFile)) {
                 mainClass.setClazz(classLoader.loadClass(className));
 
                 if (isAggregate) {
@@ -293,18 +365,20 @@ public class CreateFunctionStmt extends DdlStmt {
                     udafStateClass.setClazz(classLoader.loadClass(stateClassName));
                 }
 
+                mainClass.collectMethods();
+                if (isAggregate) {
+                    udafStateClass.collectMethods();
+                }
+
             } catch (IOException e) {
                 throw new AnalysisException("Failed to load object_file: " + objectFile);
             } catch (ClassNotFoundException e) {
                 throw new AnalysisException("Class '" + className + "' not found in object_file :" + objectFile);
+            } catch (Exception e) {
+                throw new AnalysisException("other exception when load class. exception:", e);
             }
-        } catch (MalformedURLException e) {
-            throw new AnalysisException("Object file is invalid: " + objectFile);
-        }
-
-        mainClass.collectMethods();
-        if (isAggregate) {
-            udafStateClass.collectMethods();
+        } finally {
+            System.setSecurityManager(null);
         }
     }
 
@@ -351,7 +425,7 @@ public class CreateFunctionStmt extends DdlStmt {
         function = ScalarFunction.createUdf(
                 functionName, argsDef.getArgTypes(),
                 returnType.getType(), argsDef.isVariadic(), TFunctionBinaryType.SRJAR,
-                objectFile, mainClass.getCanonicalName(), "", "");
+                objectFile, mainClass.getCanonicalName(), "", "", !"shared".equalsIgnoreCase(isolation));
         function.setChecksum(checksum);
     }
 
@@ -478,11 +552,6 @@ public class CreateFunctionStmt extends DdlStmt {
 
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
-        return visitor.visitCreateFunction(this, context);
-    }
-
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
+        return visitor.visitCreateFunctionStatement(this, context);
     }
 }

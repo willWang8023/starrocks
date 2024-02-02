@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/metric/MetricCalculator.java
 
@@ -24,6 +37,8 @@ package com.starrocks.metric;
 import com.starrocks.common.Config;
 import com.starrocks.qe.QueryDetail;
 import com.starrocks.qe.QueryDetailQueue;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
 
 import java.util.ArrayList;
 import java.util.Comparator;
@@ -80,14 +95,19 @@ public class MetricCalculator extends TimerTask {
         lastTs = currentTs;
 
         // max tablet compaction score of all backends
-        long maxCompactionScore = 0;
-        List<Metric> compactionScoreMetrics = MetricRepo.getMetricsByName(MetricRepo.TABLET_MAX_COMPACTION_SCORE);
-        for (Metric metric : compactionScoreMetrics) {
-            if (((GaugeMetric<Long>) metric).getValue() > maxCompactionScore) {
-                maxCompactionScore = ((GaugeMetric<Long>) metric).getValue();
+        if (RunMode.isSharedDataMode()) {
+            MetricRepo.GAUGE_MAX_TABLET_COMPACTION_SCORE.setValue(
+                    (long) GlobalStateMgr.getCurrentState().getCompactionMgr().getMaxCompactionScore());
+        } else {
+            long maxCompactionScore = 0;
+            List<Metric> compactionScoreMetrics = MetricRepo.getMetricsByName(MetricRepo.TABLET_MAX_COMPACTION_SCORE);
+            for (Metric metric : compactionScoreMetrics) {
+                if (((GaugeMetric<Long>) metric).getValue() > maxCompactionScore) {
+                    maxCompactionScore = ((GaugeMetric<Long>) metric).getValue();
+                }
             }
+            MetricRepo.GAUGE_MAX_TABLET_COMPACTION_SCORE.setValue(maxCompactionScore);
         }
-        MetricRepo.GAUGE_MAX_TABLET_COMPACTION_SCORE.setValue(maxCompactionScore);
 
         // query latency
         List<QueryDetail> queryList = QueryDetailQueue.getQueryDetailsAfterTime(lastQueryEventTime);
@@ -132,5 +152,7 @@ public class MetricCalculator extends TimerTask {
         if (Config.enable_routine_load_lag_metrics)  {
             MetricRepo.updateRoutineLoadProcessMetrics();
         }
+
+        MetricRepo.GAUGE_SAFE_MODE.setValue(GlobalStateMgr.getCurrentState().isSafeMode() ? 1 : 0);
     }
 }

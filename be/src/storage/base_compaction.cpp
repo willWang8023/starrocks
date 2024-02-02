@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/base_compaction.h"
 
@@ -8,22 +20,25 @@
 #include "util/starrocks_metrics.h"
 #include "util/trace.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 BaseCompaction::BaseCompaction(MemTracker* mem_tracker, TabletSharedPtr tablet)
         : Compaction(mem_tracker, std::move(tablet)) {}
 
-BaseCompaction::~BaseCompaction() {}
+BaseCompaction::~BaseCompaction() = default;
 
 Status BaseCompaction::compact() {
     if (!_tablet->init_succeeded()) {
         return Status::InvalidArgument("base compaction input parameter error.");
     }
 
+    StarRocksMetrics::instance()->base_compaction_request_total.increment(1);
+    StarRocksMetrics::instance()->running_base_compaction_task_num.increment(1);
     std::unique_lock lock(_tablet->get_base_lock(), std::try_to_lock);
     if (!lock.owns_lock()) {
         return Status::OK();
     }
+    int64_t start_time = UnixMillis();
     TRACE("got base compaction lock");
 
     // 1. pick rowsets to compact
@@ -32,7 +47,10 @@ Status BaseCompaction::compact() {
     TRACE_COUNTER_INCREMENT("input_rowsets_count", _input_rowsets.size());
 
     MemTracker* prev_tracker = tls_thread_status.set_mem_tracker(_mem_tracker);
-    DeferOp op([&] { tls_thread_status.set_mem_tracker(prev_tracker); });
+    DeferOp op([&] {
+        tls_thread_status.set_mem_tracker(prev_tracker);
+        StarRocksMetrics::instance()->running_base_compaction_task_num.increment(-1);
+    });
 
     // 2. do base compaction, merge rowsets
     RETURN_IF_ERROR(do_compaction());
@@ -42,8 +60,13 @@ Status BaseCompaction::compact() {
     _state = CompactionState::SUCCESS;
 
     // 4. add metric to base compaction
+    int64_t end_time = UnixMillis();
+    int64_t cost_time = end_time - start_time;
     StarRocksMetrics::instance()->base_compaction_deltas_total.increment(_input_rowsets.size());
     StarRocksMetrics::instance()->base_compaction_bytes_total.increment(_input_rowsets_size);
+    StarRocksMetrics::instance()->base_compaction_task_cost_time_ms.set_value(cost_time);
+    StarRocksMetrics::instance()->base_compaction_task_byte_per_second.set_value(_input_rowsets_size /
+                                                                                 (cost_time / 1000.0 + 1));
     TRACE("save base compaction metrics");
 
     return Status::OK();
@@ -144,4 +167,4 @@ Status BaseCompaction::_check_rowset_overlapping(const std::vector<RowsetSharedP
     return Status::OK();
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

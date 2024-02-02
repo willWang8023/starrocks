@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "runtime/time_types.h"
 
 #include <string>
@@ -6,7 +19,7 @@
 #include "gutil/strings/substitute.h"
 #include "util/raw_container.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // two-digit years < this are 20..; >= this are 19..
 const int YY_PART_YEAR = 70;
@@ -535,54 +548,4 @@ bool timestamp::check_time(int hour, int minute, int second, int microsecond) {
     return hour < HOURS_PER_DAY && minute < MINS_PER_HOUR && second < SECS_PER_MINUTE && microsecond < USECS_PER_SEC;
 }
 
-std::string timestamp::to_string(Timestamp timestamp) {
-    std::string s;
-    raw::make_room(&s, 26);
-    int len = to_string(timestamp, s.data(), s.size());
-    s.resize(len);
-    return s;
-}
-
-int timestamp::to_string(Timestamp timestamp, char* to, size_t n) {
-    int year, month, day;
-    int hour, minute, second, microsecond;
-    date::to_date_with_cache(timestamp::to_julian(timestamp), &year, &month, &day);
-    to_time(timestamp, &hour, &minute, &second, &microsecond);
-
-    if (n < 19) {
-        return -1;
-    }
-
-    date::to_string(year, month, day, to);
-
-    to[10] = (char)(' ');
-    to[11] = (char)('0' + (hour / 10));
-    to[12] = (char)('0' + (hour % 10));
-    to[13] = ':';
-    // Minute
-    to[14] = (char)('0' + (minute / 10));
-    to[15] = (char)('0' + (minute % 10));
-    to[16] = ':';
-    /* Second */
-    to[17] = (char)('0' + (second / 10));
-    to[18] = (char)('0' + (second % 10));
-    if (microsecond > 0) {
-        if (n < 26) {
-            return -1;
-        }
-        to[19] = '.';
-        uint32_t first = microsecond / 10000;
-        uint32_t second = (microsecond % 10000) / 100;
-        uint32_t third = microsecond % 100;
-        to[20] = (char)('0' + first / 10);
-        to[21] = (char)('0' + first % 10);
-        to[22] = (char)('0' + second / 10);
-        to[23] = (char)('0' + second % 10);
-        to[24] = (char)('0' + third / 10);
-        to[25] = (char)('0' + third % 10);
-        return 26;
-    }
-    return 19;
-}
-
-} // namespace starrocks::vectorized
+} // namespace starrocks

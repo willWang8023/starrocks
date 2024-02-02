@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/exec/es/es_scan_reader.cpp
 
@@ -79,7 +92,7 @@ ESScanReader::ESScanReader(const std::string& target, const std::map<std::string
 
     if (props.find(KEY_TERMINATE_AFTER) != props.end()) {
         _exactly_once = true;
-        // just send a normal search  against the elasticsearch with additional terminate_after param to achieve terminate early effect when limit take effect
+        // just send a normal search against the elasticsearch with additional terminate_after param to achieve terminate early effect when limit take effect
         if (_type.empty()) {
             _search_url = fmt::format("{}/{}/_search?terminate_after={}&preference=_shards:{}&{}", _target, _index,
                                       props.at(KEY_TERMINATE_AFTER), _shards, filter_path);
@@ -123,7 +136,7 @@ Status ESScanReader::open() {
     Status status = _network_client.execute_post_request(_query, &_cached_response);
     VLOG(1) << "ES Query:" << _query;
     if (!status.ok() || _network_client.get_http_status() != 200) {
-        std::string err_msg = fmt::format("Failed to connect to ES server, errmsg is: {}", status.get_error_msg());
+        std::string err_msg = fmt::format("Failed to connect to ES server, errmsg is: {}", status.message());
         return Status::InternalError(err_msg);
     }
     VLOG(1) << "open _cached response: " << _cached_response;
@@ -175,7 +188,7 @@ Status ESScanReader::get_next(bool* scan_eos, std::unique_ptr<T>& scroll_parser)
     Status status = scroll_parser->parse(response, _exactly_once);
     if (!status.ok()) {
         _eos = true;
-        LOG(WARNING) << status.get_error_msg();
+        LOG(WARNING) << status.message();
         return status;
     }
 
@@ -195,8 +208,7 @@ Status ESScanReader::get_next(bool* scan_eos, std::unique_ptr<T>& scroll_parser)
     return Status::OK();
 }
 
-template Status ESScanReader::get_next<vectorized::ScrollParser>(
-        bool* scan_eos, std::unique_ptr<vectorized::ScrollParser>& scroll_parser);
+template Status ESScanReader::get_next<ScrollParser>(bool* scan_eos, std::unique_ptr<ScrollParser>& scroll_parser);
 
 Status ESScanReader::close() {
     if (_scroll_id.empty()) {

@@ -1,16 +1,34 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.staros;
 
 import com.staros.manager.StarManager;
 import com.staros.manager.StarManagerServer;
+import com.staros.metrics.MetricsSystem;
 import com.starrocks.common.Config;
 import com.starrocks.ha.FrontendNodeType;
 import com.starrocks.ha.StateChangeExecution;
 import com.starrocks.journal.bdbje.BDBEnvironment;
 import com.starrocks.journal.bdbje.BDBJEJournal;
+import com.starrocks.lake.StarOSAgent;
 import com.starrocks.leader.Checkpoint;
+import com.starrocks.metric.MetricVisitor;
+import com.starrocks.metric.PrometheusRegistryHelper;
 import com.starrocks.persist.Storage;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.service.FrontendOptions;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -101,25 +119,52 @@ public class StarMgrServer {
         journalSystem = new BDBJEJournalSystem(environment);
         imageDir = baseImageDir + IMAGE_SUBDIR;
 
-        String[] starMgrAddr = Config.starmgr_address.split(":");
-        if (starMgrAddr.length != 2) {
-            LOG.fatal("Config.starmgr_address {} bad format.", Config.starmgr_address);
-            System.exit(-1);
-        }
-        int port = Integer.parseInt(starMgrAddr[1]);
-
+        // TODO: remove separate deployment capability for now
         // necessary starMgr config setting
         com.staros.util.Config.STARMGR_IP = FrontendOptions.getLocalHostAddress();
-        com.staros.util.Config.STARMGR_RPC_PORT = port;
-        com.staros.util.Config.S3_BUCKET = Config.starmgr_s3_bucket;
-        com.staros.util.Config.S3_REGION = Config.starmgr_s3_region;
-        com.staros.util.Config.S3_ENDPOINT = Config.starmgr_s3_endpoint;
-        com.staros.util.Config.S3_AK = Config.starmgr_s3_ak;
-        com.staros.util.Config.S3_SK = Config.starmgr_s3_sk;
+        com.staros.util.Config.STARMGR_RPC_PORT = Config.cloud_native_meta_port;
+
+        // Storage fs type
+        com.staros.util.Config.DEFAULT_FS_TYPE = "";
+
+        // use tablet_sched_disable_balance
+        com.staros.util.Config.DISABLE_BACKGROUND_SHARD_SCHEDULE_CHECK = Config.tablet_sched_disable_balance;
+        // turn on 0 as default worker group id, to be compatible with add/drop backend in FE
+        com.staros.util.Config.ENABLE_ZERO_WORKER_GROUP_COMPATIBILITY = true;
+        // set the same heartbeat configuration to starmgr, but not able to change in runtime.
+        com.staros.util.Config.WORKER_HEARTBEAT_INTERVAL_SEC = Config.heartbeat_timeout_second;
+        com.staros.util.Config.WORKER_HEARTBEAT_RETRY_COUNT = Config.heartbeat_retry_times;
+        com.staros.util.Config.GRPC_RPC_TIME_OUT_SEC = Config.starmgr_grpc_timeout_seconds;
+
+        // sync the mutable configVar to StarMgr in case any changes
+        GlobalStateMgr.getCurrentState().getConfigRefreshDaemon().registerListener(() -> {
+            com.staros.util.Config.DISABLE_BACKGROUND_SHARD_SCHEDULE_CHECK = Config.tablet_sched_disable_balance;
+            com.staros.util.Config.WORKER_HEARTBEAT_INTERVAL_SEC = Config.heartbeat_timeout_second;
+            com.staros.util.Config.WORKER_HEARTBEAT_RETRY_COUNT = Config.heartbeat_retry_times;
+            com.staros.util.Config.GRPC_RPC_TIME_OUT_SEC = Config.starmgr_grpc_timeout_seconds;
+        });
+        // set the following config, in order to provide a customized worker group definition
+        // com.staros.util.Config.RESOURCE_MANAGER_WORKER_GROUP_SPEC_RESOURCE_FILE = "";
+
+        // use external resource provisioner service to provision/release worker group resource.
+        // Keep this empty if using builtin one for testing
+        // com.staros.util.Config.RESOURCE_PROVISIONER_ADDRESS = "";
+
+        // turn on the following config, in case to use starmgr for internal multi-cluster testing
+        // com.staros.util.Config.ENABLE_BUILTIN_RESOURCE_PROVISIONER_FOR_TEST = true;
+
+        // set the following config, in order to enable the builtin test resource provisioner dump its meta to disk
+        // com.staros.util.Config.BUILTIN_PROVISION_SERVER_DATA_DIR = "./";
 
         // start rpc server
         starMgrServer = new StarManagerServer(journalSystem);
         starMgrServer.start(com.staros.util.Config.STARMGR_RPC_PORT);
+
+        StarOSAgent starOsAgent = GlobalStateMgr.getCurrentState().getStarOSAgent();
+        if (starOsAgent != null && !starOsAgent.init(starMgrServer)) {
+            LOG.error("init star os agent failed.");
+            System.exit(-1);
+        }
 
         // load meta
         loadImage(imageDir);
@@ -200,6 +245,13 @@ public class StarMgrServer {
         }
 
         return true;
+    }
+
+    public void visitMetrics(MetricVisitor visitor) {
+        if (starMgrServer == null) {
+            return;
+        }
+        PrometheusRegistryHelper.visitPrometheusRegistry(MetricsSystem.METRIC_REGISTRY, visitor);
     }
 
     public long getMaxJournalId() {

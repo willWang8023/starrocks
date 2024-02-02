@@ -1,6 +1,6 @@
 #include "exec/pipeline/table_function_operator.h"
 
-#include "gen_cpp/RuntimeProfile_types.h"
+#include "exec/pipeline/query_context.h"
 #include "gtest/gtest.h"
 
 namespace starrocks::pipeline {
@@ -9,10 +9,11 @@ public:
     TableFunctionOperatorTest() : _runtime_state(TQueryGlobals()) {}
 
 protected:
-    virtual void SetUp() override;
+    void SetUp() override;
 
 private:
     RuntimeState _runtime_state;
+    std::unique_ptr<QueryContext> _query_ctx = std::make_unique<QueryContext>();
     ObjectPool _object_pool;
     DescriptorTbl* _desc_tbl = nullptr;
     TPlanNode _tnode;
@@ -20,13 +21,13 @@ private:
 
 class Counter {
 public:
-    void process_push(const vectorized::ChunkPtr& chunk) {
+    void process_push(const ChunkPtr& chunk) {
         std::lock_guard<std::mutex> l(_mutex);
         ++_push_chunk_num;
         _push_chunk_row_num += chunk->num_rows();
     }
 
-    void process_pull(const vectorized::ChunkPtr& chunk) {
+    void process_pull(const ChunkPtr& chunk) {
         std::lock_guard<std::mutex> l(_mutex);
         ++_pull_chunk_num;
         _pull_chunk_row_num += chunk->num_rows();
@@ -65,7 +66,7 @@ using CounterPtr = std::shared_ptr<Counter>;
 class TestNormalOperatorFactory final : public OperatorFactory {
 public:
     TestNormalOperatorFactory(int32_t id, int32_t plan_node_id, CounterPtr counter, TPlanNode* tnode)
-            : OperatorFactory(id, "test_normal", plan_node_id), _counter(counter), _tnode(tnode) {}
+            : OperatorFactory(id, "test_normal", plan_node_id), _counter(std::move(counter)), _tnode(tnode) {}
 
     ~TestNormalOperatorFactory() override = default;
 
@@ -79,6 +80,8 @@ private:
 };
 
 void TableFunctionOperatorTest::SetUp() {
+    _runtime_state.set_query_ctx(_query_ctx.get());
+
     TTableDescriptor t_table_desc;
     t_table_desc.id = 0;
     t_table_desc.tableType = TTableType::OLAP_TABLE;
@@ -124,7 +127,9 @@ void TableFunctionOperatorTest::SetUp() {
         t_desc_table.slotDescriptors.push_back(slot_desc);
     }
 
-    DescriptorTbl::create(&_object_pool, t_desc_table, &_desc_tbl, config::vector_chunk_size);
+    ASSERT_TRUE(
+            DescriptorTbl::create(&_runtime_state, &_object_pool, t_desc_table, &_desc_tbl, config::vector_chunk_size)
+                    .ok());
     _runtime_state.set_desc_tbl(_desc_tbl);
 
     _tnode.node_id = 1;

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/StarRocksFE.java
 
@@ -28,7 +41,6 @@ import com.starrocks.common.Config;
 import com.starrocks.common.Log4jConfig;
 import com.starrocks.common.ThreadPoolManager;
 import com.starrocks.common.Version;
-import com.starrocks.common.util.JdkUtils;
 import com.starrocks.ha.StateChangeExecutor;
 import com.starrocks.http.HttpServer;
 import com.starrocks.journal.Journal;
@@ -36,9 +48,11 @@ import com.starrocks.journal.bdbje.BDBEnvironment;
 import com.starrocks.journal.bdbje.BDBJEJournal;
 import com.starrocks.journal.bdbje.BDBTool;
 import com.starrocks.journal.bdbje.BDBToolOptions;
+import com.starrocks.leader.MetaHelper;
 import com.starrocks.qe.CoordinatorMonitor;
 import com.starrocks.qe.QeService;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.RunMode;
 import com.starrocks.service.ExecuteEnv;
 import com.starrocks.service.FeServer;
 import com.starrocks.service.FrontendOptions;
@@ -63,9 +77,12 @@ public class StarRocksFE {
     public static final String STARROCKS_HOME_DIR = System.getenv("STARROCKS_HOME");
     public static final String PID_DIR = System.getenv("PID_DIR");
 
+    public static volatile boolean stopped = false;
+
     public static void main(String[] args) {
         start(STARROCKS_HOME_DIR, PID_DIR, args);
     }
+
 
     // entrance for starrocks frontend
     public static void start(String starRocksDir, String pidDir, String[] args) {
@@ -90,23 +107,20 @@ public class StarRocksFE {
             // init config
             new Config().init(starRocksDir + "/conf/fe.conf");
 
-            // check it after Config is initialized, otherwise the config 'check_java_version' won't work.
-            if (!JdkUtils.checkJavaVersion()) {
-                throw new IllegalArgumentException("Java version doesn't match");
-            }
-
             Log4jConfig.initLogging();
 
             // set dns cache ttl
             java.security.Security.setProperty("networkaddress.cache.ttl", "60");
+            // Need to put if before `GlobalStateMgr.getCurrentState().waitForReady()`, because it may access aws service
+            setAWSHttpClient();
 
             // check command line options
             checkCommandLineOptions(cmdLineOpts);
 
             // check meta dir
-            checkMetaDir();
+            MetaHelper.checkMetaDir();
 
-            LOG.info("StarRocks FE starting...");
+            LOG.info("StarRocks FE starting, version: {}-{}", Version.STARROCKS_VERSION, Version.STARROCKS_COMMIT_HASH);
 
             FrontendOptions.init(args);
             ExecuteEnv.setup();
@@ -117,7 +131,7 @@ public class StarRocksFE {
             StateChangeExecutor.getInstance().setMetaContext(
                     GlobalStateMgr.getCurrentState().getMetaContext());
 
-            if (Config.integrate_starmgr) {
+            if (RunMode.isSharedDataMode()) {
                 Journal journal = GlobalStateMgr.getCurrentState().getJournal();
                 if (journal instanceof BDBJEJournal) {
                     BDBEnvironment bdbEnvironment = ((BDBJEJournal) journal).getBdbEnvironment();
@@ -162,54 +176,18 @@ public class StarRocksFE {
 
             addShutdownHook();
 
-            while (true) {
+            LOG.info("FE started successfully");
+
+            while (!stopped) {
                 Thread.sleep(2000);
             }
+
         } catch (Throwable e) {
             LOG.error("StarRocksFE start failed", e);
-            e.printStackTrace();
-        }
-    }
-
-    private static void checkMetaDir() {
-
-        // check meta dir
-        //   if metaDir is the default config: StarRocksFE.STARROCKS_HOME_DIR + "/meta",
-        //   we should check whether both the new default dir (STARROCKS_HOME_DIR + "/meta")
-        //   and the old default dir (DORIS_HOME_DIR + "/doris-meta") are present. If both are present,
-        //   we need to let users keep only one to avoid starting from outdated metadata.
-        String oldDefaultMetaDir = System.getenv("DORIS_HOME") + "/doris-meta";
-        String newDefaultMetaDir = StarRocksFE.STARROCKS_HOME_DIR + "/meta";
-        String metaDir = Config.meta_dir;
-        if (metaDir.equals(newDefaultMetaDir)) {
-            File oldMeta = new File(oldDefaultMetaDir);
-            File newMeta = new File(newDefaultMetaDir);
-            if (oldMeta.exists() && newMeta.exists()) {
-                LOG.error("New default meta dir: {} and Old default meta dir: {} are both present. " +
-                                "Please make sure {} has the latest data, and remove the another one.",
-                        newDefaultMetaDir, oldDefaultMetaDir, newDefaultMetaDir);
-                System.exit(-1);
-            }
+            System.exit(-1);
         }
 
-        File meta = new File(metaDir);
-        if (!meta.exists()) {
-            // If metaDir is not the default config, it means the user has specified the other directory
-            // We should not use the oldDefaultMetaDir.
-            // Just exit in this case
-            if (!metaDir.equals(newDefaultMetaDir)) {
-                LOG.error("meta dir {} dose not exist, will exit", metaDir);
-                System.exit(-1);
-            }
-            File oldMeta = new File(oldDefaultMetaDir);
-            if (oldMeta.exists()) {
-                // For backward compatible
-                Config.meta_dir = oldDefaultMetaDir;
-            } else {
-                LOG.error("meta dir {} does not exist, will exit", meta.getAbsolutePath());
-                System.exit(-1);
-            }
-        }
+        System.exit(0);
     }
 
     /*
@@ -256,19 +234,19 @@ public class StarRocksFE {
         try {
             cmd = commandLineParser.parse(options, args);
         } catch (final ParseException e) {
-            e.printStackTrace();
+            LOG.error(e);
             System.err.println("Failed to parse command line. exit now");
             System.exit(-1);
         }
 
         // version
         if (cmd.hasOption('v') || cmd.hasOption("version")) {
-            return new CommandLineOptions(true, "", null);
+            return new CommandLineOptions(true, null);
         } else if (cmd.hasOption('b') || cmd.hasOption("bdb")) {
             if (cmd.hasOption('l') || cmd.hasOption("listdb")) {
                 // list bdb je databases
                 BDBToolOptions bdbOpts = new BDBToolOptions(true, "", false, "", "", 0, 0);
-                return new CommandLineOptions(false, "", bdbOpts);
+                return new CommandLineOptions(false, bdbOpts);
             } else if (cmd.hasOption('d') || cmd.hasOption("db")) {
                 // specify a database
                 String dbName = cmd.getOptionValue("db");
@@ -279,7 +257,7 @@ public class StarRocksFE {
 
                 if (cmd.hasOption('s') || cmd.hasOption("stat")) {
                     BDBToolOptions bdbOpts = new BDBToolOptions(false, dbName, true, "", "", 0, 0);
-                    return new CommandLineOptions(false, "", bdbOpts);
+                    return new CommandLineOptions(false, bdbOpts);
                 } else {
                     String fromKey = "";
                     String endKey = "";
@@ -318,7 +296,7 @@ public class StarRocksFE {
                     BDBToolOptions bdbOpts =
                             new BDBToolOptions(false, dbName, false, fromKey, endKey, metaVersion,
                                     starrocksMetaVersion);
-                    return new CommandLineOptions(false, "", bdbOpts);
+                    return new CommandLineOptions(false, bdbOpts);
                 }
             } else {
                 System.err.println("Invalid options when running bdb je tools");
@@ -330,11 +308,23 @@ public class StarRocksFE {
                 System.err.println("Missing helper node");
                 System.exit(-1);
             }
-            return new CommandLineOptions(false, helperNode, null);
         }
 
         // helper node is null, means no helper node is specified
-        return new CommandLineOptions(false, null, null);
+        return new CommandLineOptions(false, null);
+    }
+
+    // To resolve: "Multiple HTTP implementations were found on the classpath. To avoid non-deterministic
+    // loading implementations, please explicitly provide an HTTP client via the client builders, set
+    // the software.amazon.awssdk.http.service.impl system property with the FQCN of the HTTP service to
+    // use as the default, or remove all but one HTTP implementation from the classpath"
+    // Currently, there are 2 implements of HTTP client: ApacheHttpClient and UrlConnectionHttpClient
+    // The UrlConnectionHttpClient is introduced by #16602, and it causes the exception.
+    // So we set the default HTTP client to UrlConnectionHttpClient.
+    // TODO: remove this after we remove ApacheHttpClient
+    private static void setAWSHttpClient() {
+        System.setProperty("software.amazon.awssdk.http.service.impl",
+                "software.amazon.awssdk.http.urlconnection.UrlConnectionSdkHttpService");
     }
 
     private static void checkCommandLineOptions(CommandLineOptions cmdLineOpts) {

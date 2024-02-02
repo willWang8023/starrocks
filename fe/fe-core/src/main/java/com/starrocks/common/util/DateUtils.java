@@ -1,57 +1,196 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.common.util;
 
+import com.google.gson.Gson;
+import com.google.gson.GsonBuilder;
+import com.google.gson.JsonPrimitive;
+import com.google.gson.JsonSerializer;
 import com.starrocks.common.AnalysisException;
+import com.starrocks.persist.gson.GsonUtils;
 
+import java.time.DayOfWeek;
+import java.time.Instant;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
 import java.time.LocalTime;
+import java.time.ZoneId;
+import java.time.ZoneOffset;
+import java.time.ZonedDateTime;
 import java.time.format.DateTimeFormatter;
 import java.time.format.DateTimeFormatterBuilder;
+import java.time.format.ResolverStyle;
 import java.time.format.SignStyle;
 import java.time.temporal.ChronoField;
 import java.time.temporal.TemporalAccessor;
+import java.time.temporal.WeekFields;
 
 public class DateUtils {
-    public static final String DATEKEY_FORMAT = "yyyyMMdd";
-    public static final String DATE_FORMAT = "yyyy-MM-dd";
-    public static final String DATE_TIME_FORMAT = "yyyy-MM-dd HH:mm:ss";
-    public static final String SECOND_FORMAT = "yyyyMMddHHmmss";
-    public static final String MINUTE_FORMAT = "yyyyMMddHHmm";
-    public static final String HOUR_FORMAT = "yyyyMMddHH";
-    public static final String MONTH_FORMAT = "yyyyMM";
-    public static final String QUARTER_FORMAT = "yyyy'Q'q";
-    public static final String YEAR_FORMAT = "yyyy";
+    // These are marked as deprecated because they don't support year 0000 parsing
+    @Deprecated
+    public static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
+    @Deprecated
+    public static final DateTimeFormatter DATEKEY_FORMATTER = DateTimeFormatter.ofPattern("yyyyMMdd");
+    @Deprecated
+    public static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    @Deprecated
+    public static final DateTimeFormatter MINUTE_FORMATTER = DateTimeFormatter.ofPattern("yyyyMMddHHmm");
+    @Deprecated
+    public static final DateTimeFormatter HOUR_FORMATTER = DateTimeFormatter.ofPattern("yyyyMMddHH");
+    @Deprecated
+    public static final DateTimeFormatter YEAR_FORMATTER = DateTimeFormatter.ofPattern("yyyy");
+    @Deprecated
+    public static final DateTimeFormatter QUARTER_FORMATTER = DateTimeFormatter.ofPattern("yyyy'Q'q");
+    @Deprecated
+    public static final DateTimeFormatter MONTH_FORMATTER = DateTimeFormatter.ofPattern("yyyyMM");
 
-    public static final DateTimeFormatter DATE_FORMATTER = DateTimeFormatter.ofPattern(DATE_FORMAT);
-    public static final DateTimeFormatter DATEKEY_FORMATTER = DateTimeFormatter.ofPattern(DATEKEY_FORMAT);
-    public static final DateTimeFormatter DATE_TIME_FORMATTER = DateTimeFormatter.ofPattern(DATE_TIME_FORMAT);
-    public static final DateTimeFormatter SECOND_FORMATTER = DateTimeFormatter.ofPattern(SECOND_FORMAT);
-    public static final DateTimeFormatter MINUTE_FORMATTER = DateTimeFormatter.ofPattern(MINUTE_FORMAT);
-    public static final DateTimeFormatter HOUR_FORMATTER = DateTimeFormatter.ofPattern(HOUR_FORMAT);
-    public static final DateTimeFormatter YEAR_FORMATTER = DateTimeFormatter.ofPattern(YEAR_FORMAT);
-    public static final DateTimeFormatter QUARTER_FORMATTER = DateTimeFormatter.ofPattern(QUARTER_FORMAT);
-    public static final DateTimeFormatter MONTH_FORMATTER = DateTimeFormatter.ofPattern(MONTH_FORMAT);
+    public static final DateTimeFormatter TIME_FORMATTER = DateTimeFormatter.ofPattern("HH:mm:ss");
 
-    public static final DateTimeFormatter DATE_FORMATTER_UNIX =
-            DateUtils.unixDatetimeFormatBuilder("%Y-%m-%d").toFormatter();
-    public static final DateTimeFormatter DATE_TIME_FORMATTER_UNIX =
-            DateUtils.unixDatetimeFormatBuilder("%Y-%m-%d %H:%i:%s").toFormatter();
-    public static final DateTimeFormatter DATEKEY_FORMATTER_UNIX =
-            DateUtils.unixDatetimeFormatBuilder("%Y%m%d").toFormatter();
-    public static final DateTimeFormatter DATETIMEKEY_FORMATTER_UNIX =
-            DateUtils.unixDatetimeFormatBuilder("%Y%m%d%H%i%s").toFormatter();
+    public static final DateTimeFormatter DATE_FORMATTER_UNIX = unixDatetimeFormatter("%Y-%m-%d");
+    public static final DateTimeFormatter DATEKEY_FORMATTER_UNIX = unixDatetimeFormatter("%Y%m%d");
+    public static final DateTimeFormatter DATE_TIME_FORMATTER_UNIX = unixDatetimeFormatter("%Y-%m-%d %H:%i:%s");
+    public static final DateTimeFormatter DATE_TIME_MS_FORMATTER_UNIX = unixDatetimeFormatter("%Y-%m-%d %H:%i:%s.%f");
+    public static final DateTimeFormatter SECOND_FORMATTER_UNIX = unixDatetimeFormatter("%Y%m%d%H%i%s");
+    public static final DateTimeFormatter MINUTE_FORMATTER_UNIX = unixDatetimeFormatter("%Y%m%d%H%i");
+    public static final DateTimeFormatter HOUR_FORMATTER_UNIX = unixDatetimeFormatter("%Y%m%d%H");
+    public static final DateTimeFormatter YEAR_FORMATTER_UNIX = unixDatetimeFormatter("%Y");
+    public static final DateTimeFormatter MONTH_FORMATTER_UNIX = unixDatetimeFormatter("%Y%m");
+
+    private static final JsonSerializer<LocalDateTime> LOCAL_DATETIME_PRINTER =
+            (dateTime, type, cx) -> new JsonPrimitive(dateTime.format(DATE_TIME_FORMATTER_UNIX));
+
+    public static final Gson GSON_PRINTER = new GsonBuilder()
+            .addSerializationExclusionStrategy(new GsonUtils.HiddenAnnotationExclusionStrategy())
+            .addDeserializationExclusionStrategy(new GsonUtils.HiddenAnnotationExclusionStrategy())
+            .enableComplexMapKeySerialization()
+            .disableHtmlEscaping()
+            .registerTypeAdapter(LocalDateTime.class, LOCAL_DATETIME_PRINTER)
+            .create();
+    /*
+     * Dates containing two-digit year values are ambiguous because the century is unknown.
+     * MySQL interprets two-digit year values using these rules:
+     * Year values in the range 70-99 are converted to 1970-1999.
+     * Year values in the range 00-69 are converted to 2000-2069.
+     * */
+    private static final DateTimeFormatter STRICT_DATE_FORMATTER =
+            unixDatetimeStrictFormatter("%Y-%m-%e", false);
+    private static final DateTimeFormatter STRICT_DATE_FORMATTER_TWO_DIGIT =
+            unixDatetimeStrictFormatter("%y-%m-%e", false);
+    private static final DateTimeFormatter STRICT_DATE_NO_SPLIT_FORMATTER =
+            unixDatetimeStrictFormatter("%Y%m%e", true);
+
+    // isTwoDigit, withMs, withSplitT, withSec -> formatter
+    private static final DateTimeFormatter[][][][] DATETIME_FORMATTERS = new DateTimeFormatter[2][2][2][2];
+
+    static {
+        // isTwoDigit, withMs, withSplitT, withSec -> formatter
+        DATETIME_FORMATTERS[0][0][0][0] = unixDatetimeStrictFormatter("%Y-%m-%e %H:%i", false);
+        DATETIME_FORMATTERS[0][0][0][1] = unixDatetimeStrictFormatter("%Y-%m-%e %H:%i:%s", false);
+        DATETIME_FORMATTERS[0][0][1][0] = unixDatetimeStrictFormatter("%Y-%m-%eT%H:%i", false);
+        DATETIME_FORMATTERS[0][0][1][1] = unixDatetimeStrictFormatter("%Y-%m-%eT%H:%i:%s", false);
+        DATETIME_FORMATTERS[0][1][0][1] = unixDatetimeStrictFormatter("%Y-%m-%e %H:%i:%s.%f", false);
+        DATETIME_FORMATTERS[0][1][1][1] = unixDatetimeStrictFormatter("%Y-%m-%eT%H:%i:%s.%f", false);
+        DATETIME_FORMATTERS[1][0][0][0] = unixDatetimeStrictFormatter("%y-%m-%e %H:%i", false);
+        DATETIME_FORMATTERS[1][0][0][1] = unixDatetimeStrictFormatter("%y-%m-%e %H:%i:%s", false);
+        DATETIME_FORMATTERS[1][0][1][0] = unixDatetimeStrictFormatter("%y-%m-%eT%H:%i", false);
+        DATETIME_FORMATTERS[1][0][1][1] = unixDatetimeStrictFormatter("%y-%m-%eT%H:%i:%s", false);
+        DATETIME_FORMATTERS[1][1][0][1] = unixDatetimeStrictFormatter("%y-%m-%e %H:%i:%s.%f", false);
+        DATETIME_FORMATTERS[1][1][1][1] = unixDatetimeStrictFormatter("%y-%m-%eT%H:%i:%s.%f", false);
+    }
+
+    public static String formatDateTimeUnix(LocalDateTime dateTime) {
+        if (dateTime == null) {
+            return null;
+        }
+        return dateTime.format(DATE_TIME_FORMATTER_UNIX);
+    }
+
+    public static LocalDateTime fromEpochMillis(long epochMilli) {
+        return LocalDateTime.ofInstant(Instant.ofEpochMilli(epochMilli), ZoneOffset.UTC);
+    }
+
+    public static LocalDateTime parseUnixDateTime(String str) {
+        return LocalDateTime.parse(str, DATE_TIME_FORMATTER_UNIX);
+    }
+
+    public static LocalDateTime parseStrictDateTime(String str) {
+        if (str == null || str.length() < 5) {
+            throw new IllegalArgumentException("Invalid datetime string: " + str);
+        }
+        if (str.contains(":")) {
+            // datetime
+            int isTwoDigit = str.split("-")[0].length() == 2 ? 1 : 0;
+            int withSec = str.split(":").length > 2 ? 1 : 0;
+            int withMs = str.contains(".") ? 1 : 0;
+            int withSplitT = str.contains("T") ? 1 : 0;
+            DateTimeFormatter formatter = DATETIME_FORMATTERS[isTwoDigit][withMs][withSplitT][withSec];
+            return parseStringWithDefaultHSM(str, formatter);
+        } else {
+            // date
+            DateTimeFormatter formatter;
+            if (str.split("-")[0].length() == 2) {
+                formatter = STRICT_DATE_FORMATTER_TWO_DIGIT;
+            } else if (str.split("-").length == 3) {
+                formatter = STRICT_DATE_FORMATTER;
+            } else if (str.length() == 8) {
+                // 20200202
+                formatter = STRICT_DATE_NO_SPLIT_FORMATTER;
+            } else {
+                formatter = STRICT_DATE_FORMATTER;
+            }
+            return parseStringWithDefaultHSM(str, formatter);
+        }
+    }
 
     public static DateTimeFormatter probeFormat(String dateTimeStr) throws AnalysisException {
         if (dateTimeStr.length() == 8) {
-            return DateUtils.DATEKEY_FORMATTER;
+            return DATEKEY_FORMATTER;
         } else if (dateTimeStr.length() == 10) {
-            return DateUtils.DATE_FORMATTER;
+            return DATE_FORMATTER_UNIX;
         } else if (dateTimeStr.length() == 19) {
-            return DateUtils.DATE_TIME_FORMATTER;
+            return DATE_TIME_FORMATTER_UNIX;
+        } else if (dateTimeStr.length() == 26) {
+            return DATE_TIME_MS_FORMATTER_UNIX;
         } else {
             throw new AnalysisException("can not probe datetime format:" + dateTimeStr);
         }
+    }
+
+    public static String convertDateFormaterToDateKeyFormater(String datetime) {
+        LocalDate date = LocalDate.parse(datetime, DATE_FORMATTER);
+        String convertedDate = date.format(DATEKEY_FORMATTER_UNIX);
+        return convertedDate;
+    }
+
+    public static String convertDateTimeFormaterToSecondFormater(String datetime) {
+        LocalDateTime date = LocalDateTime.parse(datetime, DATE_TIME_FORMATTER);
+        String convertedDatetime = date.format(SECOND_FORMATTER_UNIX);
+        return convertedDatetime;
+    }
+
+    public static String formatTimestampInSeconds(long timestampInSeconds) {
+        return formatTimestampInSeconds(timestampInSeconds, TimeUtils.getSystemTimeZone().toZoneId());
+    }
+
+    public static String formatTimestampInSeconds(long timestampInSeconds, ZoneId timeZoneId) {
+        return formatTimeStampInMill(timestampInSeconds * 1000, timeZoneId);
+    }
+
+    public static String formatTimeStampInMill(long timestampInSeconds, ZoneId timeZoneId) {
+        ZonedDateTime createTime = Instant.ofEpochMilli(timestampInSeconds).atZone(timeZoneId);
+        return DATE_TIME_FORMATTER_UNIX.format(createTime);
     }
 
     /*
@@ -67,7 +206,24 @@ public class DateUtils {
         }
     }
 
-    public static DateTimeFormatterBuilder unixDatetimeFormatBuilder(String pattern) {
+    public static LocalDateTime parseDatTimeString(String datetime) throws AnalysisException {
+        DateTimeFormatter dateTimeFormatter = probeFormat(datetime);
+        return parseStringWithDefaultHSM(datetime, dateTimeFormatter);
+    }
+
+    public static DateTimeFormatter unixDatetimeFormatter(String pattern) {
+        return unixDatetimeFormatBuilder(pattern, true).toFormatter();
+    }
+
+    public static DateTimeFormatter unixDatetimeFormatter(String pattern, boolean isOutputFormat) {
+        return unixDatetimeFormatBuilder(pattern, isOutputFormat).toFormatter();
+    }
+
+    private static DateTimeFormatter unixDatetimeStrictFormatter(String pattern, boolean isOutputFormat) {
+        return unixDatetimeFormatBuilder(pattern, isOutputFormat).toFormatter().withResolverStyle(ResolverStyle.STRICT);
+    }
+
+    public static DateTimeFormatterBuilder unixDatetimeFormatBuilder(String pattern, boolean isOutputFormat) {
         DateTimeFormatterBuilder builder = new DateTimeFormatterBuilder();
         boolean escaped = false;
         for (int i = 0; i < pattern.length(); i++) {
@@ -78,10 +234,18 @@ public class DateUtils {
                         builder.appendValue(ChronoField.MONTH_OF_YEAR, 1, 2, SignStyle.NORMAL);
                         break;
                     case 'm': // %m Month, numeric (00..12)
-                        builder.appendValue(ChronoField.MONTH_OF_YEAR, 2);
+                        if (isOutputFormat) {
+                            builder.appendValue(ChronoField.MONTH_OF_YEAR, 2);
+                        } else {
+                            builder.appendValue(ChronoField.MONTH_OF_YEAR, 1, 2, SignStyle.NORMAL);
+                        }
                         break;
                     case 'd': // %d Day of the month, numeric (00..31)
-                        builder.appendValue(ChronoField.DAY_OF_MONTH, 2);
+                        if (isOutputFormat) {
+                            builder.appendValue(ChronoField.DAY_OF_MONTH, 2);
+                        } else {
+                            builder.appendValue(ChronoField.DAY_OF_MONTH, 1, 2, SignStyle.NORMAL);
+                        }
                         break;
                     case 'e': // %e Day of the month, numeric (0..31)
                         builder.appendValue(ChronoField.DAY_OF_MONTH, 1, 2, SignStyle.NORMAL);
@@ -110,14 +274,13 @@ public class DateUtils {
                         builder.appendValue(ChronoField.SECOND_OF_MINUTE, 2);
                         break;
                     case 'T': // %T Time, 24-hour (hh:mm:ss)
-                        builder.appendValue(ChronoField.HOUR_OF_DAY, 2)
-                                .appendLiteral(':')
-                                .appendValue(ChronoField.MINUTE_OF_HOUR, 2)
-                                .appendLiteral(':')
+                        builder.appendValue(ChronoField.HOUR_OF_DAY, 2).appendLiteral(':')
+                                .appendValue(ChronoField.MINUTE_OF_HOUR, 2).appendLiteral(':')
                                 .appendValue(ChronoField.SECOND_OF_MINUTE, 2);
                         break;
                     case 'v': // %v Week (01..53), where Monday is the first day of the week; used with %x
-                        builder.appendValue(ChronoField.ALIGNED_WEEK_OF_YEAR, 2);
+                        final WeekFields weekFields = WeekFields.of(DayOfWeek.MONDAY, 4);
+                        builder.appendValue(weekFields.weekOfWeekBasedYear(), 2);
                         break;
                     case 'Y': // %Y Year, numeric, four digits
                         builder.appendValue(ChronoField.YEAR, 4);
@@ -127,7 +290,11 @@ public class DateUtils {
                                 .parseDefaulting(ChronoField.ERA, 1);
                         break;
                     case 'f': // %f Microseconds (000000..999999)
-                        builder.padNext(6, '0').appendValue(ChronoField.MICRO_OF_SECOND, 1, 6, SignStyle.NORMAL);
+                        if (isOutputFormat) {
+                            builder.appendFraction(ChronoField.MICRO_OF_SECOND, 6, 6, false);
+                        } else {
+                            builder.appendFraction(ChronoField.MICRO_OF_SECOND, 1, 6, false);
+                        }
                         break;
                     case 'u': // %u Week (00..53), where Monday is the first day of the week
                         builder.appendValueReduced(ChronoField.ALIGNED_WEEK_OF_YEAR, 2, 2, 0);

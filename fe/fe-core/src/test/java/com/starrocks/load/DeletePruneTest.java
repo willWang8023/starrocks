@@ -1,10 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.load;
 
-import com.starrocks.analysis.DeleteStmt;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.sql.ast.DeleteStmt;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.Assert;
@@ -16,7 +29,7 @@ import java.util.List;
 public class DeletePruneTest {
     private static ConnectContext connectContext;
     private static StarRocksAssert starRocksAssert;
-    private static DeleteHandler deleteHandler;
+    private static DeleteMgr deleteHandler;
 
     @BeforeClass
     public static void beforeClass() throws Exception {
@@ -25,7 +38,7 @@ public class DeletePruneTest {
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
         starRocksAssert = new StarRocksAssert(connectContext);
-        deleteHandler = new DeleteHandler();
+        deleteHandler = new DeleteMgr();
 
         starRocksAssert.withDatabase("test").useDatabase("test")
                 .withTable("CREATE TABLE `test_delete` (\n" +
@@ -51,8 +64,7 @@ public class DeletePruneTest {
                         "DISTRIBUTED BY HASH(`k1`, `k2`, `k3`) BUCKETS 3 \n" +
                         "PROPERTIES (\n" +
                         "\"replication_num\" = \"1\",\n" +
-                        "\"in_memory\" = \"false\",\n" +
-                        "\"storage_format\" = \"V2\"\n" +
+                        "\"in_memory\" = \"false\"\n" +
                         ");")
                 .withTable("CREATE TABLE `test_delete2` (\n" +
                         "  `date` date NULL COMMENT \"\",\n" +

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/test/olap/rowset/segment_v2/bitmap_index_test.cpp
 
@@ -44,21 +57,25 @@ public:
 
 protected:
     void SetUp() override {
-        StoragePageCache::create_global_cache(&_tracker, 1000000000);
         _fs = std::make_shared<MemoryFileSystem>();
         ASSERT_TRUE(_fs->create_dir(kTestDir).ok());
-    }
-    void TearDown() override { StoragePageCache::release_global_cache(); }
 
-    void get_bitmap_reader_iter(std::string& file_name, const ColumnIndexMetaPB& meta, BitmapIndexReader** reader,
+        _opts.use_page_cache = true;
+        _opts.kept_in_memory = false;
+        _opts.stats = &_stats;
+    }
+    void TearDown() override { StoragePageCache::instance()->prune(); }
+
+    void get_bitmap_reader_iter(RandomAccessFile* rfile, const ColumnIndexMetaPB& meta, BitmapIndexReader** reader,
                                 BitmapIndexIterator** iter) {
+        _opts.read_file = rfile;
         *reader = new BitmapIndexReader();
-        ASSIGN_OR_ABORT(auto r, (*reader)->load(_fs.get(), file_name, meta.bitmap_index(), true, false));
+        ASSIGN_OR_ABORT(auto r, (*reader)->load(_opts, meta.bitmap_index()));
         ASSERT_TRUE(r);
-        ASSERT_OK((*reader)->new_iterator(iter));
+        ASSERT_OK((*reader)->new_iterator(_opts, iter));
     }
 
-    template <FieldType type>
+    template <LogicalType type>
     void write_index_file(std::string& filename, const void* values, size_t value_count, size_t null_count,
                           ColumnIndexMetaPB* meta) {
         TypeInfoPtr type_info = get_type_info(type);
@@ -76,8 +93,9 @@ protected:
     }
 
     std::shared_ptr<MemoryFileSystem> _fs = nullptr;
-    MemTracker _tracker;
     MemPool _pool;
+    IndexReadOptions _opts;
+    OlapReaderStatistics _stats;
 };
 
 TEST_F(BitmapIndexTest, test_invert) {
@@ -89,12 +107,12 @@ TEST_F(BitmapIndexTest, test_invert) {
 
     std::string file_name = kTestDir + "/invert";
     ColumnIndexMetaPB meta;
-    write_index_file<OLAP_FIELD_TYPE_INT>(file_name, val, num_uint8_rows, 0, &meta);
+    write_index_file<TYPE_INT>(file_name, val, num_uint8_rows, 0, &meta);
     {
-        std::unique_ptr<RandomAccessFile> rfile;
         BitmapIndexReader* reader = nullptr;
         BitmapIndexIterator* iter = nullptr;
-        get_bitmap_reader_iter(file_name, meta, &reader, &iter);
+        ASSIGN_OR_ABORT(auto rfile, _fs->new_random_access_file(file_name));
+        get_bitmap_reader_iter(rfile.get(), meta, &reader, &iter);
 
         int value = 2;
         bool exact_match;
@@ -143,12 +161,13 @@ TEST_F(BitmapIndexTest, test_invert_2) {
 
     std::string file_name = kTestDir + "/invert2";
     ColumnIndexMetaPB meta;
-    write_index_file<OLAP_FIELD_TYPE_INT>(file_name, val, num_uint8_rows, 0, &meta);
+    write_index_file<TYPE_INT>(file_name, val, num_uint8_rows, 0, &meta);
 
     {
         BitmapIndexReader* reader = nullptr;
         BitmapIndexIterator* iter = nullptr;
-        get_bitmap_reader_iter(file_name, meta, &reader, &iter);
+        ASSIGN_OR_ABORT(auto rfile, _fs->new_random_access_file(file_name));
+        get_bitmap_reader_iter(rfile.get(), meta, &reader, &iter);
 
         int value = 1026;
         bool exact_match;
@@ -170,7 +189,7 @@ TEST_F(BitmapIndexTest, test_invert_2) {
 
 TEST_F(BitmapIndexTest, test_multi_pages) {
     size_t num_uint8_rows = 1024 * 1024;
-    int64_t* val = new int64_t[num_uint8_rows];
+    auto* val = new int64_t[num_uint8_rows];
     for (int i = 0; i < num_uint8_rows; ++i) {
         val[i] = random() + 10000;
     }
@@ -178,11 +197,12 @@ TEST_F(BitmapIndexTest, test_multi_pages) {
 
     std::string file_name = kTestDir + "/mul";
     ColumnIndexMetaPB meta;
-    write_index_file<OLAP_FIELD_TYPE_BIGINT>(file_name, val, num_uint8_rows, 0, &meta);
+    write_index_file<TYPE_BIGINT>(file_name, val, num_uint8_rows, 0, &meta);
     {
         BitmapIndexReader* reader = nullptr;
         BitmapIndexIterator* iter = nullptr;
-        get_bitmap_reader_iter(file_name, meta, &reader, &iter);
+        ASSIGN_OR_ABORT(auto rfile, _fs->new_random_access_file(file_name));
+        get_bitmap_reader_iter(rfile.get(), meta, &reader, &iter);
 
         int64_t value = 2019;
         bool exact_match;
@@ -202,18 +222,19 @@ TEST_F(BitmapIndexTest, test_multi_pages) {
 
 TEST_F(BitmapIndexTest, test_null) {
     size_t num_uint8_rows = 1024;
-    int64_t* val = new int64_t[num_uint8_rows];
+    auto* val = new int64_t[num_uint8_rows];
     for (int i = 0; i < num_uint8_rows; ++i) {
         val[i] = i;
     }
 
     std::string file_name = kTestDir + "/null";
     ColumnIndexMetaPB meta;
-    write_index_file<OLAP_FIELD_TYPE_BIGINT>(file_name, val, num_uint8_rows, 30, &meta);
+    write_index_file<TYPE_BIGINT>(file_name, val, num_uint8_rows, 30, &meta);
     {
         BitmapIndexReader* reader = nullptr;
         BitmapIndexIterator* iter = nullptr;
-        get_bitmap_reader_iter(file_name, meta, &reader, &iter);
+        ASSIGN_OR_ABORT(auto rfile, _fs->new_random_access_file(file_name));
+        get_bitmap_reader_iter(rfile.get(), meta, &reader, &iter);
 
         Roaring bitmap;
         iter->read_null_bitmap(&bitmap);
@@ -227,15 +248,22 @@ TEST_F(BitmapIndexTest, test_null) {
 
 TEST_F(BitmapIndexTest, test_concurrent_load) {
     size_t num_uint8_rows = 1024;
-    int64_t* val = new int64_t[num_uint8_rows];
+    auto* val = new int64_t[num_uint8_rows];
     for (int i = 0; i < num_uint8_rows; ++i) {
         val[i] = i;
     }
 
     std::string file_name = kTestDir + "/null";
     ColumnIndexMetaPB meta;
-    write_index_file<OLAP_FIELD_TYPE_BIGINT>(file_name, val, num_uint8_rows, 30, &meta);
+    write_index_file<TYPE_BIGINT>(file_name, val, num_uint8_rows, 30, &meta);
 
+    IndexReadOptions opts;
+    ASSIGN_OR_ABORT(auto rfile, _fs->new_random_access_file(file_name))
+    opts.read_file = rfile.get();
+    opts.use_page_cache = true;
+    opts.kept_in_memory = false;
+    OlapReaderStatistics stats;
+    opts.stats = &stats;
     auto reader = std::make_unique<BitmapIndexReader>();
     std::atomic<int> count{0};
     std::atomic<int> loads{0};
@@ -247,7 +275,7 @@ TEST_F(BitmapIndexTest, test_concurrent_load) {
             while (count.load() < count) {
                 ;
             }
-            ASSIGN_OR_ABORT(auto first_load, reader->load(_fs.get(), file_name, meta.bitmap_index(), false, false));
+            ASSIGN_OR_ABORT(auto first_load, reader->load(opts, meta.bitmap_index()));
             loads.fetch_add(first_load);
         });
     }
@@ -257,7 +285,7 @@ TEST_F(BitmapIndexTest, test_concurrent_load) {
     ASSERT_EQ(1, loads.load());
 
     BitmapIndexIterator* iter = nullptr;
-    ASSERT_OK(reader->new_iterator(&iter));
+    ASSERT_OK(reader->new_iterator(opts, &iter));
 
     Roaring bitmap;
     iter->read_null_bitmap(&bitmap);

@@ -1,6 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "column/chunk.h"
+
+#include <utility>
 
 #include "column/column_helper.h"
 #include "column/datum_tuple.h"
@@ -11,11 +25,10 @@
 #include "simd/simd.h"
 #include "util/coding.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 Chunk::Chunk() {
     _slot_id_to_index.reserve(4);
-    _tuple_id_to_index.reserve(1);
 }
 
 Status Chunk::upgrade_if_overflow() {
@@ -55,24 +68,23 @@ bool Chunk::has_large_column() const {
     return false;
 }
 
-Chunk::Chunk(Columns columns, SchemaPtr schema) : _columns(std::move(columns)), _schema(std::move(schema)) {
+Chunk::Chunk(Columns columns, SchemaPtr schema) : Chunk(std::move(columns), std::move(schema), nullptr) {}
+
+// TODO: FlatMap don't support std::move
+Chunk::Chunk(Columns columns, SlotHashMap slot_map) : Chunk(std::move(columns), std::move(slot_map), nullptr) {}
+
+Chunk::Chunk(Columns columns, SchemaPtr schema, ChunkExtraDataPtr extra_data)
+        : _columns(std::move(columns)), _schema(std::move(schema)), _extra_data(std::move(extra_data)) {
     // bucket size cannot be 0.
     _cid_to_index.reserve(std::max<size_t>(1, columns.size() * 2));
     _slot_id_to_index.reserve(std::max<size_t>(1, _columns.size() * 2));
-    _tuple_id_to_index.reserve(1);
     rebuild_cid_index();
     check_or_die();
 }
 
 // TODO: FlatMap don't support std::move
-Chunk::Chunk(Columns columns, const SlotHashMap& slot_map) : _columns(std::move(columns)), _slot_id_to_index(slot_map) {
-    // when use _slot_id_to_index, we don't need to rebuild_cid_index
-    _tuple_id_to_index.reserve(1);
-}
-
-// TODO: FlatMap don't support std::move
-Chunk::Chunk(Columns columns, const SlotHashMap& slot_map, const TupleHashMap& tuple_map)
-        : _columns(std::move(columns)), _slot_id_to_index(slot_map), _tuple_id_to_index(tuple_map) {
+Chunk::Chunk(Columns columns, SlotHashMap slot_map, ChunkExtraDataPtr extra_data)
+        : _columns(std::move(columns)), _slot_id_to_index(std::move(slot_map)), _extra_data(std::move(extra_data)) {
     // when use _slot_id_to_index, we don't need to rebuild_cid_index
 }
 
@@ -81,6 +93,7 @@ void Chunk::reset() {
         c->reset_column();
     }
     _delete_state = DEL_NOT_SATISFIED;
+    _extra_data.reset();
 }
 
 void Chunk::swap_chunk(Chunk& other) {
@@ -88,13 +101,21 @@ void Chunk::swap_chunk(Chunk& other) {
     _schema.swap(other._schema);
     _cid_to_index.swap(other._cid_to_index);
     _slot_id_to_index.swap(other._slot_id_to_index);
-    _tuple_id_to_index.swap(other._tuple_id_to_index);
     std::swap(_delete_state, other._delete_state);
+    _extra_data.swap(other._extra_data);
 }
 
 void Chunk::set_num_rows(size_t count) {
     for (ColumnPtr& c : _columns) {
         c->resize(count);
+    }
+}
+
+void Chunk::update_rows(const Chunk& src, const uint32_t* indexes) {
+    DCHECK(_columns.size() == src.num_columns());
+    for (int i = 0; i < _columns.size(); i++) {
+        ColumnPtr& c = _columns[i];
+        c->update_rows(*src.columns()[i], indexes);
     }
 }
 
@@ -122,6 +143,11 @@ void Chunk::update_column(ColumnPtr column, SlotId slot_id) {
     check_or_die();
 }
 
+void Chunk::update_column_by_index(ColumnPtr column, size_t idx) {
+    _columns[idx] = std::move(column);
+    check_or_die();
+}
+
 void Chunk::insert_column(size_t idx, ColumnPtr column, const FieldPtr& field) {
     DCHECK_LT(idx, _columns.size());
     _columns.emplace(_columns.begin() + idx, std::move(column));
@@ -130,10 +156,10 @@ void Chunk::insert_column(size_t idx, ColumnPtr column, const FieldPtr& field) {
     check_or_die();
 }
 
-void Chunk::append_tuple_column(const ColumnPtr& column, TupleId tuple_id) {
-    _tuple_id_to_index[tuple_id] = _columns.size();
-    _columns.emplace_back(column);
-    check_or_die();
+void Chunk::append_default() {
+    for (const auto& column : _columns) {
+        column->append_default();
+    }
 }
 
 void Chunk::remove_column_by_index(size_t idx) {
@@ -145,13 +171,13 @@ void Chunk::remove_column_by_index(size_t idx) {
     }
 }
 
-void Chunk::remove_columns_by_index(const std::vector<size_t>& indexes) {
+[[maybe_unused]] void Chunk::remove_columns_by_index(const std::vector<size_t>& indexes) {
     DCHECK(std::is_sorted(indexes.begin(), indexes.end()));
-    for (int i = indexes.size(); i > 0; i--) {
+    for (size_t i = indexes.size(); i > 0; i--) {
         _columns.erase(_columns.begin() + indexes[i - 1]);
     }
     if (_schema != nullptr && !indexes.empty()) {
-        for (int i = indexes.size(); i > 0; i--) {
+        for (size_t i = indexes.size(); i > 0; i--) {
             _schema->remove(indexes[i - 1]);
         }
         rebuild_cid_index();
@@ -204,25 +230,14 @@ std::unique_ptr<Chunk> Chunk::clone_empty_with_schema(size_t size) const {
     return std::make_unique<Chunk>(columns, _schema);
 }
 
-std::unique_ptr<Chunk> Chunk::clone_empty_with_tuple() const {
-    return clone_empty_with_tuple(num_rows());
-}
-
-std::unique_ptr<Chunk> Chunk::clone_empty_with_tuple(size_t size) const {
-    Columns columns(_columns.size());
-    for (size_t i = 0; i < _columns.size(); ++i) {
-        columns[i] = _columns[i]->clone_empty();
-        columns[i]->reserve(size);
-    }
-    return std::make_unique<Chunk>(columns, _slot_id_to_index, _tuple_id_to_index);
-}
-
 std::unique_ptr<Chunk> Chunk::clone_unique() const {
-    std::unique_ptr<Chunk> chunk = clone_empty_with_tuple(0);
+    std::unique_ptr<Chunk> chunk = clone_empty(0);
     for (size_t idx = 0; idx < _columns.size(); idx++) {
         ColumnPtr column = _columns[idx]->clone_shared();
         chunk->_columns[idx] = std::move(column);
     }
+    chunk->_owner_info = _owner_info;
+    chunk->_extra_data = std::move(_extra_data);
     chunk->check_or_die();
     return chunk;
 }
@@ -286,13 +301,13 @@ size_t Chunk::container_memory_usage() const {
     return container_memory_usage;
 }
 
-size_t Chunk::element_memory_usage(size_t from, size_t size) const {
+size_t Chunk::reference_memory_usage(size_t from, size_t size) const {
     DCHECK_LE(from + size, num_rows()) << "Range error";
-    size_t element_memory_usage = 0;
+    size_t reference_memory_usage = 0;
     for (const auto& column : _columns) {
-        element_memory_usage += column->element_memory_usage(from, size);
+        reference_memory_usage += column->reference_memory_usage(from, size);
     }
-    return element_memory_usage;
+    return reference_memory_usage;
 }
 
 size_t Chunk::bytes_usage() const {
@@ -314,7 +329,6 @@ void Chunk::check_or_die() {
         CHECK(_schema == nullptr || _schema->fields().empty());
         CHECK(_cid_to_index.empty());
         CHECK(_slot_id_to_index.empty());
-        CHECK(_tuple_id_to_index.empty());
     } else {
         for (const ColumnPtr& c : _columns) {
             CHECK_EQ(num_rows(), c->size());
@@ -334,7 +348,7 @@ void Chunk::check_or_die() {
 }
 #endif
 
-std::string Chunk::debug_row(uint32_t index) const {
+std::string Chunk::debug_row(size_t index) const {
     std::stringstream os;
     os << "[";
     for (size_t col = 0; col < _columns.size() - 1; ++col) {
@@ -342,6 +356,18 @@ std::string Chunk::debug_row(uint32_t index) const {
         os << ", ";
     }
     os << _columns[_columns.size() - 1]->debug_item(index) << "]";
+    return os.str();
+}
+
+std::string Chunk::rebuild_csv_row(size_t index, const std::string& delimiter) const {
+    std::stringstream os;
+    for (size_t col = 0; col < _columns.size() - 1; ++col) {
+        os << _columns[col]->debug_item(index);
+        os << delimiter;
+    }
+    if (_columns.size() > 0) {
+        os << _columns[_columns.size() - 1]->debug_item(index);
+    }
     return os.str();
 }
 
@@ -409,4 +435,4 @@ bool Chunk::has_const_column() const {
     return false;
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

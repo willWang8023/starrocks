@@ -20,13 +20,20 @@ namespace starrocks {
 class Cache;
 class CacheKey;
 
+enum class ChargeMode {
+    // use value size as charge
+    VALUESIZE = 0,
+    // use allocator tracking size as charge
+    MEMSIZE = 1
+};
+
 // Create a new cache with a fixed size capacity.  This implementation
 // of Cache uses a least-recently-used eviction policy.
-extern Cache* new_lru_cache(size_t capacity);
+extern Cache* new_lru_cache(size_t capacity, ChargeMode charge_mode = ChargeMode::VALUESIZE);
 
 class CacheKey {
 public:
-    CacheKey() {}
+    CacheKey() = default;
     // Create a slice that refers to d[0,n-1].
     CacheKey(const char* d, size_t n) : _data(d), _size(n) {}
 
@@ -134,7 +141,7 @@ public:
     // value will be passed to "deleter".
     virtual Handle* insert(const CacheKey& key, void* value, size_t charge,
                            void (*deleter)(const CacheKey& key, void* value),
-                           CachePriority priority = CachePriority::NORMAL) = 0;
+                           CachePriority priority = CachePriority::NORMAL, size_t value_size = 0) = 0;
 
     // If the cache has no mapping for "key", returns NULL.
     //
@@ -176,8 +183,16 @@ public:
     // leveldb may change prune() to a pure abstract method.
     virtual void prune() {}
 
-    virtual size_t get_memory_usage() = 0;
     virtual void get_cache_status(rapidjson::Document* document) = 0;
+
+    virtual void set_capacity(size_t capacity) = 0;
+    virtual size_t get_capacity() const = 0;
+    virtual size_t get_memory_usage() const = 0;
+    virtual size_t get_lookup_count() const = 0;
+    virtual size_t get_hit_count() const = 0;
+
+    //  Decrease or increase cache capacity.
+    virtual bool adjust_capacity(int64_t delta, size_t min_capacity = 0) = 0;
 
 private:
     Cache(const Cache&) = delete;
@@ -198,6 +213,7 @@ typedef struct LRUHandle {
     uint32_t refs;
     uint32_t hash; // Hash of key(); used for fast sharding and comparisons
     CachePriority priority = CachePriority::NORMAL;
+    size_t value_size;
     char key_data[1]; // Beginning of key
 
     CacheKey key() const {
@@ -206,7 +222,7 @@ typedef struct LRUHandle {
         if (next == this) {
             return *(reinterpret_cast<CacheKey*>(value));
         } else {
-            return CacheKey(key_data, key_length);
+            return {key_data, key_length};
         }
     }
 
@@ -253,24 +269,26 @@ private:
 class LRUCache {
 public:
     LRUCache();
-    ~LRUCache();
+    ~LRUCache() noexcept;
 
     // Separate from constructor so caller can easily make an array of LRUCache
-    void set_capacity(size_t capacity) { _capacity = capacity; }
+    void set_capacity(size_t capacity);
+
+    void set_charge_mode(ChargeMode charge_mode);
 
     // Like Cache methods, but with an extra "hash" parameter.
     Cache::Handle* insert(const CacheKey& key, uint32_t hash, void* value, size_t charge,
                           void (*deleter)(const CacheKey& key, void* value),
-                          CachePriority priority = CachePriority::NORMAL);
+                          CachePriority priority = CachePriority::NORMAL, size_t value_size = 0);
     Cache::Handle* lookup(const CacheKey& key, uint32_t hash);
     void release(Cache::Handle* handle);
     void erase(const CacheKey& key, uint32_t hash);
     int prune();
 
-    uint64_t get_lookup_count() const { return _lookup_count; }
-    uint64_t get_hit_count() const { return _hit_count; }
-    size_t get_usage() const { return _usage; }
-    size_t get_capacity() const { return _capacity; }
+    uint64_t get_lookup_count() const;
+    uint64_t get_hit_count() const;
+    size_t get_usage() const;
+    size_t get_capacity() const;
 
 private:
     void _lru_remove(LRUHandle* e);
@@ -280,12 +298,13 @@ private:
     void _evict_one_entry(LRUHandle* e);
 
     // Initialized before use.
-    size_t _capacity;
+    size_t _capacity{0};
+
+    ChargeMode _charge_mode;
 
     // _mutex protects the following state.
-    std::mutex _mutex;
+    mutable std::mutex _mutex;
     size_t _usage{0};
-    uint64_t _last_id{0};
 
     // Dummy head of LRU list.
     // lru.prev is newest entry, lru.next is oldest entry.
@@ -303,10 +322,10 @@ static const int kNumShards = 1 << kNumShardBits;
 
 class ShardedLRUCache : public Cache {
 public:
-    explicit ShardedLRUCache(size_t capacity);
+    explicit ShardedLRUCache(size_t capacity, ChargeMode charge_mode = ChargeMode::VALUESIZE);
     ~ShardedLRUCache() override = default;
     Handle* insert(const CacheKey& key, void* value, size_t charge, void (*deleter)(const CacheKey& key, void* value),
-                   CachePriority priority = CachePriority::NORMAL) override;
+                   CachePriority priority = CachePriority::NORMAL, size_t value_size = 0) override;
     Handle* lookup(const CacheKey& key) override;
     void release(Handle* handle) override;
     void erase(const CacheKey& key) override;
@@ -314,16 +333,25 @@ public:
     Slice value_slice(Handle* handle) override;
     uint64_t new_id() override;
     void prune() override;
-    size_t get_memory_usage() override;
     void get_cache_status(rapidjson::Document* document) override;
+    void set_capacity(size_t capacity) override;
+    size_t get_memory_usage() const override;
+    size_t get_capacity() const override;
+    uint64_t get_lookup_count() const override;
+    uint64_t get_hit_count() const override;
+    bool adjust_capacity(int64_t delta, size_t min_capacity = 0) override;
 
 private:
     static uint32_t _hash_slice(const CacheKey& s);
     static uint32_t _shard(uint32_t hash);
+    void _set_capacity(size_t capacity);
+    size_t _get_stat(size_t (LRUCache::*mem_fun)() const) const;
 
     LRUCache _shards[kNumShards];
-    std::mutex _id_mutex;
+    std::mutex _mutex;
     uint64_t _last_id;
+    size_t _capacity;
+    ChargeMode _charge_mode;
 };
 
 } // namespace starrocks

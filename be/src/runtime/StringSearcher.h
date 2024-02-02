@@ -12,7 +12,6 @@
 #endif
 
 namespace starrocks {
-namespace vectorized {
 
 /** Variants for searching a substring in a string.
   * In most cases, performance is less than Volnitsky (see Volnitsky.h).
@@ -256,6 +255,4 @@ struct LibcASCIICaseSensitiveStringSearcher {
     }
 };
 
-} //namespace vectorized
-
-} //namespace starrocks
+} // namespace starrocks

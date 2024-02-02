@@ -1,20 +1,44 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.operator.scalar;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.starrocks.catalog.Type;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 
+import java.util.Comparator;
 import java.util.List;
+import java.util.Map;
 import java.util.Objects;
 
 public class LambdaFunctionOperator extends ScalarOperator {
 
     private List<ColumnRefOperator> refColumns;
     private ScalarOperator lambdaExpr;
+
+    public Map<ColumnRefOperator, ScalarOperator> getColumnRefMap() {
+        return columnRefMap;
+    }
+
+    // should be in order.
+    private final Map<ColumnRefOperator, ScalarOperator> columnRefMap =
+            Maps.newTreeMap(Comparator.comparing(ColumnRefOperator::getId));
 
     public LambdaFunctionOperator(List<ColumnRefOperator> refColumns, ScalarOperator lambdaExpr, Type retType) {
         super(OperatorType.LAMBDA_FUNCTION, retType);
@@ -28,6 +52,18 @@ public class LambdaFunctionOperator extends ScalarOperator {
 
     public ScalarOperator getLambdaExpr() {
         return lambdaExpr;
+    }
+
+    public void addColumnToExpr(Map<ColumnRefOperator, ScalarOperator> columnRefMap) {
+        this.columnRefMap.putAll(columnRefMap);
+    }
+
+    // array_map((x,y) -> x, arr1, arr2) can be reduced to arr1
+    public int canReduce() {
+        if (lambdaExpr.getOpType().equals(OperatorType.LAMBDA_ARGUMENT) && refColumns.contains(lambdaExpr)) {
+            return refColumns.indexOf(lambdaExpr) + 1;
+        }
+        return 0;
     }
 
     // only need to concern the lambda expression.
@@ -55,7 +91,7 @@ public class LambdaFunctionOperator extends ScalarOperator {
 
     @Override
     public String toString() {
-        return "(" + refColumns.toString() + "->" + lambdaExpr.toString()  + ")";
+        return "(" + refColumns.toString() + "->" + lambdaExpr.toString() + ")";
     }
 
     @Override
@@ -86,7 +122,10 @@ public class LambdaFunctionOperator extends ScalarOperator {
 
     @Override
     public ColumnRefSet getUsedColumns() {
-        return lambdaExpr.getUsedColumns();
+        ColumnRefSet usedCols = lambdaExpr.getUsedColumns();
+        columnRefMap.values().stream().forEach(e -> usedCols.union(e.getUsedColumns()));
+        usedCols.except(new ColumnRefSet(columnRefMap.keySet()));
+        return usedCols;
     }
 
     @Override

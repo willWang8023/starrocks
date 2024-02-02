@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -23,7 +35,7 @@ class PercentileValue;
 class JsonValue;
 } // namespace starrocks
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 typedef __int128 int128_t;
 typedef unsigned __int128 uint128_t;
@@ -31,9 +43,10 @@ typedef unsigned __int128 uint128_t;
 class Datum;
 using DatumArray = std::vector<Datum>;
 
-using DatumKey = std::variant<int8_t, uint8_t, int16_t, uint16_t, uint24_t, int32_t, uint32_t, int64_t, uint64_t,
-                              int96_t, int128_t, Slice, decimal12_t, DecimalV2Value, float, double>;
+using DatumKey = std::variant<std::monostate, int8_t, uint8_t, int16_t, uint16_t, uint24_t, int32_t, uint32_t, int64_t,
+                              uint64_t, int96_t, int128_t, Slice, decimal12_t, DecimalV2Value, float, double>;
 using DatumMap = std::map<DatumKey, Datum>;
+using DatumStruct = std::vector<Datum>;
 
 template <class... Ts>
 struct overloaded : Ts... {
@@ -48,7 +61,12 @@ public:
 
     template <typename T>
     Datum(T value) {
+        static_assert(!std::is_same_v<std::string, T>, "should use the Slice as parameter instead of std::string");
         set(value);
+    }
+
+    Datum(const DatumKey& datum_key) {
+        std::visit(overloaded{[this](auto& arg) { set<decltype(arg)>(arg); }}, datum_key);
     }
 
     int8_t get_int8() const { return get<int8_t>(); }
@@ -70,6 +88,8 @@ public:
     const decimal12_t& get_decimal12() const { return get<decimal12_t>(); }
     const DecimalV2Value& get_decimal() const { return get<DecimalV2Value>(); }
     const DatumArray& get_array() const { return get<DatumArray>(); }
+    const DatumMap& get_map() const { return get<DatumMap>(); }
+    const DatumStruct& get_struct() const { return get<DatumStruct>(); }
     const HyperLogLog* get_hyperloglog() const { return get<HyperLogLog*>(); }
     const BitmapValue* get_bitmap() const { return get<BitmapValue*>(); }
     const PercentileValue* get_percentile() const { return get<PercentileValue*>(); }
@@ -141,6 +161,9 @@ public:
     }
 
     DatumKey convert2DatumKey() const {
+        if (is_null()) {
+            return std::monostate();
+        }
         return std::visit(
                 overloaded{[](const int8_t& arg) { return DatumKey(arg); },
                            [](const uint8_t& arg) { return DatumKey(arg); },
@@ -161,6 +184,15 @@ public:
                 _value);
     }
 
+    template <typename T>
+    bool is_equal(const T& val) const {
+        return get<T>() == val;
+    }
+
+    bool equal_datum_key(const DatumKey& key) const {
+        return std::visit([&](const auto& arg) { return is_equal(arg); }, key);
+    }
+
 private:
     using Variant =
             std::variant<std::monostate, int8_t, uint8_t, int16_t, uint16_t, uint24_t, int32_t, uint32_t, int64_t,
@@ -173,4 +205,4 @@ static const Datum kNullDatum{};
 
 Datum convert2Datum(const DatumKey& key);
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -9,10 +21,7 @@ namespace starrocks {
 
 class EsPredicate;
 class ESScanReader;
-
-namespace vectorized {
 class ScrollParser;
-}
 
 namespace connector {
 
@@ -20,7 +29,7 @@ class ESConnector final : public Connector {
 public:
     ~ESConnector() override = default;
 
-    DataSourceProviderPtr create_data_source_provider(vectorized::ConnectorScanNode* scan_node,
+    DataSourceProviderPtr create_data_source_provider(ConnectorScanNode* scan_node,
                                                       const TPlanNode& plan_node) const override;
 
     ConnectorType connector_type() const override { return ConnectorType::ES; }
@@ -33,11 +42,13 @@ class ESDataSourceProvider final : public DataSourceProvider {
 public:
     ~ESDataSourceProvider() override = default;
     friend class ESDataSource;
-    ESDataSourceProvider(vectorized::ConnectorScanNode* scan_node, const TPlanNode& plan_node);
+    ESDataSourceProvider(ConnectorScanNode* scan_node, const TPlanNode& plan_node);
     DataSourcePtr create_data_source(const TScanRange& scan_range) override;
 
+    const TupleDescriptor* tuple_descriptor(RuntimeState* state) const override;
+
 protected:
-    vectorized::ConnectorScanNode* _scan_node;
+    ConnectorScanNode* _scan_node;
     const TEsScanNode _es_scan_node;
 };
 
@@ -46,9 +57,10 @@ public:
     ~ESDataSource() override = default;
 
     ESDataSource(const ESDataSourceProvider* provider, const TScanRange& scan_range);
+    std::string name() const override;
     Status open(RuntimeState* state) override;
     void close(RuntimeState* state) override;
-    Status get_next(RuntimeState* state, vectorized::ChunkPtr* chunk) override;
+    Status get_next(RuntimeState* state, ChunkPtr* chunk) override;
 
     int64_t raw_rows_read() const override;
     int64_t num_rows_read() const override;
@@ -68,6 +80,7 @@ private:
     std::map<std::string, std::string> _docvalue_context;
     std::map<std::string, std::string> _fields_context;
     std::vector<std::string> _column_names;
+    std::string _timezone;
 
     // predicate index in the conjuncts
     std::vector<int> _predicate_idx;
@@ -82,7 +95,7 @@ private:
     int64_t _cpu_time_ns = 0;
 
     ESScanReader* _es_reader = nullptr;
-    std::unique_ptr<vectorized::ScrollParser> _es_scroll_parser;
+    std::unique_ptr<ScrollParser> _es_scroll_parser;
 
     RuntimeProfile::Counter* _read_counter = nullptr;
     RuntimeProfile::Counter* _read_timer = nullptr;

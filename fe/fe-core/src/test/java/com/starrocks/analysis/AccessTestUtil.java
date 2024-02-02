@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/analysis/AccessTestUtil.java
 
@@ -34,12 +47,8 @@ import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.RandomDistributionInfo;
 import com.starrocks.catalog.SinglePartitionInfo;
 import com.starrocks.catalog.Type;
-import com.starrocks.common.AnalysisException;
-import com.starrocks.common.DdlException;
 import com.starrocks.common.jmockit.Deencapsulation;
 import com.starrocks.journal.JournalTask;
-import com.starrocks.mysql.privilege.Auth;
-import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.persist.EditLog;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
@@ -58,33 +67,6 @@ public class AccessTestUtil {
         return new SystemInfoService();
     }
 
-    public static Auth fetchAdminAccess() {
-        Auth auth = new Auth();
-        try {
-            new Expectations(auth) {
-                {
-                    auth.checkGlobalPriv((ConnectContext) any, (PrivPredicate) any);
-                    minTimes = 0;
-                    result = true;
-
-                    auth.checkDbPriv((ConnectContext) any, anyString, (PrivPredicate) any);
-                    minTimes = 0;
-                    result = true;
-
-                    auth.checkTblPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
-                    minTimes = 0;
-                    result = true;
-
-                    auth.setPassword((SetPassVar) any);
-                    minTimes = 0;
-                }
-            };
-        } catch (DdlException e) {
-            e.printStackTrace();
-        }
-        return auth;
-    }
-
     public static GlobalStateMgr fetchAdminCatalog() {
         GlobalStateMgr globalStateMgr = GlobalStateMgr.getCurrentState();
         BlockingQueue<JournalTask> journalQueue = new ArrayBlockingQueue<JournalTask>(100);
@@ -99,34 +81,14 @@ public class AccessTestUtil {
         Column column = new Column();
         baseSchema.add(column);
         OlapTable table = new OlapTable(30000, "testTbl", baseSchema,
-                KeysType.AGG_KEYS, new SinglePartitionInfo(), distributionInfo, globalStateMgr.getClusterId(),
+                KeysType.AGG_KEYS, new SinglePartitionInfo(), distributionInfo, globalStateMgr.getNodeMgr().getClusterId(),
                 null);
         table.setIndexMeta(baseIndex.getId(), "testTbl", baseSchema, 0, 1, (short) 1,
                 TStorageType.COLUMN, KeysType.AGG_KEYS);
         table.addPartition(partition);
         table.setBaseIndexId(baseIndex.getId());
-        db.createTable(table);
+        db.registerTableUnlocked(table);
         return globalStateMgr;
-    }
-
-    public static Auth fetchBlockAccess() {
-        Auth auth = new Auth();
-        new Expectations(auth) {
-            {
-                auth.checkGlobalPriv((ConnectContext) any, (PrivPredicate) any);
-                minTimes = 0;
-                result = false;
-
-                auth.checkDbPriv((ConnectContext) any, anyString, (PrivPredicate) any);
-                minTimes = 0;
-                result = false;
-
-                auth.checkTblPriv((ConnectContext) any, anyString, anyString, (PrivPredicate) any);
-                minTimes = 0;
-                result = false;
-            }
-        };
-        return auth;
     }
 
     public static OlapTable mockTable(String name) {
@@ -184,7 +146,7 @@ public class AccessTestUtil {
                 minTimes = 0;
                 result = null;
 
-                db.getTableNamesWithLock();
+                db.getTableNamesViewWithLock();
                 minTimes = 0;
                 result = Sets.newHashSet("testTable");
 
@@ -207,47 +169,30 @@ public class AccessTestUtil {
     }
 
     public static GlobalStateMgr fetchBlockCatalog() {
-        try {
-            GlobalStateMgr globalStateMgr = Deencapsulation.newInstance(GlobalStateMgr.class);
+        GlobalStateMgr globalStateMgr = Deencapsulation.newInstance(GlobalStateMgr.class);
 
-            Auth auth = fetchBlockAccess();
-            Database db = mockDb("testDb");
+        Database db = mockDb("testDb");
 
-            new Expectations(globalStateMgr) {
-                {
-                    globalStateMgr.getAuth();
-                    minTimes = 0;
-                    result = auth;
+        new Expectations(globalStateMgr) {
+            {
+                globalStateMgr.getDb("testDb");
+                minTimes = 0;
+                result = db;
 
-                    globalStateMgr.changeCatalogDb((ConnectContext) any, anyString);
-                    minTimes = 0;
-                    result = new DdlException("failed");
+                globalStateMgr.getDb("emptyDb");
+                minTimes = 0;
+                result = null;
 
-                    globalStateMgr.getDb("testDb");
-                    minTimes = 0;
-                    result = db;
+                globalStateMgr.getDb(anyString);
+                minTimes = 0;
+                result = new Database();
 
-                    globalStateMgr.getDb("emptyDb");
-                    minTimes = 0;
-                    result = null;
-
-                    globalStateMgr.getDb(anyString);
-                    minTimes = 0;
-                    result = new Database();
-
-                    globalStateMgr.getDbNames();
-                    minTimes = 0;
-                    result = Lists.newArrayList("testDb");
-
-                    globalStateMgr.getDb("emptyCluster");
-                    minTimes = 0;
-                    result = null;
-                }
-            };
-            return globalStateMgr;
-        } catch (DdlException e) {
-            return null;
-        }
+                globalStateMgr.getDb("emptyCluster");
+                minTimes = 0;
+                result = null;
+            }
+        };
+        return globalStateMgr;
     }
 
     public static Analyzer fetchAdminAnalyzer() {
@@ -262,10 +207,6 @@ public class AccessTestUtil {
                 minTimes = 0;
                 result = "testDb";
 
-                analyzer.getQualifiedUser();
-                minTimes = 0;
-                result = "testUser";
-
                 analyzer.incrementCallDepth();
                 minTimes = 0;
                 result = 1;
@@ -277,22 +218,6 @@ public class AccessTestUtil {
                 analyzer.getCallDepth();
                 minTimes = 0;
                 result = 1;
-            }
-        };
-        return analyzer;
-    }
-
-    public static Analyzer fetchBlockAnalyzer() throws AnalysisException {
-        Analyzer analyzer = new Analyzer(fetchBlockCatalog(), new ConnectContext(null));
-        new Expectations(analyzer) {
-            {
-                analyzer.getDefaultDb();
-                minTimes = 0;
-                result = "testCluster:testDb";
-
-                analyzer.getQualifiedUser();
-                minTimes = 0;
-                result = "testCluster:testUser";
             }
         };
         return analyzer;
@@ -367,7 +292,7 @@ public class AccessTestUtil {
                 minTimes = 0;
                 result = null;
 
-                db.getTableNamesWithLock();
+                db.getTableNamesViewWithLock();
                 minTimes = 0;
                 result = Sets.newHashSet("t");
 
@@ -397,10 +322,6 @@ public class AccessTestUtil {
                 analyzer.getTable((TableName) any);
                 minTimes = 0;
                 result = table;
-
-                analyzer.getQualifiedUser();
-                minTimes = 0;
-                result = "testUser";
 
                 analyzer.getCatalog();
                 minTimes = 0;

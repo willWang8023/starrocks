@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -27,7 +39,7 @@ public:
         return Status::OK();
     }
 
-    Slice build() override { return Slice(_buffer.data(), _buffer.size()); }
+    Slice build() override { return {_buffer.data(), _buffer.size()}; }
 
 private:
     enum { SIZE_OF_TYPE = sizeof(T) };
@@ -42,7 +54,7 @@ public:
     ~PlainEncoder() override = default;
 
     Status append(const uint8_t* vals, size_t count) override {
-        const Slice* slices = (const Slice*)vals;
+        const auto* slices = (const Slice*)vals;
         for (int i = 0; i < count; ++i) {
             put_fixed32_le(&_buffer, static_cast<uint32_t>(slices[i].size));
             _buffer.append(slices[i].data, slices[i].size);
@@ -50,7 +62,7 @@ public:
         return Status::OK();
     }
 
-    Slice build() override { return Slice(_buffer.data(), _buffer.size()); }
+    Slice build() override { return {_buffer.data(), _buffer.size()}; }
 
 private:
     faststring _buffer;
@@ -98,7 +110,7 @@ public:
         return Status::OK();
     }
 
-    Status next_batch(size_t count, ColumnContentType content_type, vectorized::Column* dst) override {
+    Status next_batch(size_t count, ColumnContentType content_type, Column* dst) override {
         size_t max_fetch = count * SIZE_OF_TYPE;
         if (max_fetch + _offset > _data.size) {
             return Status::InternalError(strings::Substitute(
@@ -107,6 +119,16 @@ public:
         auto n = dst->append_numbers(_data.data + _offset, max_fetch);
         CHECK_EQ(count, n);
         _offset += max_fetch;
+        return Status::OK();
+    }
+
+    Status skip(size_t values_to_skip) override {
+        size_t fetch_size = values_to_skip * SIZE_OF_TYPE;
+        if (fetch_size + _offset > _data.size) {
+            return Status::InternalError(strings::Substitute(
+                    "going to skip out-of-bounds data, offset=$0,skip=$1,size=$2", _offset, fetch_size, _data.size));
+        }
+        _offset += fetch_size;
         return Status::OK();
     }
 
@@ -146,7 +168,7 @@ public:
         return Status::OK();
     }
 
-    Status next_batch(size_t count, ColumnContentType content_type, vectorized::Column* dst) override {
+    Status next_batch(size_t count, ColumnContentType content_type, Column* dst) override {
         std::vector<Slice> slices;
         slices.reserve(count);
 
@@ -163,7 +185,26 @@ public:
             return Status::InternalError(strings::Substitute(
                     "going to read out-of-bounds data, offset=$0,count=$1,size=$2", _offset, count, _data.size));
         }
-        dst->append_strings(slices);
+        auto ret = dst->append_strings(slices);
+        if (UNLIKELY(!ret)) {
+            return Status::InternalError("PlainDecoder append strings to column failed");
+        }
+        return Status::OK();
+    }
+
+    Status skip(size_t values_to_skip) override {
+        size_t num_decoded = 0;
+        while (num_decoded < values_to_skip && _offset < _data.size) {
+            uint32_t length = decode_fixed32_le(reinterpret_cast<const uint8_t*>(_data.data) + _offset);
+            _offset += sizeof(int32_t);
+            _offset += length;
+            num_decoded++;
+        }
+        // unlikely happened
+        if (UNLIKELY(num_decoded < values_to_skip || _offset > _data.size)) {
+            return Status::InternalError(
+                    strings::Substitute("going to skip out-of-bounds data, offset=$0,size=$1", _offset, _data.size));
+        }
         return Status::OK();
     }
 
@@ -201,10 +242,11 @@ public:
 
     Status set_data(const Slice& data) override {
         _batched_bit_reader.reset(reinterpret_cast<const uint8_t*>(data.data), data.size);
+        _decoded_values_buffer.reset();
         return Status::OK();
     }
 
-    Status next_batch(size_t count, ColumnContentType content_type, vectorized::Column* dst) override {
+    Status next_batch(size_t count, ColumnContentType content_type, Column* dst) override {
         auto original_size = dst->size();
         dst->resize(original_size + count);
         auto num_unpacked_values = unpack_batch(count, dst->mutable_raw_data() + original_size);
@@ -213,6 +255,13 @@ public:
                     "going to read out-of-bounds data, count=$0,num_unpacked_values=$1", count, num_unpacked_values));
         }
         return Status::OK();
+    }
+
+    Status skip(size_t values_to_skip) override {
+        //TODO(Smith) still heavy work load
+        std::vector<uint8_t> tmp;
+        tmp.reserve(values_to_skip);
+        return next_batch(values_to_skip, tmp.data());
     }
 
     Status next_batch(size_t count, uint8_t* dst) override {
@@ -292,7 +341,7 @@ public:
     Status append(const uint8_t* vals, size_t count) override {
         if (count == 0) return Status::OK();
 
-        const Slice* slices = (const Slice*)vals;
+        const auto* slices = (const Slice*)vals;
         _buffer.reserve(_buffer.size() + count * slices[0].size);
         for (int i = 0; i < count; ++i) {
             DCHECK_EQ(slices[0].size, slices[i].size);
@@ -301,7 +350,7 @@ public:
         return Status::OK();
     }
 
-    Slice build() override { return Slice(_buffer.data(), _buffer.size()); }
+    Slice build() override { return {_buffer.data(), _buffer.size()}; }
 
 private:
     faststring _buffer;
@@ -318,7 +367,7 @@ public:
         return Status::OK();
     }
 
-    void set_type_legth(int32_t type_length) override { _type_length = type_length; }
+    void set_type_length(int32_t type_length) override { _type_length = type_length; }
 
     Status set_data(const Slice& data) override {
         _data = data;
@@ -326,19 +375,26 @@ public:
         return Status::OK();
     }
 
-    Status next_batch(size_t count, ColumnContentType content_type, vectorized::Column* dst) override {
+    Status next_batch(size_t count, ColumnContentType content_type, Column* dst) override {
         if (_offset + _type_length * count > _data.size) {
             return Status::InternalError(strings::Substitute(
                     "going to read out-of-bounds data, offset=$0,count=$1,size=$2", _offset, count, _data.size));
         }
-        std::vector<Slice> slices;
-        slices.resize(count);
-        for (int i = 0; i < count; ++i) {
-            slices[i] = Slice(_data.data + _offset, _type_length);
-            _offset += _type_length;
+        auto ret = dst->append_continuous_fixed_length_strings(_data.data + _offset, count, _type_length);
+        if (UNLIKELY(!ret)) {
+            return Status::InternalError("FLBAPlainDecoder append strings to column failed");
         }
+        _offset += count * _type_length;
+        return Status::OK();
+    }
 
-        dst->append_continuous_strings(slices);
+    Status skip(size_t values_to_skip) override {
+        if (_offset + _type_length * values_to_skip > _data.size) {
+            return Status::InternalError(
+                    strings::Substitute("going to skip out-of-bounds data, offset=$0,skip=$1,size=$2", _offset,
+                                        _type_length * values_to_skip, _data.size));
+        }
+        _offset += _type_length * values_to_skip;
         return Status::OK();
     }
 

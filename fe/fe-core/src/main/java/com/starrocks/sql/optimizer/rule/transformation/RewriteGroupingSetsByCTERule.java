@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -67,13 +80,13 @@ public class RewriteGroupingSetsByCTERule extends TransformationRule {
         OptExpression repeatOpt = input.inputAt(0);
 
         ColumnRefFactory columnRefFactory = context.getColumnRefFactory();
-        int cteId = columnRefFactory.getNextRelationId();
+        int cteId = context.getCteContext().getNextCteId();
         OptExpression cteProduce = OptExpression.create(new LogicalCTEProduceOperator(cteId), repeatOpt.getInputs());
 
         List<OptExpression> children = new ArrayList<>();
         List<List<ColumnRefOperator>> childOutputColumns = new ArrayList<>();
         LogicalRepeatOperator repeatOperator = (LogicalRepeatOperator) repeatOpt.getOp();
-        for (int i = 0;  i < repeatOperator.getRepeatColumnRef().size(); i++) {
+        for (int i = 0; i < repeatOperator.getRepeatColumnRef().size(); i++) {
             // create cte consume, cte output columns
             // output column -> old input column.
             List<ColumnRefOperator> groupingSetKeys = repeatOperator.getRepeatColumnRef().get(i);
@@ -167,7 +180,7 @@ public class RewriteGroupingSetsByCTERule extends TransformationRule {
         if (consumeOutputMap.isEmpty()) {
             List<ColumnRefOperator> outputColumns =
                     produceOperator.getOutputColumns(new ExpressionContext(cteProduce)).getStream().
-                            mapToObj(factory::getColumnRef).collect(Collectors.toList());
+                            map(factory::getColumnRef).collect(Collectors.toList());
             ColumnRefOperator smallestColumn = Utils.findSmallestColumnRef(outputColumns);
             ColumnRefOperator consumeOutput =
                     factory.create(smallestColumn, smallestColumn.getType(), smallestColumn.isNullable());

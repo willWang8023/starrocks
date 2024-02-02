@@ -1,8 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Strings;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.LikePredicate;
@@ -45,7 +59,7 @@ public class ShowLoadStmtAnalyzer {
         }
 
         @Override
-        public Void visitShowLoadStmt(ShowLoadStmt statement, ConnectContext context) {
+        public Void visitShowLoadStatement(ShowLoadStmt statement, ConnectContext context) {
             analyzeDbName(statement, context);
             analyzeWhereClause(statement, context);
             analyzeOrderByElements(statement, context);
@@ -56,7 +70,7 @@ public class ShowLoadStmtAnalyzer {
             String dbName = statement.getDbName();
             if (Strings.isNullOrEmpty(dbName)) {
                 dbName = context.getDatabase();
-                if (Strings.isNullOrEmpty(dbName)) {
+                if (Strings.isNullOrEmpty(dbName) && !statement.isAll()) {
                     ErrorReport.reportSemanticException(ErrorCode.ERR_NO_DB_ERROR);
                 }
             }
@@ -120,7 +134,7 @@ public class ShowLoadStmtAnalyzer {
             {
                 if (expr instanceof BinaryPredicate) {
                     BinaryPredicate binaryPredicate = (BinaryPredicate) expr;
-                    if (binaryPredicate.getOp() != BinaryPredicate.Operator.EQ) {
+                    if (binaryPredicate.getOp() != BinaryType.EQ) {
                         valid = false;
                         break CHECK;
                     }
@@ -188,7 +202,8 @@ public class ShowLoadStmtAnalyzer {
             if (!valid) {
                 ErrorReport.reportSemanticException(ErrorCode.ERR_COMMON_ERROR,
                         "Where clause should looks like: LABEL = \"your_load_label\","
-                                + " or LABEL LIKE \"matcher\", " + " or STATE = \"PENDING|ETL|LOADING|FINISHED|CANCELLED\", "
+                                + " or LABEL LIKE \"matcher\", "
+                                + " or STATE = \"PENDING|ETL|LOADING|FINISHED|CANCELLED|QUEUEING\", "
                                 + " or compound predicate with operator AND");
             }
         }

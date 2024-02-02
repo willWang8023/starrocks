@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/qe/QueryState.java
 
@@ -51,6 +64,12 @@ public class QueryState {
 
     public enum ErrType {
         ANALYSIS_ERR,
+        IGNORE_ERR,
+
+        INTERNAL_ERR,
+
+        IO_ERR,
+
         OTHER_ERR
     }
 
@@ -64,16 +83,22 @@ public class QueryState {
     private int warningRows = 0;
     // make it public for easy to use
     public int serverStatus = 0;
+    private boolean isFinished = false;
 
     public QueryState() {
     }
 
     public void reset() {
         stateType = MysqlStateType.OK;
+        errorMessage = "";
         errorCode = null;
         infoMessage = null;
-        serverStatus = 0;
+        errType = ErrType.OTHER_ERR;
         isQuery = false;
+        affectedRows = 0;
+        warningRows = 0;
+        serverStatus = 0;
+        isFinished = false;
     }
 
     public MysqlStateType getStateType() {
@@ -82,6 +107,7 @@ public class QueryState {
 
     public void setEof() {
         stateType = MysqlStateType.EOF;
+        isFinished = true;
     }
 
     public void setOk() {
@@ -93,11 +119,13 @@ public class QueryState {
         this.warningRows = warningRows;
         this.infoMessage = infoMessage;
         stateType = MysqlStateType.OK;
+        isFinished = true;
     }
 
     public void setError(String errorMsg) {
         this.stateType = MysqlStateType.ERR;
-        this.errorMessage = errorMsg;
+        this.setMsg(errorMsg);
+        isFinished = true;
     }
 
     public boolean isError() {
@@ -105,7 +133,7 @@ public class QueryState {
     }
 
     public boolean isRunning() {
-        return stateType == MysqlStateType.OK;
+        return !isFinished;
     }
 
     public void setStateType(MysqlStateType stateType) {
@@ -113,7 +141,7 @@ public class QueryState {
     }
 
     public void setMsg(String msg) {
-        this.errorMessage = msg;
+        this.errorMessage = msg == null ? "" : msg;
     }
 
     public void setErrType(ErrType errType) {
@@ -144,6 +172,10 @@ public class QueryState {
         return errorCode;
     }
 
+    public void setErrorCode(ErrorCode errorCode) {
+        this.errorCode = errorCode;
+    }
+
     public long getAffectedRows() {
         return affectedRows;
     }
@@ -168,6 +200,16 @@ public class QueryState {
                 break;
         }
         return packet;
+    }
+
+    public String toProfileString() {
+        if (stateType == MysqlStateType.ERR) {
+            return "Error";
+        } else if (isFinished) {
+            return "Finished";
+        } else {
+            return "Running";
+        }
     }
 
     @Override

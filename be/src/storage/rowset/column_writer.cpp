@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/segment_v2/column_writer.cpp
 
@@ -30,18 +43,21 @@
 #include "column/nullable_column.h"
 #include "common/logging.h"
 #include "fs/fs.h"
-#include "gen_cpp/segment.pb.h"
 #include "gutil/strings/substitute.h"
 #include "simd/simd.h"
+#include "storage/rowset/array_column_writer.h"
 #include "storage/rowset/bitmap_index_writer.h"
 #include "storage/rowset/bitshuffle_page.h"
 #include "storage/rowset/bloom_filter.h"
 #include "storage/rowset/bloom_filter_index_writer.h"
 #include "storage/rowset/encoding_info.h"
+#include "storage/rowset/json_column_writer.h"
+#include "storage/rowset/map_column_writer.h"
 #include "storage/rowset/options.h"
 #include "storage/rowset/ordinal_page_index.h"
 #include "storage/rowset/page_builder.h"
 #include "storage/rowset/page_io.h"
+#include "storage/rowset/struct_column_writer.h"
 #include "storage/rowset/zone_map_index.h"
 #include "util/compression/block_compression.h"
 #include "util/faststring.h"
@@ -67,7 +83,7 @@ using strings::Substitute;
 
 class ByteIterator {
 public:
-    ByteIterator(const uint8_t* bytes, size_t size) : _bytes(bytes), _size(size), _pos(0) {}
+    ByteIterator(const uint8_t* bytes, size_t size) : _bytes(bytes), _size(size) {}
 
     // Returns a pair consisting of the run length and the value of the run.
     std::pair<size_t, uint8_t> next() {
@@ -84,7 +100,7 @@ public:
 private:
     const uint8_t* _bytes;
     const size_t _size;
-    size_t _pos;
+    size_t _pos{0};
 };
 
 class NullMapRLEBuilder {
@@ -92,7 +108,7 @@ public:
     NullMapRLEBuilder() : _bitmap_buf(512), _rle_encoder(&_bitmap_buf, 1) {}
 
     explicit NullMapRLEBuilder(size_t reserve_bits)
-            : _has_null(false), _bitmap_buf(BitmapSize(reserve_bits)), _rle_encoder(&_bitmap_buf, 1) {}
+            : _bitmap_buf(BitmapSize(reserve_bits)), _rle_encoder(&_bitmap_buf, 1) {}
 
     void add_run(bool value, size_t run) {
         _has_null |= value;
@@ -125,7 +141,7 @@ public:
     explicit NullFlagsBuilder(NullEncodingPB null_encoding) : NullFlagsBuilder(32 * 1024, null_encoding) {}
 
     explicit NullFlagsBuilder(size_t reserve_bits, NullEncodingPB null_encoding)
-            : _has_null(false), _null_map(reserve_bits), _null_encoding(null_encoding) {}
+            : _null_map(reserve_bits), _null_encoding(null_encoding) {}
 
     void add_null_flags(const uint8_t* flags, size_t count) { _null_map.append(flags, count); }
 
@@ -143,8 +159,10 @@ public:
                                                  sizeof(uint8_t), 0);
             if (r < 0) {
                 LOG(ERROR) << "bitshuffle compress failed: " << bitshuffle_error_msg(r);
-                return OwnedSlice();
+                return {};
             }
+            // before build(), update buffer length to the actual compressed size
+            _encode_buf.resize(r);
             return _encode_buf.build();
         } else if (_null_encoding == NullEncodingPB::LZ4_NULL) {
             const BlockCompressionCodec* codec = nullptr;
@@ -152,7 +170,7 @@ public:
             Status status = get_block_compression_codec(type, &codec);
             if (!status.ok()) {
                 LOG(ERROR) << "get codec failed, fail to encode null flags";
-                return OwnedSlice();
+                return {};
             }
             _encode_buf.resize(codec->max_compressed_len(_null_map.size()));
             Slice origin_slice(_null_map);
@@ -160,14 +178,14 @@ public:
             status = codec->compress(origin_slice, &compressed_slice);
             if (!status.ok()) {
                 LOG(ERROR) << "compress null map failed";
-                return OwnedSlice();
+                return {};
             }
             // _encode_buf must be resize to compressed slice's size
             _encode_buf.resize(compressed_slice.get_size());
             return _encode_buf.build();
         } else {
             LOG(ERROR) << "invalid null encoding:" << _null_encoding;
-            return OwnedSlice();
+            return {};
         }
     }
 
@@ -197,30 +215,20 @@ private:
 
 class StringColumnWriter final : public ColumnWriter {
 public:
-    StringColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field,
+    StringColumnWriter(const ColumnWriterOptions& opts, TypeInfoPtr type_info,
                        std::unique_ptr<ScalarColumnWriter> column_writer);
 
     ~StringColumnWriter() override = default;
 
     Status init() override { return _scalar_column_writer->init(); };
 
-    Status append(const vectorized::Column& column) override;
-
-    Status append(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null) override {
-        // if column is Array<String>, encoding maybe not set
-        // check _is_speculated again to avoid _page_builder is not initialized
-        if (!_is_speculated) {
-            _scalar_column_writer->set_encoding(DEFAULT_ENCODING);
-            _is_speculated = true;
-        }
-        return _scalar_column_writer->append(data, null_flags, count, has_null);
-    };
+    Status append(const Column& column) override;
 
     // Speculate char/varchar encoding and reset encoding
-    void speculate_column_and_set_encoding(const vectorized::Column& column);
+    void speculate_column_and_set_encoding(const Column& column);
 
     // Speculate char/varchar encoding
-    EncodingTypePB speculate_string_encoding(const vectorized::BinaryColumn& bin_col);
+    EncodingTypePB speculate_string_encoding(const BinaryColumn& bin_col);
 
     Status finish_current_page() override { return _scalar_column_writer->finish_current_page(); };
 
@@ -241,91 +249,97 @@ public:
 
     uint64_t total_mem_footprint() const override { return _scalar_column_writer->total_mem_footprint(); }
 
-    Status check_string_lengths(const vectorized::Column& column);
+    Status check_string_lengths(const Column& column);
 
 private:
     std::unique_ptr<ScalarColumnWriter> _scalar_column_writer;
     bool _is_speculated = false;
-    vectorized::ColumnPtr _buf_column = nullptr;
+    ColumnPtr _buf_column = nullptr;
+};
+
+class DictColumnWriter final : public ColumnWriter {
+public:
+    DictColumnWriter(const ColumnWriterOptions& opts, TypeInfoPtr type_info,
+                     std::unique_ptr<ScalarColumnWriter> column_writer);
+
+    ~DictColumnWriter() override = default;
+
+    Status init() override { return _scalar_column_writer->init(); };
+
+    Status append(const Column& column) override;
+
+    // Speculate encoding and reset encoding
+    Status speculate_column_and_set_encoding(const Column& column);
+
+    // Speculate encoding
+    template <LogicalType Type>
+    inline EncodingTypePB speculate_encoding(const Column& column);
+
+    Status finish_current_page() override { return _scalar_column_writer->finish_current_page(); };
+
+    uint64_t estimate_buffer_size() override { return _scalar_column_writer->estimate_buffer_size(); };
+
+    // finish append data
+    Status finish() override;
+
+    Status write_data() override { return _scalar_column_writer->write_data(); };
+    Status write_ordinal_index() override { return _scalar_column_writer->write_ordinal_index(); };
+    Status write_zone_map() override { return _scalar_column_writer->write_zone_map(); };
+    Status write_bitmap_index() override { return _scalar_column_writer->write_bitmap_index(); };
+    Status write_bloom_filter_index() override { return _scalar_column_writer->write_bloom_filter_index(); };
+
+    ordinal_t get_next_rowid() const override { return _scalar_column_writer->get_next_rowid(); };
+
+    bool is_global_dict_valid() override { return _scalar_column_writer->is_global_dict_valid(); }
+
+    uint64_t total_mem_footprint() const override { return _scalar_column_writer->total_mem_footprint(); }
+
+private:
+    std::unique_ptr<ScalarColumnWriter> _scalar_column_writer;
+    bool _is_speculated = false;
+    ColumnPtr _buf_column = nullptr;
 };
 
 StatusOr<std::unique_ptr<ColumnWriter>> ColumnWriter::create(const ColumnWriterOptions& opts,
                                                              const TabletColumn* column, WritableFile* wfile) {
-    std::unique_ptr<Field> field(FieldFactory::create(*column));
-    DCHECK(field.get() != nullptr);
+    TypeInfoPtr type_info = get_type_info(*column);
+    DCHECK(type_info.get() != nullptr);
     if (is_string_type(delegate_type(column->type()))) {
-        std::unique_ptr<Field> field_clone(FieldFactory::create(*column));
         ColumnWriterOptions str_opts = opts;
         str_opts.need_speculate_encoding = true;
-        auto column_writer = std::make_unique<ScalarColumnWriter>(str_opts, std::move(field_clone), wfile);
-        return std::make_unique<StringColumnWriter>(str_opts, std::move(field), std::move(column_writer));
+        auto column_writer = std::make_unique<ScalarColumnWriter>(str_opts, type_info, wfile);
+        return std::make_unique<StringColumnWriter>(str_opts, std::move(type_info), std::move(column_writer));
+    } else if (enable_non_string_column_dict_encoding() &&
+               numeric_types_support_dict_encoding(delegate_type(column->type()))) {
+        DCHECK(column->type() != TYPE_VARCHAR);
+        DCHECK(column->type() != TYPE_CHAR);
+        ColumnWriterOptions dict_opts = opts;
+        dict_opts.need_speculate_encoding = true;
+        auto column_writer = std::make_unique<ScalarColumnWriter>(dict_opts, type_info, wfile);
+        return std::make_unique<DictColumnWriter>(dict_opts, std::move(type_info), std::move(column_writer));
+    } else if (column->type() == LogicalType::TYPE_JSON) {
+        auto column_writer = std::make_unique<ScalarColumnWriter>(opts, type_info, wfile);
+        return create_json_column_writer(opts, std::move(type_info), wfile, std::move(column_writer));
     } else if (is_scalar_field_type(delegate_type(column->type()))) {
-        return std::make_unique<ScalarColumnWriter>(opts, std::move(field), wfile);
+        return std::make_unique<ScalarColumnWriter>(opts, std::move(type_info), wfile);
     } else {
         switch (column->type()) {
-        case FieldType::OLAP_FIELD_TYPE_ARRAY: {
-            DCHECK(column->subcolumn_count() == 1);
-            const TabletColumn& element_column = column->subcolumn(0);
-            ColumnWriterOptions element_options;
-            element_options.meta = opts.meta->mutable_children_columns(0);
-            element_options.need_zone_map = false;
-            element_options.need_bloom_filter = element_column.is_bf_column();
-            element_options.need_bitmap_index = element_column.has_bitmap_index();
-            if (element_column.type() == FieldType::OLAP_FIELD_TYPE_ARRAY) {
-                if (element_options.need_bloom_filter) {
-                    return Status::NotSupported("Do not support bloom filter for array type");
-                }
-                if (element_options.need_bitmap_index) {
-                    return Status::NotSupported("Do not support bitmap index for array type");
-                }
-            }
-
-            ASSIGN_OR_RETURN(auto element_writer, ColumnWriter::create(element_options, &element_column, wfile));
-
-            std::unique_ptr<ScalarColumnWriter> null_writer = nullptr;
-            if (opts.meta->is_nullable()) {
-                ColumnWriterOptions null_options;
-                null_options.meta = opts.meta->add_children_columns();
-                null_options.meta->set_column_id(opts.meta->column_id());
-                null_options.meta->set_unique_id(opts.meta->unique_id());
-                null_options.meta->set_type(OLAP_FIELD_TYPE_BOOL);
-                null_options.meta->set_length(1);
-                null_options.meta->set_encoding(DEFAULT_ENCODING);
-                null_options.meta->set_compression(opts.meta->compression());
-                null_options.meta->set_is_nullable(false);
-                std::unique_ptr<Field> bool_field(FieldFactory::create_by_type(FieldType::OLAP_FIELD_TYPE_BOOL));
-                null_writer = std::make_unique<ScalarColumnWriter>(null_options, std::move(bool_field), wfile);
-            }
-
-            ColumnWriterOptions array_size_options;
-            array_size_options.meta = opts.meta->add_children_columns();
-            array_size_options.meta->set_column_id(opts.meta->column_id());
-            array_size_options.meta->set_unique_id(opts.meta->unique_id());
-            array_size_options.meta->set_type(OLAP_FIELD_TYPE_INT);
-            array_size_options.meta->set_length(4);
-            array_size_options.meta->set_encoding(DEFAULT_ENCODING);
-            array_size_options.meta->set_compression(opts.meta->compression());
-            array_size_options.meta->set_is_nullable(false);
-            array_size_options.need_zone_map = false;
-            array_size_options.need_bloom_filter = false;
-            array_size_options.need_bitmap_index = false;
-            std::unique_ptr<Field> bigint_field(FieldFactory::create_by_type(FieldType::OLAP_FIELD_TYPE_INT));
-            std::unique_ptr<ScalarColumnWriter> offset_writer =
-                    std::make_unique<ScalarColumnWriter>(array_size_options, std::move(bigint_field), wfile);
-            return std::make_unique<ArrayColumnWriter>(opts, std::move(field), std::move(null_writer),
-                                                       std::move(offset_writer), std::move(element_writer));
-        }
+        case LogicalType::TYPE_ARRAY:
+            return create_array_column_writer(opts, std::move(type_info), column, wfile);
+        case LogicalType::TYPE_MAP:
+            return create_map_column_writer(opts, std::move(type_info), column, wfile);
+        case LogicalType::TYPE_STRUCT:
+            return create_struct_column_writer(opts, std::move(type_info), column, wfile);
         default:
-            return Status::NotSupported("unsupported type for ColumnWriter: " + std::to_string(field->type()));
+            return Status::NotSupported("unsupported type for ColumnWriter: " + std::to_string(type_info->type()));
         }
     }
 }
 
 ///////////////////////////////////////////////////////////////////////////////////
 
-ScalarColumnWriter::ScalarColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field,
-                                       WritableFile* wfile)
-        : ColumnWriter(std::move(field), opts.meta->is_nullable()),
+ScalarColumnWriter::ScalarColumnWriter(const ColumnWriterOptions& opts, TypeInfoPtr type_info, WritableFile* wfile)
+        : ColumnWriter(std::move(type_info), opts.meta->length(), opts.meta->is_nullable()),
           _opts(opts),
           _wfile(wfile),
           _curr_page_format(_opts.page_format),
@@ -355,7 +369,8 @@ Status ScalarColumnWriter::init() {
     RETURN_IF_ERROR(get_block_compression_codec(_opts.meta->compression(), &_compress_codec));
 
     if (!_opts.need_speculate_encoding) {
-        set_encoding(_opts.meta->encoding());
+        auto st = set_encoding(_opts.meta->encoding());
+        CHECK(st.ok()) << st;
     }
     // create ordinal builder
     _ordinal_index_builder = std::make_unique<OrdinalIndexWriter>();
@@ -370,16 +385,15 @@ Status ScalarColumnWriter::init() {
     }
     if (_opts.need_zone_map) {
         _has_index_builder = true;
-        _zone_map_index_builder = ZoneMapIndexWriter::create(get_field());
+        _zone_map_index_builder = ZoneMapIndexWriter::create(type_info());
     }
     if (_opts.need_bitmap_index) {
         _has_index_builder = true;
-        RETURN_IF_ERROR(BitmapIndexWriter::create(get_field()->type_info(), &_bitmap_index_builder));
+        RETURN_IF_ERROR(BitmapIndexWriter::create(_type_info, &_bitmap_index_builder));
     }
     if (_opts.need_bloom_filter) {
         _has_index_builder = true;
-        RETURN_IF_ERROR(BloomFilterIndexWriter::create(BloomFilterOptions(), get_field()->type_info(),
-                                                       &_bloom_filter_index_builder));
+        RETURN_IF_ERROR(BloomFilterIndexWriter::create(BloomFilterOptions(), _type_info, &_bloom_filter_index_builder));
     }
     return Status::OK();
 }
@@ -431,7 +445,11 @@ Status ScalarColumnWriter::write_data() {
         PageFooterPB footer;
         footer.set_type(DICTIONARY_PAGE);
         footer.set_uncompressed_size(dict_body->size());
-        footer.mutable_dict_page_footer()->set_encoding(PLAIN_ENCODING);
+        if (_encoding_info->type() == TYPE_CHAR || _encoding_info->type() == TYPE_VARCHAR) {
+            footer.mutable_dict_page_footer()->set_encoding(PLAIN_ENCODING);
+        } else {
+            footer.mutable_dict_page_footer()->set_encoding(BIT_SHUFFLE);
+        }
 
         PagePointer dict_pp;
         std::vector<Slice> body{Slice(*dict_body)};
@@ -461,14 +479,14 @@ inline Status ScalarColumnWriter::set_encoding(const EncodingTypePB& encoding) {
         return Status::InternalError("reset encoding failed.");
     }
     PageBuilder* page_builder = nullptr;
-    RETURN_IF_ERROR(EncodingInfo::get(get_field()->type_info()->type(), encoding, &_encoding_info));
+    RETURN_IF_ERROR(EncodingInfo::get(type_info()->type(), encoding, &_encoding_info));
     _opts.meta->set_encoding(_encoding_info->encoding());
     PageBuilderOptions opts;
     opts.data_page_size = _opts.data_page_size;
     RETURN_IF_ERROR(_encoding_info->create_page_builder(opts, &page_builder));
     if (page_builder == nullptr) {
         return Status::NotSupported(strings::Substitute("Failed to create page builder for type $0 and encoding $1",
-                                                        get_field()->type(), _opts.meta->encoding()));
+                                                        type_info()->type(), _opts.meta->encoding()));
     }
     // should store more concrete encoding type instead of DEFAULT_ENCODING
     // because the default encoding of a data type can be changed in the future
@@ -607,23 +625,23 @@ Status ScalarColumnWriter::finish_current_page() {
     return Status::OK();
 }
 
-Status ScalarColumnWriter::append(const vectorized::Column& column) {
+Status ScalarColumnWriter::append(const Column& column) {
     _total_mem_footprint += column.byte_size();
 
     const uint8_t* ptr = column.raw_data();
     const uint8_t* null =
-            is_nullable() ? down_cast<const vectorized::NullableColumn*>(&column)->null_column()->raw_data() : nullptr;
+            is_nullable() ? down_cast<const NullableColumn*>(&column)->null_column()->raw_data() : nullptr;
     return append(ptr, null, column.size(), column.has_null());
 }
 
-Status ScalarColumnWriter::append_array_offsets(const vectorized::Column& column) {
+Status ScalarColumnWriter::append_array_offsets(const Column& column) {
     _total_mem_footprint += column.byte_size();
 
     // Write offset column, it's only used in ArrayColumn
     // [1, 2, 3], [4, 5, 6]
     // In memory, it will be transformed by actual offset(0, 3, 6)
     // In disk, offset is stored as length array(3, 3)
-    auto& offsets = down_cast<const vectorized::UInt32Column&>(column);
+    auto& offsets = down_cast<const UInt32Column&>(column);
     auto& data = offsets.get_data();
 
     std::vector<uint32_t> array_size;
@@ -633,8 +651,8 @@ Status ScalarColumnWriter::append_array_offsets(const vectorized::Column& column
         array_size[i] = data[i + 1] - data[i];
     }
 
-    const uint8_t* raw_data = reinterpret_cast<const uint8_t*>(array_size.data());
-    const size_t field_size = get_field()->size();
+    const auto* raw_data = reinterpret_cast<const uint8_t*>(array_size.data());
+    const size_t field_size = type_info()->size();
     size_t remaining = array_size.size();
     size_t offset_ordinal = 0;
     while (remaining > 0) {
@@ -656,34 +674,8 @@ Status ScalarColumnWriter::append_array_offsets(const vectorized::Column& column
     return Status::OK();
 }
 
-Status ScalarColumnWriter::append_array_offsets(const uint8_t* data, const uint8_t* null_flags, size_t count,
-                                                bool has_null) {
-    const size_t field_size = get_field()->size();
-    size_t remaining = count;
-    size_t offset_ordinal = 0;
-    while (remaining > 0) {
-        bool page_full = false;
-        size_t num_written = 0;
-        num_written = _page_builder->add(data, remaining);
-        page_full = num_written < remaining;
-        _next_rowid += num_written;
-        if (page_full) {
-            RETURN_IF_ERROR(finish_current_page());
-            _element_ordinal = _previous_ordinal;
-        }
-        const uint32_t* array_size = reinterpret_cast<const uint32_t*>(data) + offset_ordinal;
-        for (size_t i = 0; i < num_written; ++i) {
-            _previous_ordinal += *(array_size + i);
-        }
-        offset_ordinal += num_written;
-        data += field_size * num_written;
-        remaining -= num_written;
-    }
-    return Status::OK();
-}
-
 Status ScalarColumnWriter::append(const uint8_t* data, const uint8_t* null_flags, size_t count, bool has_null) {
-    const size_t field_size = get_field()->size();
+    const size_t field_size = type_info()->size();
     size_t remaining = count;
     while (remaining > 0) {
         bool page_full = false;
@@ -739,7 +731,7 @@ Status ScalarColumnWriter::append(const uint8_t* data, const uint8_t* null_flags
                     INDEX_ADD_VALUES(_bitmap_index_builder, pdata, run);
                     INDEX_ADD_VALUES(_bloom_filter_index_builder, pdata, run);
                 }
-                pdata += get_field()->size() * run;
+                pdata += type_info()->size() * run;
             }
         } else {
             INDEX_ADD_VALUES(_zone_map_index_builder, data, num_written);
@@ -760,144 +752,12 @@ Status ScalarColumnWriter::append(const uint8_t* data, const uint8_t* null_flags
 
 ////////////////////////////////////////////////////////////////////////////////
 
-ArrayColumnWriter::ArrayColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field,
-                                     std::unique_ptr<ScalarColumnWriter> null_writer,
-                                     std::unique_ptr<ScalarColumnWriter> offset_writer,
-                                     std::unique_ptr<ColumnWriter> element_writer)
-        : ColumnWriter(std::move(field), opts.meta->is_nullable()),
-          _opts(opts),
-          _null_writer(std::move(null_writer)),
-          _array_size_writer(std::move(offset_writer)),
-          _element_writer(std::move(element_writer)) {}
-
-Status ArrayColumnWriter::init() {
-    if (is_nullable()) {
-        RETURN_IF_ERROR(_null_writer->init());
-    }
-    RETURN_IF_ERROR(_array_size_writer->init());
-    RETURN_IF_ERROR(_element_writer->init());
-
-    return Status::OK();
-}
-
-Status ArrayColumnWriter::append(const vectorized::Column& column) {
-    const vectorized::ArrayColumn* array_column = nullptr;
-    vectorized::NullColumn* null_column = nullptr;
-    if (is_nullable()) {
-        const auto& nullable_column = down_cast<const vectorized::NullableColumn&>(column);
-        array_column = down_cast<vectorized::ArrayColumn*>(nullable_column.data_column().get());
-        null_column = down_cast<vectorized::NullColumn*>(nullable_column.null_column().get());
-    } else {
-        array_column = down_cast<const vectorized::ArrayColumn*>(&column);
-    }
-
-    // 1. Write null column when necessary
-    if (is_nullable()) {
-        RETURN_IF_ERROR(_null_writer->append(*null_column));
-    }
-
-    // 2. Write offset column
-    RETURN_IF_ERROR(_array_size_writer->append_array_offsets(array_column->offsets()));
-
-    // 3. writer elements column recursively
-    RETURN_IF_ERROR(_element_writer->append(array_column->elements()));
-
-    return Status::OK();
-}
-
-Status ArrayColumnWriter::append(const uint8_t* data, const uint8_t* null_map, size_t count, bool has_null) {
-    const Collection* collection = reinterpret_cast<const Collection*>(data);
-    // 1. Write null column when necessary
-    if (is_nullable()) {
-        _null_writer->append(null_map, nullptr, count, false);
-    }
-
-    // 2. Write offset column
-    uint32_t array_size = collection->length;
-    RETURN_IF_ERROR(_array_size_writer->append_array_offsets(reinterpret_cast<const uint8_t*>(&array_size), nullptr,
-                                                             count, false));
-
-    // 3. writer elements column one by one
-    const uint8_t* element_data = reinterpret_cast<const uint8_t*>(collection->data);
-    if (collection->has_null) {
-        for (size_t i = 0; i < collection->length; ++i) {
-            RETURN_IF_ERROR(
-                    _element_writer->append(element_data, &(collection->null_signs[i]), 1, collection->has_null));
-            element_data += _element_writer->get_field()->size();
-        }
-    } else {
-        for (size_t i = 0; i < collection->length; ++i) {
-            RETURN_IF_ERROR(_element_writer->append(element_data, nullptr, 1, false));
-            element_data = element_data + _element_writer->get_field()->size();
-        }
-    }
-    return Status::OK();
-}
-
-uint64_t ArrayColumnWriter::estimate_buffer_size() {
-    size_t estimate_size = _array_size_writer->estimate_buffer_size() + _element_writer->estimate_buffer_size();
-    if (is_nullable()) {
-        estimate_size += _null_writer->estimate_buffer_size();
-    }
-    return estimate_size;
-}
-
-Status ArrayColumnWriter::finish() {
-    if (is_nullable()) {
-        RETURN_IF_ERROR(_null_writer->finish());
-    }
-    RETURN_IF_ERROR(_array_size_writer->finish());
-    RETURN_IF_ERROR(_element_writer->finish());
-
-    _opts.meta->set_num_rows(get_next_rowid());
-    _opts.meta->set_total_mem_footprint(total_mem_footprint());
-    return Status::OK();
-}
-
-uint64_t ArrayColumnWriter::total_mem_footprint() const {
-    uint64_t total_mem_footprint = 0;
-    if (is_nullable()) {
-        total_mem_footprint += _null_writer->total_mem_footprint();
-    }
-    total_mem_footprint += _array_size_writer->total_mem_footprint();
-    total_mem_footprint += _element_writer->total_mem_footprint();
-    return total_mem_footprint;
-}
-
-Status ArrayColumnWriter::write_data() {
-    if (is_nullable()) {
-        RETURN_IF_ERROR(_null_writer->write_data());
-    }
-    RETURN_IF_ERROR(_array_size_writer->write_data());
-    RETURN_IF_ERROR(_element_writer->write_data());
-    return Status::OK();
-}
-
-Status ArrayColumnWriter::write_ordinal_index() {
-    if (is_nullable()) {
-        RETURN_IF_ERROR(_null_writer->write_ordinal_index());
-    }
-    RETURN_IF_ERROR(_array_size_writer->write_ordinal_index());
-    RETURN_IF_ERROR(_element_writer->write_ordinal_index());
-    return Status::OK();
-}
-
-Status ArrayColumnWriter::finish_current_page() {
-    if (is_nullable()) {
-        RETURN_IF_ERROR(_null_writer->finish_current_page());
-    }
-    RETURN_IF_ERROR(_array_size_writer->finish_current_page());
-    RETURN_IF_ERROR(_element_writer->finish_current_page());
-    return Status::OK();
-}
-
-////////////////////////////////////////////////////////////////////////////////
-
-StringColumnWriter::StringColumnWriter(const ColumnWriterOptions& opts, std::unique_ptr<Field> field,
+StringColumnWriter::StringColumnWriter(const ColumnWriterOptions& opts, TypeInfoPtr type_info,
                                        std::unique_ptr<ScalarColumnWriter> column_writer)
-        : ColumnWriter(std::move(field), opts.meta->is_nullable()), _scalar_column_writer(std::move(column_writer)) {}
+        : ColumnWriter(std::move(type_info), opts.meta->length(), opts.meta->is_nullable()),
+          _scalar_column_writer(std::move(column_writer)) {}
 
-Status StringColumnWriter::append(const vectorized::Column& column) {
+Status StringColumnWriter::append(const Column& column) {
     if (config::enable_check_string_lengths) {
         RETURN_IF_ERROR(check_string_lengths(column));
     }
@@ -906,8 +766,9 @@ Status StringColumnWriter::append(const vectorized::Column& column) {
     }
 
     if (_buf_column == nullptr) {
-        // first column size is greater than speculate size
-        if (column.size() >= config::dictionary_speculate_min_chunk_size) {
+        // First column size is greater than speculate size or byte size large than UINT32_MAX.
+        // Because if columns' byte size than UINT32_MAX, that will cause BinaryColumn<uint32_t> overflow
+        if (column.size() >= config::dictionary_speculate_min_chunk_size || column.byte_size() >= UINT32_MAX) {
             _is_speculated = true;
             speculate_column_and_set_encoding(column);
             return _scalar_column_writer->append(column);
@@ -917,34 +778,37 @@ Status StringColumnWriter::append(const vectorized::Column& column) {
             return Status::OK();
         }
     }
-    _buf_column->append(column, 0, column.size());
-    if (_buf_column->size() < config::dictionary_speculate_min_chunk_size) {
-        return Status::OK();
-    } else {
+    if (column.size() + _buf_column->size() >= config::dictionary_speculate_min_chunk_size ||
+        column.byte_size() + _buf_column->byte_size() >= UINT32_MAX) {
+        // If it is predicted that _buf_column will exceed the limit after append column,
+        // skip append column
         _is_speculated = true;
         speculate_column_and_set_encoding(*_buf_column);
-        Status st = _scalar_column_writer->append(*_buf_column);
+        RETURN_IF_ERROR(_scalar_column_writer->append(*_buf_column));
         _buf_column.reset();
-        return st;
+        RETURN_IF_ERROR(_scalar_column_writer->append(column));
+    } else {
+        _buf_column->append(column, 0, column.size());
     }
+    return Status::OK();
 }
 
-inline void StringColumnWriter::speculate_column_and_set_encoding(const vectorized::Column& column) {
+inline void StringColumnWriter::speculate_column_and_set_encoding(const Column& column) {
+    Status st;
     if (column.is_nullable()) {
-        const auto& data_col = down_cast<const vectorized::NullableColumn&>(column).data_column();
-        const auto& bin_col = down_cast<vectorized::BinaryColumn&>(*data_col);
+        const auto& data_col = down_cast<const NullableColumn&>(column).data_column();
+        const auto& bin_col = down_cast<BinaryColumn&>(*data_col);
         const auto detect_encoding = speculate_string_encoding(bin_col);
-        _scalar_column_writer->set_encoding(detect_encoding);
+        st = _scalar_column_writer->set_encoding(detect_encoding);
     } else if (column.is_binary()) {
-        const auto& bin_col = down_cast<const vectorized::BinaryColumn&>(column);
+        const auto& bin_col = down_cast<const BinaryColumn&>(column);
         auto detect_encoding = speculate_string_encoding(bin_col);
-        _scalar_column_writer->set_encoding(detect_encoding);
+        st = _scalar_column_writer->set_encoding(detect_encoding);
     }
+    CHECK(st.ok()) << st;
 }
 
-inline EncodingTypePB StringColumnWriter::speculate_string_encoding(const vectorized::BinaryColumn& bin_col) {
-    const size_t dictionary_min_rowcount = 256;
-
+inline EncodingTypePB StringColumnWriter::speculate_string_encoding(const BinaryColumn& bin_col) {
     auto row_count = bin_col.size();
     auto ratio = config::dictionary_encoding_ratio;
     auto max_card = static_cast<size_t>(static_cast<double>(row_count) * ratio);
@@ -952,7 +816,7 @@ inline EncodingTypePB StringColumnWriter::speculate_string_encoding(const vector
     if (row_count > dictionary_min_rowcount) {
         phmap::flat_hash_set<size_t> hash_set;
         for (size_t i = 0; i < row_count; i++) {
-            size_t hash = vectorized::SliceHash()(bin_col.get_slice(i));
+            size_t hash = SliceHash()(bin_col.get_slice(i));
             hash_set.insert(hash);
             if (hash_set.size() > max_card) {
                 return PLAIN_ENCODING;
@@ -981,22 +845,22 @@ Status StringColumnWriter::finish() {
     return _scalar_column_writer->finish();
 }
 
-Status StringColumnWriter::check_string_lengths(const vectorized::Column& column) {
-    size_t limit = get_field()->length();
+Status StringColumnWriter::check_string_lengths(const Column& column) {
+    size_t limit = length();
     auto row_count = column.size();
     const uint8_t* null =
-            is_nullable() ? down_cast<const vectorized::NullableColumn*>(&column)->null_column()->raw_data() : nullptr;
-    const vectorized::BinaryColumn* bin_col;
+            is_nullable() ? down_cast<const NullableColumn*>(&column)->null_column()->raw_data() : nullptr;
+    const BinaryColumn* bin_col;
 
     if (is_nullable()) {
-        const auto& data_col = down_cast<const vectorized::NullableColumn*>(&column)->data_column();
-        bin_col = down_cast<const vectorized::BinaryColumn*>(data_col.get());
+        const auto& data_col = down_cast<const NullableColumn*>(&column)->data_column();
+        bin_col = down_cast<const BinaryColumn*>(data_col.get());
     } else {
-        bin_col = down_cast<const vectorized::BinaryColumn*>(&column);
+        bin_col = down_cast<const BinaryColumn*>(&column);
     }
     for (size_t i = 0; i < row_count; i++) {
         // skip string length check if it is null
-        if (null != nullptr && null[i] == starrocks::vectorized::DATUM_NULL) {
+        if (null != nullptr && null[i] == starrocks::DATUM_NULL) {
             continue;
         }
         // here we shouldn't use raw_data() api of column to get a vector of slices in advance,
@@ -1005,10 +869,139 @@ Status StringColumnWriter::check_string_lengths(const vectorized::Column& column
         Slice slice = bin_col->get_slice(i);
         if (slice.get_size() > limit) {
             return Status::InvalidArgument(fmt::format("string length({}) > limit({}), string: {}", slice.get_size(),
-                                                       limit, slice.get_data()));
+                                                       limit, slice.to_string()));
         }
     }
     return Status::OK();
+}
+
+DictColumnWriter::DictColumnWriter(const ColumnWriterOptions& opts, TypeInfoPtr type_info,
+                                   std::unique_ptr<ScalarColumnWriter> column_writer)
+        : ColumnWriter(std::move(type_info), opts.meta->length(), opts.meta->is_nullable()),
+          _scalar_column_writer(std::move(column_writer)) {}
+
+Status DictColumnWriter::append(const Column& column) {
+    if (_is_speculated) {
+        return _scalar_column_writer->append(column);
+    }
+
+    if (_buf_column == nullptr) {
+        // First column size is greater than speculate size or byte size large than UINT32_MAX.
+        // Because if columns' byte size than UINT32_MAX, that will cause BinaryColumn<uint32_t> overflow
+        if (column.size() >= config::dictionary_speculate_min_chunk_size || column.byte_size() >= UINT32_MAX) {
+            _is_speculated = true;
+            RETURN_IF_ERROR(speculate_column_and_set_encoding(column));
+            return _scalar_column_writer->append(column);
+        } else {
+            _buf_column = column.clone_empty();
+            _buf_column->append(column, 0, column.size());
+            return Status::OK();
+        }
+    }
+    if (column.size() + _buf_column->size() >= config::dictionary_speculate_min_chunk_size ||
+        column.byte_size() + _buf_column->byte_size() >= UINT32_MAX) {
+        // If it is predicted that _buf_column will exceed the limit after append column,
+        // skip append column
+        _is_speculated = true;
+        RETURN_IF_ERROR(speculate_column_and_set_encoding(*_buf_column));
+        RETURN_IF_ERROR(_scalar_column_writer->append(*_buf_column));
+        _buf_column.reset();
+        RETURN_IF_ERROR(_scalar_column_writer->append(column));
+    } else {
+        _buf_column->append(column, 0, column.size());
+    }
+    return Status::OK();
+}
+
+inline Status DictColumnWriter::speculate_column_and_set_encoding(const Column& column) {
+    Status st;
+    EncodingTypePB detect_encoding;
+    LogicalType logicalType = delegate_type(type_info()->type());
+    switch (logicalType) {
+    case TYPE_SMALLINT:
+        detect_encoding = speculate_encoding<TYPE_SMALLINT>(column);
+        break;
+    case TYPE_INT:
+        detect_encoding = speculate_encoding<TYPE_INT>(column);
+        break;
+    case TYPE_BIGINT:
+        detect_encoding = speculate_encoding<TYPE_BIGINT>(column);
+        break;
+    case TYPE_LARGEINT:
+        detect_encoding = speculate_encoding<TYPE_LARGEINT>(column);
+        break;
+    case TYPE_FLOAT:
+        detect_encoding = speculate_encoding<TYPE_FLOAT>(column);
+        break;
+    case TYPE_DOUBLE:
+        detect_encoding = speculate_encoding<TYPE_DOUBLE>(column);
+        break;
+    case TYPE_DATE:
+        detect_encoding = speculate_encoding<TYPE_DATE>(column);
+        break;
+    case TYPE_DATETIME:
+        detect_encoding = speculate_encoding<TYPE_DATETIME>(column);
+        break;
+    case TYPE_DECIMALV2:
+        detect_encoding = speculate_encoding<TYPE_DECIMALV2>(column);
+        break;
+    default:
+        return Status::InternalError(strings::Substitute("$0 type should not use dictionary encoding", logicalType));
+    }
+    st = _scalar_column_writer->set_encoding(detect_encoding);
+    CHECK(st.ok()) << st;
+    return st;
+}
+
+// The detection logic here uses a set to record the distinct values of a sample column. When the number
+// of distinct values exceeds row_count * ratio, dictionary encoding is no longer used.
+// Here, row_count is the number of elements in the sample column, and ratio is set by the user.
+template <LogicalType Type>
+inline EncodingTypePB DictColumnWriter::speculate_encoding(const Column& column) {
+    using ColumnType = typename RunTimeTypeTraits<Type>::ColumnType;
+    const ColumnType* numerical_col;
+    if (column.is_nullable()) {
+        const auto& data_col = down_cast<const NullableColumn&>(column).data_column();
+        numerical_col = &down_cast<ColumnType&>(*data_col);
+    } else {
+        numerical_col = &down_cast<const ColumnType&>(column);
+    }
+
+    auto row_count = numerical_col->size();
+    auto ratio = config::dictionary_encoding_ratio_for_non_string_column;
+    auto max_card = static_cast<size_t>(static_cast<double>(row_count) * ratio);
+
+    if (row_count > dictionary_min_rowcount) {
+        using CppType = typename RunTimeTypeTraits<Type>::CppType;
+        phmap::flat_hash_set<CppType> hash_set;
+        for (size_t i = 0; i < row_count; i++) {
+            CppType value = numerical_col->get_data()[i];
+            hash_set.insert(value);
+            if (hash_set.size() > max_card) {
+                return BIT_SHUFFLE;
+            }
+        }
+    }
+
+    return DICT_ENCODING;
+}
+
+Status DictColumnWriter::finish() {
+    if (_is_speculated) {
+        return _scalar_column_writer->finish();
+    }
+
+    _is_speculated = true;
+    if (_buf_column != nullptr) {
+        RETURN_IF_ERROR(speculate_column_and_set_encoding(*_buf_column));
+        Status st = _scalar_column_writer->append(*_buf_column);
+        _buf_column.reset();
+        if (!st.ok()) {
+            return st;
+        }
+    }
+
+    return _scalar_column_writer->finish();
 }
 
 } // namespace starrocks

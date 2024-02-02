@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/TimestampArithmeticExpr.java
 
@@ -25,6 +38,7 @@ import com.google.common.base.Preconditions;
 import com.starrocks.analysis.ArithmeticExpr.Operator;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
 
@@ -57,6 +71,11 @@ public class TimestampArithmeticExpr extends Expr {
 
     // C'tor for function-call like arithmetic, e.g., 'date_add(a, interval b year)'.
     public TimestampArithmeticExpr(String funcName, Expr e1, Expr e2, String timeUnitIdent) {
+        this(funcName, e1, e2, timeUnitIdent, NodePosition.ZERO);
+    }
+
+    public TimestampArithmeticExpr(String funcName, Expr e1, Expr e2, String timeUnitIdent, NodePosition pos) {
+        super(pos);
         this.funcName = funcName.toLowerCase();
         this.timeUnitIdent = timeUnitIdent;
         this.intervalFirst = false;
@@ -69,6 +88,12 @@ public class TimestampArithmeticExpr extends Expr {
     // to the time value (even in the interval-first case).
     public TimestampArithmeticExpr(ArithmeticExpr.Operator op, Expr e1, Expr e2,
                                    String timeUnitIdent, boolean intervalFirst) {
+        this(op, e1, e2, timeUnitIdent, intervalFirst, NodePosition.ZERO);
+    }
+
+    public TimestampArithmeticExpr(ArithmeticExpr.Operator op, Expr e1, Expr e2,
+                                   String timeUnitIdent, boolean intervalFirst, NodePosition pos) {
+        super(pos);
         Preconditions.checkState(op == Operator.ADD || op == Operator.SUBTRACT);
         this.funcName = null;
         this.op = op;

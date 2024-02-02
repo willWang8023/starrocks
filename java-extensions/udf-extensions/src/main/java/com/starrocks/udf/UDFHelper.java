@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.udf;
 
@@ -8,38 +20,43 @@ import java.lang.reflect.Array;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Method;
 import java.math.BigDecimal;
+import java.math.BigInteger;
 import java.nio.ByteBuffer;
 import java.nio.ByteOrder;
 import java.nio.IntBuffer;
 import java.nio.charset.StandardCharsets;
 import java.sql.Date;
+import java.sql.Time;
 import java.sql.Timestamp;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
 import java.time.LocalDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Arrays;
+import java.util.TimeZone;
 
 import static com.starrocks.utils.NativeMethodHelper.getAddrs;
 import static com.starrocks.utils.NativeMethodHelper.resizeStringData;
 
 public class UDFHelper {
-    public static final int TYPE_BOOLEAN = 2;
-    public static final int TYPE_TINYINT = 3;
-    public static final int TYPE_SMALLINT = 4;
+    public static final int TYPE_TINYINT = 1;
+    public static final int TYPE_SMALLINT = 3;
     public static final int TYPE_INT = 5;
-    public static final int TYPE_BIGINT = 6;
-    public static final int TYPE_FLOAT = 8;
-    public static final int TYPE_DOUBLE = 9;
-    public static final int TYPE_VARCHAR = 10;
-    public static final int TYPE_DATETIME = 12;
-    public static final int TYPE_ARRAY = 15;
+    public static final int TYPE_BIGINT = 7;
+    public static final int TYPE_FLOAT = 10;
+    public static final int TYPE_DOUBLE = 11;
+    public static final int TYPE_VARCHAR = 17;
+    public static final int TYPE_ARRAY = 19;
+    public static final int TYPE_BOOLEAN = 24;
+    public static final int TYPE_TIME = 44;
+    public static final int TYPE_DATETIME = 51;
 
     private static final byte[] emptyBytes = new byte[0];
 
     private static final ThreadLocal<DateFormat> formatter =
             ThreadLocal.withInitial(() -> new SimpleDateFormat("yyyy-MM-dd HH:mm:ss"));
     private static final DateTimeFormatter dateTimeFormatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm:ss");
+    private static final TimeZone timeZone = TimeZone.getDefault();
 
     private static void getBooleanBoxedResult(int numRows, Boolean[] boxedArr, long columnAddr) {
         byte[] nulls = new byte[numRows];
@@ -133,6 +150,16 @@ public class UDFHelper {
         Platform.copyMemory(dataArr, Platform.LONG_ARRAY_OFFSET, null, addrs[1], numRows * 8L);
     }
 
+    public static void getStringLargeIntResult(int numRows, BigInteger[] column, long columnAddr) {
+        String[] results = new String[numRows];
+        for (int i = 0; i < numRows; i++) {
+            if (column[i] != null) {
+                results[i] = column[i].toString();
+            }
+        }
+        getStringBoxedResult(numRows, results, columnAddr);
+    }
+
     private static void getFloatBoxedResult(int numRows, Float[] boxedArr, long columnAddr) {
         byte[] nulls = new byte[numRows];
         float[] dataArr = new float[numRows];
@@ -166,6 +193,25 @@ public class UDFHelper {
         // memcpy to uint8_t array
         Platform.copyMemory(nulls, Platform.BYTE_ARRAY_OFFSET, null, addrs[0], numRows);
         // memcpy to int array
+        Platform.copyMemory(dataArr, Platform.DOUBLE_ARRAY_OFFSET, null, addrs[1], numRows * 8L);
+    }
+
+    private static void getDoubleTimeResult(int numRows, Time[] boxedArr, long columnAddr) {
+        byte[] nulls = new byte[numRows];
+        double[] dataArr = new double[numRows];
+        for (int i = 0; i < numRows; i++) {
+            if (boxedArr[i] == null) {
+                nulls[i] = 1;
+            } else {
+                // Note: add the timezone offset back because Time#getTime() returns the GMT timestamp
+                dataArr[i] = (boxedArr[i].getTime() + timeZone.getRawOffset()) / 1000;
+            }
+        }
+
+        final long[] addrs = getAddrs(columnAddr);
+        // memcpy to uint8_t array
+        Platform.copyMemory(nulls, Platform.BYTE_ARRAY_OFFSET, null, addrs[0], numRows);
+        // memcpy to double array
         Platform.copyMemory(dataArr, Platform.DOUBLE_ARRAY_OFFSET, null, addrs[1], numRows * 8L);
     }
 
@@ -273,6 +319,10 @@ public class UDFHelper {
                 getBigIntBoxedResult(numRows, (Long[]) boxedResult, columnAddr);
                 break;
             }
+            case TYPE_TIME: {
+                getDoubleTimeResult(numRows, (Time[]) boxedResult, columnAddr);
+                break;
+            }
             case TYPE_VARCHAR: {
                 if (boxedResult instanceof Date[]) {
                     getStringDateResult(numRows, (Date[]) boxedResult, columnAddr);
@@ -282,6 +332,8 @@ public class UDFHelper {
                     getStringTimeStampResult(numRows, (Timestamp[]) boxedResult, columnAddr);
                 } else if (boxedResult instanceof BigDecimal[]) {
                     getStringDecimalResult(numRows, (BigDecimal[]) boxedResult, columnAddr);
+                } else if (boxedResult instanceof BigInteger[]) {
+                    getStringLargeIntResult(numRows, (BigInteger[]) boxedResult, columnAddr);
                 } else if (boxedResult instanceof String[]) {
                     getStringBoxedResult(numRows, (String[]) boxedResult, columnAddr);
                 } else {

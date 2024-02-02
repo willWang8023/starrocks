@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "io/fd_input_stream.h"
 
@@ -9,6 +21,25 @@
 #include "common/logging.h"
 #include "gutil/macros.h"
 #include "io/io_error.h"
+#include "io_profiler.h"
+#include "util/stopwatch.hpp"
+
+#ifdef USE_STAROS
+#include "fslib/metric_key.h"
+#include "metrics/metrics.h"
+#endif
+
+#ifdef USE_STAROS
+namespace {
+static const staros::starlet::metrics::Labels kSrPosixFsLables({{"fstype", "srposix"}});
+
+DEFINE_HISTOGRAM_METRIC_KEY_WITH_TAG_BUCKET(s_posixread_iosize, staros::starlet::fslib::kMKReadIOSize, kSrPosixFsLables,
+                                            staros::starlet::metrics::MetricsSystem::kIOSizeBuckets);
+DEFINE_HISTOGRAM_METRIC_KEY_WITH_TAG_BUCKET(s_posixread_iolatency, staros::starlet::fslib::kMKReadIOLatency,
+                                            kSrPosixFsLables,
+                                            staros::starlet::metrics::MetricsSystem::kIOLatencyBuckets);
+} // namespace
+#endif
 
 namespace starrocks::io {
 
@@ -39,13 +70,22 @@ Status FdInputStream::close() {
 
 StatusOr<int64_t> FdInputStream::read(void* data, int64_t count) {
     CHECK_IS_CLOSED(_is_closed);
+    MonotonicStopWatch watch;
+    watch.start();
     ssize_t res;
+#ifdef USE_STAROS
+    staros::starlet::metrics::TimeObserver<prometheus::Histogram> observer(s_posixread_iolatency);
+#endif
     RETRY_ON_EINTR(res, ::pread(_fd, static_cast<char*>(data), count, _offset));
     if (UNLIKELY(res < 0)) {
         _errno = errno;
         return io_error("read", _errno);
     }
+#ifdef USE_STAROS
+    s_posixread_iosize.Observe(res);
+#endif
     _offset += res;
+    IOProfiler::add_read(res, watch.elapsed_time());
     return res;
 }
 

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "udf/java/java_udf.h"
 
@@ -12,10 +24,9 @@
 #include "common/status.h"
 #include "fmt/core.h"
 #include "jni.h"
-#include "runtime/primitive_type.h"
+#include "types/logical_type.h"
 #include "udf/java/java_native_method.h"
 #include "udf/java/utils.h"
-#include "udf/udf_internal.h"
 #include "util/defer_op.h"
 
 // find a jclass and return a global jclass ref
@@ -47,7 +58,7 @@
         return _env->Call##CallType##Method(obj, _val_##prim_clazz);                             \
     }
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 constexpr const char* CLASS_UDF_HELPER_NAME = "com.starrocks.udf.UDFHelper";
 constexpr const char* CLASS_NATIVE_METHOD_HELPER_NAME = "com.starrocks.utils.NativeMethodHelper";
@@ -80,15 +91,15 @@ void JVMFunctionHelper::_init() {
     _object_class = JNI_FIND_CLASS("java/lang/Object");
     _object_array_class = JNI_FIND_CLASS("[Ljava/lang/Object;");
     _string_class = JNI_FIND_CLASS("java/lang/String");
-    _throwable_class = JNI_FIND_CLASS("java/lang/Throwable");
     _jarrays_class = JNI_FIND_CLASS("java/util/Arrays");
     _list_class = JNI_FIND_CLASS("java/util/List");
+    _exception_util_class = JNI_FIND_CLASS("org/apache/commons/lang3/exception/ExceptionUtils");
 
     CHECK(_object_class);
     CHECK(_string_class);
-    CHECK(_throwable_class);
     CHECK(_jarrays_class);
     CHECK(_list_class);
+    CHECK(_exception_util_class);
 
     ADD_NUMBERIC_CLASS(boolean, Boolean, Z);
     ADD_NUMBERIC_CLASS(byte, Byte, B);
@@ -173,12 +184,12 @@ JVMClass& JVMFunctionHelper::function_state_clazz() {
     return *_function_states_clazz;
 }
 
-#define CHECK_FUNCTION_EXCEPTION(_env, name)                  \
-    if (auto e = _env->ExceptionOccurred()) {                 \
-        LOCAL_REF_GUARD(e);                                   \
-        _env->ExceptionClear();                               \
-        LOG(WARNING) << "Exception happend when call " #name; \
-        return "";                                            \
+#define CHECK_FUNCTION_EXCEPTION(_env, name)                   \
+    if (auto e = _env->ExceptionOccurred()) {                  \
+        LOCAL_REF_GUARD(e);                                    \
+        _env->ExceptionClear();                                \
+        LOG(WARNING) << "Exception happened when call " #name; \
+        return "";                                             \
     }
 
 #define RETURN_ERROR_IF_EXCEPTION(env, errmsg)                                   \
@@ -223,20 +234,13 @@ std::string JVMFunctionHelper::to_cxx_string(jstring str) {
 }
 
 std::string JVMFunctionHelper::dumpExceptionString(jthrowable throwable) {
-    std::stringstream ss;
     // toString
-    jmethodID toString = getToStringMethod(_throwable_class);
-    CHECK(toString != nullptr) << "Not Found JNI method toString";
-    ss << to_string(throwable);
-
-    // e.getStackTrace()
-    jmethodID getStackTrace = _env->GetMethodID(_throwable_class, "getStackTrace", "()[Ljava/lang/StackTraceElement;");
-    CHECK(getStackTrace != nullptr) << "Not Found JNI method getStackTrace";
-    jobject stack_traces = _env->CallObjectMethod((jobject)throwable, getStackTrace);
+    auto get_stack_trace = _env->GetStaticMethodID(_exception_util_class, "getStackTrace",
+                                                   "(Ljava/lang/Throwable;)Ljava/lang/String;");
+    CHECK(get_stack_trace != nullptr) << "Not Found JNI method getStackTrace";
+    jobject stack_traces = _env->CallStaticObjectMethod(_exception_util_class, get_stack_trace, (jobject)throwable);
     LOCAL_REF_GUARD(stack_traces);
-    CHECK_FUNCTION_EXCEPTION(_env, "dump_string")
-    ss << array_to_string(stack_traces);
-    return ss.str();
+    return to_cxx_string((jstring)stack_traces);
 }
 
 jmethodID JVMFunctionHelper::getToStringMethod(jclass clazz) {
@@ -289,8 +293,8 @@ void JVMFunctionHelper::batch_update(FunctionContext* ctx, jobject udaf, jobject
                                      int cols) {
     jobjectArray input_arr = _build_object_array(_object_array_class, input, cols);
     LOCAL_REF_GUARD(input_arr);
-    _env->CallStaticVoidMethod(_udf_helper_class, _batch_update, udaf, update,
-                               ctx->impl()->udaf_ctxs()->states->handle(), states, input_arr);
+    _env->CallStaticVoidMethod(_udf_helper_class, _batch_update, udaf, update, ctx->udaf_ctxs()->states->handle(),
+                               states, input_arr);
     CHECK_UDF_CALL_EXCEPTION(_env, ctx);
 }
 
@@ -307,7 +311,7 @@ void JVMFunctionHelper::batch_update_if_not_null(FunctionContext* ctx, jobject u
     jobjectArray input_arr = _build_object_array(_object_array_class, input, cols);
     LOCAL_REF_GUARD(input_arr);
     _env->CallStaticVoidMethod(_udf_helper_class, _batch_update_if_not_null, udaf, update,
-                               ctx->impl()->udaf_ctxs()->states->handle(), states, input_arr);
+                               ctx->udaf_ctxs()->states->handle(), states, input_arr);
     CHECK_UDF_CALL_EXCEPTION(_env, ctx);
 }
 
@@ -362,12 +366,12 @@ int JVMFunctionHelper::list_size(jobject obj) {
 
 // convert UDAF ctx to jobject
 jobject JVMFunctionHelper::convert_handle_to_jobject(FunctionContext* ctx, int state) {
-    auto* states = ctx->impl()->udaf_ctxs()->states.get();
+    auto* states = ctx->udaf_ctxs()->states.get();
     return states->get_state(ctx, _env, state);
 }
 
 jobject JVMFunctionHelper::convert_handles_to_jobjects(FunctionContext* ctx, jobject state_ids) {
-    auto* states = ctx->impl()->udaf_ctxs()->states.get();
+    auto* states = ctx->udaf_ctxs()->states.get();
     return states->get_state(ctx, _env, state_ids);
 }
 
@@ -396,11 +400,11 @@ Slice JVMFunctionHelper::sliceVal(jstring jstr, std::string* buffer) {
     size_t length = this->string_length(jstr);
     buffer->resize(length);
     _env->GetStringUTFRegion(jstr, 0, length, buffer->data());
-    return Slice(buffer->data(), buffer->length());
+    return {buffer->data(), buffer->length()};
 }
 
 Slice JVMFunctionHelper::sliceVal(jstring jstr) {
-    return Slice(_env->GetStringUTFChars(jstr, NULL));
+    return {_env->GetStringUTFChars(jstr, nullptr)};
 }
 
 std::string JVMFunctionHelper::to_jni_class_name(const std::string& name) {
@@ -440,7 +444,7 @@ DirectByteBuffer::~DirectByteBuffer() {
             _handle = nullptr;
             return Status::OK();
         });
-        ret->get_future().get();
+        (void)ret->get_future().get();
     }
 }
 
@@ -455,7 +459,7 @@ void JavaGlobalRef::clear() {
             _handle = nullptr;
             return Status::OK();
         });
-        ret->get_future().get();
+        (void)ret->get_future().get();
     }
 }
 
@@ -705,7 +709,7 @@ Status ClassAnalyzer::get_method_desc(const std::string& sign, std::vector<Metho
     RETURN_IF_ERROR(get_udaf_method_desc(sign, desc));
     // return type may be a void type
     for (int i = 1; i < desc->size(); ++i) {
-        if (desc->at(i).type == INVALID_TYPE) {
+        if (desc->at(i).type == TYPE_UNKNOWN) {
             return Status::InternalError(fmt::format("unknown type sign:{}", sign));
         }
     }
@@ -732,7 +736,7 @@ Status ClassAnalyzer::get_udaf_method_desc(const std::string& sign, std::vector<
                 i++;
             }
             // return Status::NotSupported("Not support Array Type");
-            desc->emplace_back(MethodTypeDescriptor{INVALID_TYPE, true});
+            desc->emplace_back(MethodTypeDescriptor{TYPE_UNKNOWN, true});
         }
         if (sign[i] == 'L') {
             int st = i + 1;
@@ -753,7 +757,7 @@ Status ClassAnalyzer::get_udaf_method_desc(const std::string& sign, std::vector<
             } else if (type == "java/lang/String") {
                 desc->emplace_back(MethodTypeDescriptor{TYPE_VARCHAR, true});
             } else {
-                desc->emplace_back(MethodTypeDescriptor{INVALID_TYPE, true});
+                desc->emplace_back(MethodTypeDescriptor{TYPE_UNKNOWN, true});
             }
             continue;
         }
@@ -768,9 +772,9 @@ Status ClassAnalyzer::get_udaf_method_desc(const std::string& sign, std::vector<
         ADD_PRIM_METHOD_TYPE_DESC('D', TYPE_DOUBLE)
             // clang-format on
         } else if (sign[i] == 'V') {
-            desc->emplace_back(MethodTypeDescriptor{INVALID_TYPE, false});
+            desc->emplace_back(MethodTypeDescriptor{TYPE_UNKNOWN, false});
         } else {
-            desc->emplace_back(MethodTypeDescriptor{INVALID_TYPE, false});
+            desc->emplace_back(MethodTypeDescriptor{TYPE_UNKNOWN, false});
         }
     }
 
@@ -916,4 +920,4 @@ Status detect_java_runtime() {
     return Status::OK();
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

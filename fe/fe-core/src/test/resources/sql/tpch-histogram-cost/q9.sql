@@ -1,36 +1,3 @@
-[sql]
-select
-        nation,
-        o_year,
-        sum(amount) as sum_profit
-from
-        (
-                select
-                        n_name as nation,
-                        extract(year from o_orderdate) as o_year,
-                        l_extendedprice * (1 - l_discount) - ps_supplycost * l_quantity as amount
-                from
-                        part,
-                        supplier,
-                        lineitem,
-                        partsupp,
-                        orders,
-                        nation
-                where
-                        s_suppkey = l_suppkey
-                        and ps_suppkey = l_suppkey
-                        and ps_partkey = l_partkey
-                        and p_partkey = l_partkey
-                        and o_orderkey = l_orderkey
-                        and s_nationkey = n_nationkey
-                        and p_name like '%peru%'
-        ) as profit
-group by
-        nation,
-        o_year
-order by
-        nation,
-        o_year desc ;
 [fragment]
 PLAN FRAGMENT 0
 OUTPUT EXPRS:53: N_NAME | 57: year | 59: sum
@@ -118,7 +85,6 @@ rollup: partsupp
 tabletRatio=10/10
 cardinality=80000000
 avgRowSize=24.0
-numNodes=0
 
 PLAN FRAGMENT 4
 OUTPUT EXPRS:
@@ -147,7 +113,6 @@ rollup: supplier
 tabletRatio=1/1
 cardinality=1000000
 avgRowSize=8.0
-numNodes=0
 
 PLAN FRAGMENT 5
 OUTPUT EXPRS:
@@ -165,7 +130,6 @@ rollup: nation
 tabletRatio=1/1
 cardinality=25
 avgRowSize=29.0
-numNodes=0
 
 PLAN FRAGMENT 6
 OUTPUT EXPRS:
@@ -213,7 +177,6 @@ rollup: lineitem
 tabletRatio=20/20
 cardinality=600000000
 avgRowSize=44.0
-numNodes=0
 
 PLAN FRAGMENT 7
 OUTPUT EXPRS:
@@ -231,7 +194,6 @@ rollup: orders
 tabletRatio=10/10
 cardinality=150000000
 avgRowSize=12.0
-numNodes=0
 
 PLAN FRAGMENT 8
 OUTPUT EXPRS:
@@ -253,5 +215,4 @@ rollup: part
 tabletRatio=10/10
 cardinality=5000000
 avgRowSize=63.0
-numNodes=0
 [end]

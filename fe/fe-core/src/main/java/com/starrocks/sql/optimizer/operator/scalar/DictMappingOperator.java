@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.operator.scalar;
 
@@ -11,14 +24,25 @@ import java.util.List;
 import java.util.Objects;
 
 public class DictMappingOperator extends ScalarOperator {
-
+    // use dict id
     private ColumnRefOperator dictColumn;
+    // dict expression
     private ScalarOperator originScalaOperator;
+    // input string expression
+    private ScalarOperator stringProvideOperator;
 
     public DictMappingOperator(ColumnRefOperator dictColumn, ScalarOperator originScalaOperator, Type retType) {
         super(OperatorType.DICT_MAPPING, retType);
         this.dictColumn = dictColumn;
         this.originScalaOperator = originScalaOperator;
+    }
+
+    public DictMappingOperator(Type type, ColumnRefOperator dictColumn, ScalarOperator originScalaOperator,
+                               ScalarOperator stringScalarOperator) {
+        super(OperatorType.DICT_MAPPING, type);
+        this.dictColumn = dictColumn;
+        this.originScalaOperator = originScalaOperator;
+        this.stringProvideOperator = stringScalarOperator;
     }
 
     public ColumnRefOperator getDictColumn() {
@@ -27,6 +51,10 @@ public class DictMappingOperator extends ScalarOperator {
 
     public ScalarOperator getOriginScalaOperator() {
         return originScalaOperator;
+    }
+
+    public ScalarOperator getStringProvideOperator() {
+        return stringProvideOperator;
     }
 
     @Override
@@ -50,7 +78,8 @@ public class DictMappingOperator extends ScalarOperator {
 
     @Override
     public String toString() {
-        return "DictMapping(" + dictColumn + "{" + originScalaOperator + "}" + ")";
+        String stringOperator = stringProvideOperator == null ? "" : ", " + stringProvideOperator;
+        return "DictMapping(" + dictColumn + ", " + originScalaOperator + stringOperator + ")";
     }
 
     @Override
@@ -59,19 +88,18 @@ public class DictMappingOperator extends ScalarOperator {
     }
 
     @Override
-    public boolean equals(Object other) {
-        if (other == null) {
-            return false;
-        }
-        if (this == other) {
+    public boolean equals(Object o) {
+        if (this == o) {
             return true;
         }
-        if (other instanceof DictMappingOperator) {
-            final DictMappingOperator mapping = (DictMappingOperator) other;
-            return mapping.getType().equals(getType()) && mapping.originScalaOperator.equals(originScalaOperator) &&
-                    mapping.dictColumn.equals(dictColumn);
+        if (o == null || getClass() != o.getClass()) {
+            return false;
         }
-        return false;
+
+        DictMappingOperator that = (DictMappingOperator) o;
+        return Objects.equals(dictColumn, that.dictColumn) &&
+                Objects.equals(originScalaOperator, that.originScalaOperator) &&
+                Objects.equals(stringProvideOperator, that.stringProvideOperator);
     }
 
     @Override
@@ -85,10 +113,23 @@ public class DictMappingOperator extends ScalarOperator {
     }
 
     @Override
+    public void getColumnRefs(List<ColumnRefOperator> columns) {
+        dictColumn.getColumnRefs(columns);
+        if (stringProvideOperator != null) {
+            stringProvideOperator.getColumnRefs(columns);
+        } else {
+            originScalaOperator.getColumnRefs(columns);
+        }
+    }
+
+    @Override
     public ScalarOperator clone() {
         DictMappingOperator clone = (DictMappingOperator) super.clone();
         clone.dictColumn = (ColumnRefOperator) this.dictColumn.clone();
         clone.originScalaOperator = this.originScalaOperator.clone();
+        if (this.stringProvideOperator != null) {
+            clone.stringProvideOperator = this.stringProvideOperator.clone();
+        }
         return clone;
     }
 }

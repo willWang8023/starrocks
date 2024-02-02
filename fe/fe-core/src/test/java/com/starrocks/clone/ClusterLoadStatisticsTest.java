@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/test/java/org/apache/doris/clone/ClusterLoadStatisticsTest.java
 
@@ -146,6 +159,27 @@ public class ClusterLoadStatisticsTest {
         List<List<String>> infos = loadStatistic.getClusterStatistic(TStorageMedium.HDD);
         System.out.println(infos);
         Assert.assertEquals(3, infos.size());
+    }
+
+    @Test
+    public void testToString() {
+        ClusterLoadStatistic clusterLoad = new ClusterLoadStatistic(systemInfoService, invertedIndex);
+        clusterLoad.init();
+
+        BackendLoadStatistic beLoad = clusterLoad.getBackendLoadStatistic(10001);
+        Assert.assertEquals("{\"beId\":10001,\"clusterName\":\"default_cluster\",\"isAvailable\":true," +
+                "\"cpuCores\":0,\"memLimit\":0,\"memUsed\":0," +
+                "\"mediums\":[{\"medium\":\"HDD\",\"replica\":1,\"used\":570000,\"total\":\"1.5MB\"," +
+                "\"score\":1.0040447504302925}," +
+                "{\"medium\":\"SSD\",\"replica\":0,\"used\":0,\"total\":\"0B\",\"score\":NaN}]," +
+                "\"paths\":[" +
+                "{\"beId\":10001,\"path\":\"/path3\",\"pathHash\":0,\"storageMedium\":\"HDD\"," +
+                "\"total\":500000,\"used\":10000}," +
+                "{\"beId\":10001,\"path\":\"/path2\",\"pathHash\":0,\"storageMedium\":\"HDD\"," +
+                "\"total\":180000,\"used\":80000}," +
+                "{\"beId\":10001,\"path\":\"/path1\",\"pathHash\":0,\"storageMedium\":\"HDD\"," +
+                "\"total\":980000,\"used\":480000}]}", beLoad.toString());
+
     }
 
 }

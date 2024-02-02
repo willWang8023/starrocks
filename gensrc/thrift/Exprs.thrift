@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+//
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/gensrc/thrift/Exprs.thrift
 
@@ -26,6 +39,8 @@ include "Types.thrift"
 include "Opcodes.thrift"
 
 enum TExprNodeType {
+  // Be careful, to keep the compatibility between differen version fe and be,
+  // please always add the new expr at last.
   AGG_EXPR,
   ARITHMETIC_EXPR,
   BINARY_PRED,
@@ -62,25 +77,19 @@ enum TExprNodeType {
   PLACEHOLDER_EXPR,
   CLONE_EXPR,
   LAMBDA_FUNCTION_EXPR,
+  SUBFIELD_EXPR,
+  RUNTIME_FILTER_MIN_MAX_EXPR,
+  MAP_ELEMENT_EXPR,
+  BINARY_LITERAL,
+  MAP_EXPR,
+  DICT_QUERY_EXPR,
+
+  // query DICTIONARY object
+  DICTIONARY_GET_EXPR,
+  
+  JIT_EXPR,
 }
 
-//enum TAggregationOp {
-//  INVALID,
-//  COUNT,
-//  MAX,
-//  DISTINCT_PC,
-//  MERGE_PC,
-//  DISTINCT_PCSA,
-//  MERGE_PCSA,
-//  MIN,
-//  SUM,
-//}
-//
-//struct TAggregateExpr {
-//  1: required bool is_star
-//  2: required bool is_distinct
-//  3: required TAggregationOp op
-//}
 struct TAggregateExpr {
   // Indicates whether this expr is the merge() of an aggregation.
   1: required bool is_merge_agg
@@ -113,6 +122,10 @@ struct TIntLiteral {
 
 struct TLargeIntLiteral {
   1: required string value
+}
+
+struct TBinaryLiteral {
+  1: required binary value
 }
 
 struct TInPredicate {
@@ -164,6 +177,21 @@ struct TFunctionCallExpr {
   2: optional i32 vararg_start_idx
 }
 
+struct TDictQueryExpr {
+  1: required string db_name
+  2: required string tbl_name
+  3: required map<i64, i64> partition_version
+  4: required list<string> key_fields
+  5: required string value_field
+  6: required bool strict_mode
+}
+
+struct TDictionaryGetExpr {
+  1: optional i64 dict_id
+  2: optional i64 txn_id
+  3: optional i32 key_size
+}
+
 // This is essentially a union over the subclasses of Expr.
 struct TExprNode {
   1: required TExprNodeType node_type
@@ -202,12 +230,31 @@ struct TExprNode {
 
   29: optional TPlaceHolder vslot_ref;
 
+  // Used for SubfieldExpr
+  30: optional list<string> used_subfield_names;
+  31: optional TBinaryLiteral binary_literal;
+  32: optional bool copy_flag;
+
+  // used for CollectionElementAt
+  35: optional bool check_is_out_of_bounds
+
   // For vector query engine
-  50: optional bool use_vectorized
+  50: optional bool use_vectorized  // Deprecated
   51: optional bool has_nullable_child
   52: optional bool is_nullable
   53: optional Types.TTypeDesc child_type_desc
   54: optional bool is_monotonic
+
+  55: optional TDictQueryExpr dict_query_expr
+
+  56: optional TDictionaryGetExpr dictionary_get_expr
+}
+
+struct TPartitionLiteral {
+  1: optional Types.TPrimitiveType type
+  2: optional TIntLiteral int_literal
+  3: optional TDateLiteral date_literal
+  4: optional TStringLiteral string_literal
 }
 
 // A flattened representation of a tree of Expr nodes, obtained by depth-first

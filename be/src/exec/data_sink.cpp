@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/exec/data_sink.cpp
 
@@ -31,13 +44,19 @@
 #include "exec/tablet_sink.h"
 #include "exprs/expr.h"
 #include "gen_cpp/InternalService_types.h"
+#include "runtime/blackhole_table_sink.h"
 #include "runtime/data_stream_sender.h"
+#include "runtime/dictionary_cache_sink.h"
 #include "runtime/export_sink.h"
+#include "runtime/hive_table_sink.h"
+#include "runtime/iceberg_table_sink.h"
 #include "runtime/memory_scratch_sink.h"
 #include "runtime/multi_cast_data_stream_sink.h"
 #include "runtime/mysql_table_sink.h"
 #include "runtime/result_sink.h"
 #include "runtime/runtime_state.h"
+#include "runtime/schema_table_sink.h"
+#include "runtime/table_function_table_sink.h"
 
 namespace starrocks {
 
@@ -49,9 +68,12 @@ static std::unique_ptr<DataStreamSender> create_data_stream_sink(
             params.__isset.send_query_statistics_with_every_batch && params.send_query_statistics_with_every_batch;
     bool enable_exchange_pass_through =
             params.__isset.enable_exchange_pass_through && params.enable_exchange_pass_through;
+    bool enable_exchange_perf = params.__isset.enable_exchange_perf && params.enable_exchange_perf;
+
     // TODO: figure out good buffer size based on size of output row
     auto ret = std::make_unique<DataStreamSender>(state, sender_id, row_desc, data_stream_sink, destinations, 16 * 1024,
-                                                  send_query_statistics_with_every_batch, enable_exchange_pass_through);
+                                                  send_query_statistics_with_every_batch, enable_exchange_pass_through,
+                                                  enable_exchange_perf);
     return ret;
 }
 
@@ -64,8 +86,8 @@ Status DataSink::create_data_sink(RuntimeState* state, const TDataSink& thrift_s
         if (!thrift_sink.__isset.stream_sink) {
             return Status::InternalError("Missing data stream sink.");
         }
-        *sink = std::move(create_data_stream_sink(state, thrift_sink.stream_sink, row_desc, params, sender_id,
-                                                  params.destinations));
+        *sink = create_data_stream_sink(state, thrift_sink.stream_sink, row_desc, params, sender_id,
+                                        params.destinations);
         break;
     }
     case TDataSinkType::RESULT_SINK:
@@ -101,7 +123,7 @@ Status DataSink::create_data_sink(RuntimeState* state, const TDataSink& thrift_s
     case TDataSinkType::OLAP_TABLE_SINK: {
         Status status;
         DCHECK(thrift_sink.__isset.olap_table_sink);
-        *sink = std::make_unique<stream_load::OlapTableSink>(state->obj_pool(), output_exprs, &status);
+        *sink = std::make_unique<stream_load::OlapTableSink>(state->obj_pool(), output_exprs, &status, state);
         RETURN_IF_ERROR(status);
         break;
     }
@@ -120,6 +142,48 @@ Status DataSink::create_data_sink(RuntimeState* state, const TDataSink& thrift_s
         *sink = std::move(mcast_data_stream_sink);
         break;
     }
+    case TDataSinkType::SCHEMA_TABLE_SINK: {
+        if (!thrift_sink.__isset.schema_table_sink) {
+            return Status::InternalError("Missing schema table sink.");
+        }
+        *sink = std::make_unique<SchemaTableSink>(state->obj_pool(), row_desc, output_exprs);
+        break;
+    }
+    case TDataSinkType::ICEBERG_TABLE_SINK: {
+        if (!thrift_sink.__isset.iceberg_table_sink) {
+            return Status::InternalError("Missing iceberg table sink");
+        }
+        *sink = std::make_unique<IcebergTableSink>(state->obj_pool(), output_exprs);
+        break;
+    }
+    case TDataSinkType::HIVE_TABLE_SINK: {
+        if (!thrift_sink.__isset.hive_table_sink) {
+            return Status::InternalError("Missing hive table sink");
+        }
+        *sink = std::make_unique<HiveTableSink>(state->obj_pool(), output_exprs);
+        break;
+    }
+    case TDataSinkType::TABLE_FUNCTION_TABLE_SINK: {
+        if (!thrift_sink.__isset.table_function_table_sink) {
+            return Status::InternalError("Missing table function table sink");
+        }
+        *sink = std::make_unique<TableFunctionTableSink>(state->obj_pool(), output_exprs);
+        break;
+    }
+    case TDataSinkType::BLACKHOLE_TABLE_SINK: {
+        *sink = std::make_unique<BlackHoleTableSink>(state->obj_pool());
+        break;
+    }
+    case TDataSinkType::DICTIONARY_CACHE_SINK: {
+        if (!thrift_sink.__isset.dictionary_cache_sink) {
+            return Status::InternalError("Missing dictionary cache sink");
+        }
+        if (!state->enable_pipeline_engine()) {
+            return Status::InternalError("dictionary cache only support pipeline engine");
+        }
+        *sink = std::make_unique<DictionaryCacheSink>();
+        break;
+    }
 
     default:
         std::stringstream error_msg;
@@ -135,13 +199,13 @@ Status DataSink::create_data_sink(RuntimeState* state, const TDataSink& thrift_s
     }
 
     if (*sink != nullptr) {
-        RETURN_IF_ERROR((*sink)->init(thrift_sink));
+        RETURN_IF_ERROR((*sink)->init(thrift_sink, state));
     }
 
     return Status::OK();
 }
 
-Status DataSink::init(const TDataSink& thrift_sink) {
+Status DataSink::init(const TDataSink& thrift_sink, RuntimeState* state) {
     return Status::OK();
 }
 
@@ -150,7 +214,7 @@ Status DataSink::prepare(RuntimeState* state) {
     return Status::OK();
 }
 
-Status DataSink::send_chunk(RuntimeState* state, vectorized::Chunk* chunk) {
+Status DataSink::send_chunk(RuntimeState* state, Chunk* chunk) {
     return Status::NotSupported("Don't support vector query engine");
 }
 

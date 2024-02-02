@@ -50,12 +50,11 @@ public class WildcardURI {
             // 3. the space(" ") will be encoded to "+", we have to change it to "%20"
             // example can be found in WildcardURITest.java
             String encodedPath = URLEncoder.encode(path, StandardCharsets.UTF_8.toString()).replaceAll("%3A",
-                    ":").replaceAll("%2F", "/").replaceAll("\\+", "%20");
+                    ":").replaceAll("%2F", "/").replaceAll("\\+", "%20").replaceAll("%40", "@");
             uri = new URI(encodedPath);
             uri.normalize();
         } catch (UnsupportedEncodingException | URISyntaxException e) {
             LOG.warn("failed to encoded uri: " + path, e);
-            e.printStackTrace();
             throw new UserException("invalid input path {} " + path);
         }
     }

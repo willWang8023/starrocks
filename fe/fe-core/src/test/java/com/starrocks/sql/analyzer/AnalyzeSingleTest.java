@@ -1,12 +1,30 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
-import com.starrocks.analysis.StatementBase;
+import com.starrocks.analysis.CompoundPredicate;
+import com.starrocks.common.Config;
+import com.starrocks.common.util.LogUtil;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.SqlModeHelper;
+import com.starrocks.sql.ast.LoadStmt;
 import com.starrocks.sql.ast.QueryRelation;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.StatementBase;
+import com.starrocks.sql.ast.SubmitTaskStmt;
 import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.utframe.UtFrameUtils;
@@ -53,18 +71,48 @@ public class AnalyzeSingleTest {
         analyzeFail("select error from t0");
         analyzeFail("select v1 from t_error");
 
-        analyzeSuccess("select v1 from t0 temporary partition(t1,t2)");
+        analyzeFail("select v1 from t0 temporary partition(t1,t2)");
         analyzeFail("SELECT v1,v2,v3 FROM t0 INTO OUTFILE \"hdfs://path/to/result_\""
                 + "FORMAT AS PARQUET PROPERTIES" +
                 "(\"broker.name\" = \"my_broker\"," +
                 "\"broker.hadoop.security.authentication\" = \"kerberos\"," +
-                "\"line_delimiter\" = \"\n\", \"max_file_size\" = \"100MB\");", "Only support CSV format");
+                "\"line_delimiter\" = \"\n\", \"max_file_size\" = \"100MB\");", "line_delimiter is only for CSV format");
 
         analyzeSuccess("SELECT v1,v2,v3 FROM t0  INTO OUTFILE \"hdfs://path/to/result_\""
                 + "FORMAT AS CSV PROPERTIES" +
                 "(\"broker.name\" = \"my_broker\"," +
                 "\"broker.hadoop.security.authentication\" = \"kerberos\"," +
                 "\"line_delimiter\" = \"\n\", \"max_file_size\" = \"100MB\");");
+
+        analyzeSuccess("SELECT v1,v2,v3 FROM t0  INTO OUTFILE \"hdfs://path/to/result_\" FORMAT AS CSV");
+
+        analyzeFail("SELECT b1 FROM test_object INTO OUTFILE \"hdfs://path/to/result_\" FORMAT AS PARQUET");
+
+        analyzeFail("SELECT b1 FROM test_object INTO OUTFILE \"hdfs://path/to/result_\" FORMAT AS CSV");
+
+        analyzeSuccess("select v1 as location from t0");
+
+        analyzeSuccess("select v1 as rank from t0");
+
+        analyzeSuccess("select v1 as running from t0");
+        analyzeSuccess("select v1 as queries from t0");
+        analyzeSuccess("show running queries");
+        analyzeSuccess("show running queries limit 10");
+    }
+
+    @Test
+    public void testIdentifierStartWithDigit() {
+        StatementBase statementBase = com.starrocks.sql.parser.SqlParser.parse("select * from a.11b", 0).get(0);
+        Assert.assertEquals("SELECT * FROM a.11b", AstToStringBuilder.toString(statementBase));
+
+        statementBase = com.starrocks.sql.parser.SqlParser.parse("select a.11b.22c, * from a.11b", 0).get(0);
+        Assert.assertEquals("SELECT a.11b.22c, * FROM a.11b", AstToStringBuilder.toString(statementBase));
+
+        statementBase = com.starrocks.sql.parser.SqlParser.parse("select 00a.11b.22c, * from 00a.11b", 0).get(0);
+        Assert.assertEquals("SELECT 00a.11b.22c, * FROM 00a.11b", AstToStringBuilder.toString(statementBase));
+
+        statementBase = com.starrocks.sql.parser.SqlParser.parse("select 11b.* from 11b", 0).get(0);
+        Assert.assertEquals("SELECT 11b.* FROM 11b", AstToStringBuilder.toString(statementBase));
     }
 
     @Test
@@ -111,11 +159,11 @@ public class AnalyzeSingleTest {
         analyzeSuccess("select v1 from t0 where v1 = 1");
         analyzeSuccess("select v1 from t0 where v2 = 1 and v3 = 5");
         analyzeSuccess("select v1 from t0 where v1 = v2");
+        analyzeSuccess("select v1 from t0 where v2");
 
         analyzeFail("select v1 from t0 where sum(v2) > 1");
         analyzeFail("select v1 from t0 where error = 5");
         analyzeFail("select v1 from t0 where error = v1");
-        analyzeFail("select v1 from t0 where v2");
     }
 
     @Test
@@ -289,17 +337,44 @@ public class AnalyzeSingleTest {
          * In a double-quoted string, two double-quotes are combined into one double-quote
          */
         QueryStatement statement = (QueryStatement) analyzeSuccess("select '\"\"' ");
-        Assert.assertEquals("'\"\"'", AST2SQL.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+        Assert.assertEquals("'\"\"'", AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
         statement = (QueryStatement) analyzeSuccess("select \"\"\"\" ");
-        Assert.assertEquals("'\"'", AST2SQL.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+        Assert.assertEquals("'\"'", AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
         statement = (QueryStatement) analyzeSuccess("select \"7\\\"\\\"\"");
-        Assert.assertEquals("'7\"\"'", AST2SQL.toString(statement.getQueryRelation().getOutputExpression().get(0)));
-        statement = (QueryStatement) analyzeWithoutTestView("select '7'''");
-        Assert.assertEquals("'7''", AST2SQL.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+        Assert.assertEquals("'7\"\"'", AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+        statement = (QueryStatement) analyzeSuccess("select '7'''");
+        Assert.assertEquals("'7\\''", AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
         statement = (QueryStatement) analyzeSuccess("SELECT '7\\'\\''");
-        Assert.assertEquals("'7'''", AST2SQL.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+        Assert.assertEquals("'7\\'\\''", AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+        statement = (QueryStatement) analyzeSuccess("select \"Hello ' World ' !\"");
+        Assert.assertEquals("'Hello \\' World \\' !'",
+                AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+        statement = (QueryStatement) analyzeSuccess("select 'Hello \" World \" !'");
+        Assert.assertEquals("'Hello \" World \" !'",
+                AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
 
         analyzeSuccess("select @@`sql_mode`");
+        analyzeSuccess("select @@SESSION.`sql_mode`");
+        analyzeSuccess("select @@SESSION.sql_mode");
+        analyzeSuccess("select @_123var");
+    }
+
+    @Test
+    public void testBinaryLiteral() {
+        QueryStatement statement = (QueryStatement) analyzeSuccess("select x'0ABC' ");
+        Assert.assertEquals("\'0ABC\'", AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+        statement = (QueryStatement) analyzeSuccess("select \"0ABC\" ");
+        Assert.assertEquals("\'0ABC\'", AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+        // mysql client will output binary format in the outputs.
+        statement = (QueryStatement) analyzeSuccess("select '0ABC' ");
+        Assert.assertEquals("\'0ABC\'", AstToStringBuilder.toString(statement.getQueryRelation().getOutputExpression().get(0)));
+
+        String expectMsg = "Binary literal can only contain hexadecimal digits and an even number of digits";
+        analyzeFail("select x'0AB' ", expectMsg);
+        analyzeFail("select x\"0AB\" ", expectMsg);
+        analyzeFail("select x'0,AB' ", expectMsg);
+        analyzeFail("select x\"0,AB\" ", expectMsg);
+        analyzeFail("select x\"0AX\" ", expectMsg);
     }
 
     @Test
@@ -387,63 +462,74 @@ public class AnalyzeSingleTest {
     }
 
     @Test
+    public void testLogicalBinaryPredicate() {
+        QueryStatement queryStatement = (QueryStatement) analyzeSuccess("select * from test.t0 where v1 = 1 && v2 = 2");
+        SelectRelation selectRelation = (SelectRelation) queryStatement.getQueryRelation();
+        Assert.assertTrue(selectRelation.getPredicate() instanceof CompoundPredicate);
+        Assert.assertEquals(((CompoundPredicate) selectRelation.getPredicate()).getOp(), CompoundPredicate.Operator.AND);
+
+        queryStatement = (QueryStatement) analyzeSuccess("select * from test.t0 where v1 = 1 || v2 = 2");
+        selectRelation = (SelectRelation) queryStatement.getQueryRelation();
+        Assert.assertTrue(selectRelation.getPredicate() instanceof CompoundPredicate);
+        Assert.assertEquals(((CompoundPredicate) selectRelation.getPredicate()).getOp(), CompoundPredicate.Operator.OR);
+    }
+
+    @Test
     public void testSqlMode() {
         ConnectContext connectContext = getConnectContext();
-        analyzeFail("select 'a' || 'b' from t0",
-                "Operand ''a' OR 'b'' part of predicate ''a'' should return type 'BOOLEAN'");
+        analyzeSuccess("select 'a' || 'b' from t0");
 
         StatementBase statementBase = com.starrocks.sql.parser.SqlParser.parse("select true || false from t0",
                 connectContext.getSessionVariable().getSqlMode()).get(0);
         Analyzer.analyze(statementBase, connectContext);
         Assert.assertEquals("SELECT TRUE OR FALSE FROM test.t0",
-                AST2SQL.toString(statementBase));
+                AstToStringBuilder.toString(statementBase));
 
         connectContext.getSessionVariable().setSqlMode(SqlModeHelper.MODE_PIPES_AS_CONCAT);
         statementBase = com.starrocks.sql.parser.SqlParser.parse("select 'a' || 'b' from t0",
                 connectContext.getSessionVariable().getSqlMode()).get(0);
         Analyzer.analyze(statementBase, connectContext);
         Assert.assertEquals("SELECT concat('a', 'b') FROM test.t0",
-                AST2SQL.toString(statementBase));
+                AstToStringBuilder.toString(statementBase));
 
         statementBase = SqlParser.parse("select * from  tall where ta like concat(\"h\", \"a\", \"i\")||'%'",
                 connectContext.getSessionVariable().getSqlMode()).get(0);
         Analyzer.analyze(statementBase, connectContext);
         Assert.assertEquals(
-                "SELECT * FROM test.tall WHERE ta LIKE (concat(concat('h', 'a', 'i'), '%'))",
-                AST2SQL.toString(statementBase));
+                "SELECT * FROM test.tall WHERE test.tall.ta LIKE (concat(concat('h', 'a', 'i'), '%'))",
+                AstToStringBuilder.toString(statementBase));
 
         connectContext.getSessionVariable().setSqlMode(0);
         statementBase = SqlParser.parse("select * from  tall where ta like concat(\"h\", \"a\", \"i\")|| true",
                 connectContext.getSessionVariable().getSqlMode()).get(0);
         Analyzer.analyze(statementBase, connectContext);
         Assert.assertEquals(
-                "SELECT * FROM test.tall WHERE (ta LIKE (concat('h', 'a', 'i'))) OR TRUE",
-                AST2SQL.toString(statementBase));
+                "SELECT * FROM test.tall WHERE (test.tall.ta LIKE (concat('h', 'a', 'i'))) OR TRUE",
+                AstToStringBuilder.toString(statementBase));
 
-        analyzeFail("select * from  tall where ta like concat(\"h\", \"a\", \"i\")||'%'",
-                "LIKE (concat('h', 'a', 'i'))) OR '%'' part of predicate ''%'' should return type 'BOOLEAN'");
+        analyzeSuccess("select * from  tall where ta like concat(\"h\", \"a\", \"i\")||'%'");
 
         connectContext.getSessionVariable().setSqlMode(SqlModeHelper.MODE_SORT_NULLS_LAST);
         statementBase = SqlParser.parse("select * from  tall order by ta",
                 connectContext.getSessionVariable().getSqlMode()).get(0);
         Analyzer.analyze(statementBase, connectContext);
-        Assert.assertEquals("SELECT * FROM test.tall ORDER BY ta ASC NULLS LAST ",
-                AST2SQL.toString(statementBase));
+        Assert.assertEquals("SELECT * FROM test.tall ORDER BY test.tall.ta ASC NULLS LAST ",
+                AstToStringBuilder.toString(statementBase));
 
-        statementBase = SqlParser.parse("select * from  tall order by ta desc",
+        statementBase = SqlParser.parse("select * from  test.tall order by test.tall.ta desc",
                 connectContext.getSessionVariable().getSqlMode()).get(0);
         Analyzer.analyze(statementBase, connectContext);
         Assert.assertEquals(
-                "SELECT * FROM test.tall ORDER BY ta DESC NULLS FIRST ",
-                AST2SQL.toString(statementBase));
+                "SELECT * FROM test.tall ORDER BY test.tall.ta DESC NULLS FIRST ",
+                AstToStringBuilder.toString(statementBase));
 
         connectContext.getSessionVariable().setSqlMode(0);
-        statementBase = SqlParser.parse("select * from  tall order by ta",
+        statementBase = SqlParser.parse("select * from  test.tall order by test.tall.ta",
                 connectContext.getSessionVariable().getSqlMode()).get(0);
         Analyzer.analyze(statementBase, connectContext);
         Assert.assertEquals(
-                "SELECT * FROM test.tall ORDER BY ta ASC ",
-                AST2SQL.toString(statementBase));
+                "SELECT * FROM test.tall ORDER BY test.tall.ta ASC ",
+                AstToStringBuilder.toString(statementBase));
     }
 
     @Test
@@ -498,6 +584,16 @@ public class AnalyzeSingleTest {
         statementBase = analyzeSuccess("select /*+ SET_VAR(broadcast_row_limit=1) */ * from t0");
         selectRelation = (SelectRelation) ((QueryStatement) statementBase).getQueryRelation();
         Assert.assertEquals("1", selectRelation.getSelectList().getOptHints().get("broadcast_row_limit"));
+
+        SubmitTaskStmt stmt = (SubmitTaskStmt) analyzeSuccess("submit /*+ SET_VAR(broadcast_row_limit=1) */ task as " +
+                "create table temp as select count(*) as cnt from t0");
+        Assert.assertEquals("1", stmt.getProperties().get("broadcast_row_limit"));
+
+        LoadStmt loadStmt = (LoadStmt) analyzeSuccess("LOAD /*+ SET_VAR(broadcast_row_limit=1) */  LABEL test.testLabel " +
+                "(DATA INFILE(\"hdfs://hdfs_host:hdfs_port/user/starRocks/data/input/file\") " +
+                "INTO TABLE `t0`) WITH BROKER hdfs_broker PROPERTIES (\"strict_mode\"=\"true\")");
+        Assert.assertEquals("1", loadStmt.getOptHints().get("broadcast_row_limit"));
+
     }
 
     @Test
@@ -510,5 +606,174 @@ public class AnalyzeSingleTest {
     @Test
     public void testSync() {
         analyzeSuccess("sync");
+    }
+
+    @Test
+    public void testUnsupportedStatement() {
+        analyzeSuccess("start transaction");
+        analyzeSuccess("start transaction with consistent snapshot");
+        analyzeSuccess("begin");
+        analyzeSuccess("begin work");
+        analyzeSuccess("commit");
+        analyzeSuccess("commit work");
+        analyzeSuccess("commit and no chain release");
+        analyzeSuccess("rollback");
+    }
+
+    @Test
+    public void testASTChildCountLimit() {
+        Config.expr_children_limit = 5;
+        analyzeSuccess("select * from test.t0 where v1 in (1,2,3,4,5)");
+        analyzeSuccess("select * from test.t0 where v1 in (1,2,3,4)");
+
+        analyzeFail("select * from test.t0 where v1 in (1,2,3,4,5,6)",
+                "Getting syntax error from line 1, column 35 to line 1, column 45. " +
+                        "Detail message: The number of exprs are 6 exceeded the maximum limit 5");
+
+        analyzeFail("select [1,2,3,4,5,6]",
+                "Getting syntax error from line 1, column 8 to line 1, column 18. " +
+                        "Detail message: The number of exprs are 6 exceeded the maximum limit 5");
+
+        analyzeFail("select array<int>[1,2,3,4,5,6]",
+                "Getting syntax error from line 1, column 18 to line 1, column 28. " +
+                        "Detail message: The number of exprs are 6 exceeded the maximum limit 5");
+
+        analyzeFail("select * from (values(1,2,3,4,5,6)) t",
+                "Getting syntax error from line 1, column 22 to line 1, column 32. " +
+                        "Detail message: The number of exprs are 6 exceeded the maximum limit 5");
+
+        analyzeFail("insert into t0 values(1,2,3),(1,2,3),(1,2,3),(1,2,3),(1,2,3),(1,2,3)",
+                "Getting syntax error from line 1, column 0 to line 1, column 67. " +
+                        "Detail message: The inserted rows are 6 exceeded the maximum limit 5");
+
+        analyzeFail("insert into t0 values(1,2,3,4,5,6)",
+                "Getting syntax error from line 1, column 21 to line 1, column 33. " +
+                        "Detail message: The number of children in expr are 6 exceeded the maximum limit 5");
+
+        Config.expr_children_limit = 100000;
+        analyzeSuccess("select * from test.t0 where v1 in (1,2,3,4,5,6)");
+    }
+
+    @Test
+    public void testOrderByWithSameColumnName() {
+        analyzeFail("select * from t0, tnotnull order by v1", "Column 'v1' is ambiguous");
+        analyzeSuccess("select * from t0, tnotnull order by t0.v1");
+
+        analyzeFail("select t0.v1 from t0, tnotnull order by v2", "Column 'v2' is ambiguous");
+        analyzeSuccess("select t0.v1 from t0, tnotnull order by v1");
+        analyzeSuccess("select tnotnull.v1 from t0, tnotnull order by v1");
+        analyzeSuccess("select t0.v1 from t0, tnotnull order by t0.v1");
+        analyzeFail("select t0.v1 as v from t0, tnotnull order by v1", "Column 'v1' is ambiguous");
+        analyzeSuccess("select t0.v1 as v from t0, tnotnull order by t0.v1");
+        analyzeFail("select t0.v1, tnotnull.v1 from t0, tnotnull order by v1", "Column 'v1' is ambiguous");
+    }
+
+    @Test
+    public void testOutputNamesWithDB() {
+        QueryRelation query = ((QueryStatement) analyzeSuccess(
+                "select t0.v1, v1 from t0"))
+                .getQueryRelation();
+        Assert.assertEquals("v1,v1", String.join(",", query.getColumnOutputNames()));
+        analyzeFail("create view v as select t0.v1, v1 from t0", "Duplicate column name 'v1'");
+
+        query = ((QueryStatement) analyzeSuccess(
+                "select * from t0, t1"))
+                .getQueryRelation();
+        Assert.assertEquals("v1,v2,v3,v4,v5,v6", String.join(",", query.getColumnOutputNames()));
+
+        query = ((QueryStatement) analyzeSuccess(
+                "select t0.*, abs(t0.v1), abs(v1) from t0, t1"))
+                .getQueryRelation();
+        Assert.assertEquals("v1,v2,v3,abs(t0.v1),abs(v1)", String.join(",", query.getColumnOutputNames()));
+
+        analyzeSuccess("select v1 as v from t0 order by v1");
+        analyzeSuccess("select v1 as v from t0 order by t0.v1");
+        analyzeFail("select v1 as v from t0 order by test.v",
+                "Column '`test`.`v`' cannot be resolved");
+
+        analyzeFail("create view v as select * from t0,tnotnull", "Duplicate column name 'v1'");
+    }
+
+    @Test
+    public void testColumnAlias() {
+        analyzeFail("select * from test.t0 as t(a,b,c)", "Getting syntax error at line 1, column 26. " +
+                "Detail message: Unexpected input '(', the most similar input is {<EOF>, ';'}");
+        analyzeSuccess("select * from (select * from test.t0) as t(a,b,c)");
+        QueryRelation query = ((QueryStatement) analyzeSuccess("select t.a from (select * from test.t0) as t(a,b,c)"))
+                .getQueryRelation();
+        Assert.assertEquals("a", String.join(",", query.getColumnOutputNames()));
+
+        query = ((QueryStatement) analyzeSuccess("select t.a,* from (select * from test.t0) as t(a,b,c)"))
+                .getQueryRelation();
+        Assert.assertEquals("a,a,b,c", String.join(",", query.getColumnOutputNames()));
+
+        query = ((QueryStatement) analyzeSuccess("select t0.column_0, * from (values(1,2,3)) t0")).getQueryRelation();
+        Assert.assertEquals("column_0,column_0,column_1,column_2",
+                String.join(",", query.getColumnOutputNames()));
+
+        query = ((QueryStatement) analyzeSuccess("select t0.a, * from (values(1,2,3)) t0(a,b,c)")).getQueryRelation();
+        Assert.assertEquals("a,a,b,c", String.join(",", query.getColumnOutputNames()));
+    }
+
+    @Test
+    public void testRemoveLineSeparator1() {
+        String sql = "#comment\nselect /* comment */ /*+SET_VAR(disable_join_reorder=true)*/* \n" +
+                "from    \n" +
+                "tbl where-- comment\n" +
+                "col = 1 #comment\r\n" +
+                "\tand /*\n" +
+                "comment\n" +
+                "comment\n" +
+                "*/ col = \"con   tent\n" +
+                "contend\" and col = \"''```中\t文  \\\"\r\n\\r\\n\\t\\\"英  文\" and `col`= 'abc\"bcd\\\'';";
+        String res = LogUtil.removeLineSeparator(sql);
+        String expect = "#comment\n" +
+                "select /* comment */ /*+SET_VAR(disable_join_reorder=true)*/* from tbl where-- comment\n" +
+                "col = 1 #comment\r\n" +
+                " and /*\n" +
+                "comment\n" +
+                "comment\n" +
+                "*/ col = \"con   tent\n" +
+                "contend\" and col = \"''```中\t文  \\\"\r\n" +
+                "\\r\\n\\t\\\"英  文\" and `col`= 'abc\"bcd\\'';";
+        Assert.assertEquals(expect, res);
+    }
+
+    @Test
+    public void testRemoveLineSeparator2() {
+        String invalidSql = "#comment\nselect /* comment */ /*+SET_VAR(disable_join_reorder=true)*/* from    \n" +
+                "tbl where-- comment\n" +
+                "col = 1 #comment\r\n" +
+                "\tand /*\n" +
+                "comment\n" +
+                "comment\n" +
+                "*/ col = \"con   tent\n" +
+                "contend and col = \"''```中\t文  \\\"\r\n\\r\\n\\t\\\"英  文\" and `col`= 'abc\"bcd\\\'';";
+        String res = LogUtil.removeLineSeparator(invalidSql);
+        Assert.assertEquals("#comment\n" +
+                "select /* comment */ /*+SET_VAR(disable_join_reorder=true)*/* from tbl where-- comment\n" +
+                "col = 1 #comment\r\n" +
+                " and /*\n" +
+                "comment\n" +
+                "comment\n" +
+                "*/ col = \"con   tent\n" +
+                "contend and col = \"''```中\t文  \\\"\r\n" +
+                "\\r\\n\\t\\\"英  文\" and `col`= 'abc\"bcd\\'';`", res);
+    }
+
+    @Test
+    public void testRemoveCommentsOrIllegalHint() {
+        analyzeSuccess("select /*+ SET */ v1 from t0");
+        analyzeSuccess("select /*+ SET */ v1 from t0");
+        analyzeSuccess("select /*+   abc*/ v1 from t0");
+
+        analyzeSuccess("select v1 /*+*/ from t0");
+        analyzeSuccess("select v1 /*+\n*/ from t0");
+        analyzeSuccess("select v1 /*+   \n\n*/ from t0");
+        analyzeSuccess("select v1 /**/ from t0");
+        analyzeSuccess("select v1 /*    */ from t0");
+        analyzeSuccess("select v1 /*    a*/ from t0");
+        analyzeSuccess("select v1 /*abc    '中文\n'*/ from t0");
+        analyzeSuccess("select /*+ SET_VAR ('abc' = 'abc')*/ v1  from t0");
     }
 }

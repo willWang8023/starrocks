@@ -1,12 +1,30 @@
-# This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+# Copyright 2021-present StarRocks, Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 
-# where to put generated libraries
 set(LIBRARY_OUTPUT_PATH "${BUILD_DIR}/src/column")
+
+if (CLANG_TIDY_PATH)
+    set(CMAKE_CXX_CLANG_TIDY "${CLANG_TIDY_PATH}")
+endif()
 
 add_library(Column STATIC
         array_column.cpp
+        adaptive_nullable_column.cpp
         chunk.cpp
+        chunk_extra_data.cpp
         column.cpp
+        column_access_path.cpp
         column_helper.cpp
         column_viewer.cpp
         const_column.cpp
@@ -25,4 +43,6 @@ add_library(Column STATIC
         column_visitor_mutable.cpp
         json_column.cpp
         map_column.cpp
-        )
+        struct_column.cpp
+        stream_chunk.cpp
+)

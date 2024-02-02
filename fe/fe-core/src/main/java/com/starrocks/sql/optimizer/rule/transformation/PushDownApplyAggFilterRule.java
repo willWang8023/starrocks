@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
@@ -26,39 +38,41 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 
-/**
- * Push down ApplyNode and AggregationNode as a whole
- * Pattern:
- *      ApplyNode
- *      /      \
- *  LEFT     Aggregation(scalar aggregation)
- *               \
- *               Filter
- *                 \
- *                 ....
- * Before:
- *      ApplyNode
- *      /      \
- *  LEFT     Aggregate(scalar aggregation)
- *               \
- *               Filter
- *                 \
- *                 ....
- * After:
- *      ApplyNode
- *      /      \
- *  LEFT      Filter(correlation)
- *               \
- *            Aggregate(vector aggregation, group by correlation columns)
- *                 \
- *              Project(correlation columns: expression)[optional]
- *                   \
- *               Filter(un-correlation)[optional]
- *                     \
- *                      ....
- * Requirements:
- * 1. All predicate is Binary.EQ in correlation filter
- */
+// Push down ApplyNode and AggregationNode as a whole
+// Pattern:
+//      ApplyNode
+//      /      \
+//  LEFT     Aggregation(scalar aggregation)
+//               \
+//               Filter
+//                 \
+//                 ....
+//
+// Before:
+//      ApplyNode
+//      /      \
+//  LEFT     Aggregate(scalar aggregation)
+//               \
+//               Filter
+//                 \
+//                 ....
+//
+// After:
+//      ApplyNode
+//      /      \
+//  LEFT      Filter(correlation)
+//               \
+//            Aggregate(vector aggregation, group by correlation columns)
+//                 \
+//              Project(correlation columns: expression)[optional]
+//                   \
+//               Filter(un-correlation)[optional]
+//                     \
+//                      ....
+//
+// Requirements:
+// 1. All predicate is Binary.EQ in correlation filter
+//
 public class PushDownApplyAggFilterRule extends TransformationRule {
     public PushDownApplyAggFilterRule() {
         super(RuleType.TF_PUSH_DOWN_APPLY_AGG, Pattern.create(OperatorType.LOGICAL_APPLY).addChildren(
@@ -118,9 +132,7 @@ public class PushDownApplyAggFilterRule extends TransformationRule {
         CorrelatedPredicateRewriter rewriter = new CorrelatedPredicateRewriter(
                 apply.getCorrelationColumnRefs(), context);
 
-        ScalarOperator newPredicate = SubqueryUtils.rewritePredicateAndExtractColumnRefs(
-                Utils.compoundAnd(correlationPredicate), rewriter);
-
+        ScalarOperator newPredicate = rewriter.rewrite(Utils.compoundAnd(correlationPredicate));
         Map<ColumnRefOperator, ScalarOperator> innerRefMap = rewriter.getColumnRefToExprMap();
         // create new trees
 

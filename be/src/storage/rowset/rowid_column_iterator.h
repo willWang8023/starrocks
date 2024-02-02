@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -8,7 +20,7 @@
 #include "storage/rowset/common.h"
 #include "util/raw_container.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // Instead of return a batch of column values, RowIdColumnIterator just return a batch
 // of row id when you call `next_batch`.
@@ -20,26 +32,26 @@ class RowIdColumnIterator final : public starrocks::ColumnIterator {
     using rowid_t = starrocks::rowid_t;
 
 public:
-    RowIdColumnIterator() {}
+    RowIdColumnIterator() = default;
 
     ~RowIdColumnIterator() override = default;
 
-    Status init(const ColumnIteratorOptions& opts) override {
+    [[nodiscard]] Status init(const ColumnIteratorOptions& opts) override {
         _opts = opts;
         return Status::OK();
     }
 
-    Status seek_to_first() override {
+    [[nodiscard]] Status seek_to_first() override {
         _current_rowid = 0;
         return Status::OK();
     }
 
-    Status seek_to_ordinal(ordinal_t ord) override {
+    [[nodiscard]] Status seek_to_ordinal(ordinal_t ord) override {
         _current_rowid = ord;
         return Status::OK();
     }
 
-    Status next_batch(size_t* n, vectorized::Column* dst) override {
+    [[nodiscard]] Status next_batch(size_t* n, Column* dst) override {
         Buffer<rowid_t>& v = down_cast<FixedLengthColumn<rowid_t>*>(dst)->get_data();
         const size_t sz = v.size();
         raw::stl_vector_resize_uninitialized(&v, sz + *n);
@@ -51,12 +63,12 @@ public:
         return Status::OK();
     }
 
-    Status next_batch(const vectorized::SparseRange& range, vectorized::Column* dst) override {
-        vectorized::SparseRangeIterator iter = range.new_iterator();
+    [[nodiscard]] Status next_batch(const SparseRange<>& range, Column* dst) override {
+        SparseRangeIterator<> iter = range.new_iterator();
         size_t to_read = range.span_size();
         while (to_read > 0) {
             _current_rowid = iter.begin();
-            vectorized::Range r = iter.next(to_read);
+            Range<> r = iter.next(to_read);
             Buffer<rowid_t>& v = down_cast<FixedLengthColumn<rowid_t>*>(dst)->get_data();
             const size_t sz = v.size();
             raw::stl_vector_resize_uninitialized(&v, sz + r.span_size());
@@ -70,19 +82,15 @@ public:
         return Status::OK();
     }
 
-    Status fetch_values_by_rowid(const rowid_t* rowids, size_t size, vectorized::Column* values) override {
+    [[nodiscard]] Status fetch_values_by_rowid(const rowid_t* rowids, size_t size, Column* values) override {
         return Status::NotSupported("Not supported by RowIdColumnIterator: fetch_values_by_rowid");
     }
 
     ordinal_t get_current_ordinal() const override { return _current_rowid; }
 
-    Status next_batch(size_t* n, ColumnBlockView* dst, bool* has_null) override {
-        return Status::NotSupported("Not supported by RowIdColumnIterator: next_batch");
-    }
-
-    Status get_row_ranges_by_zone_map(const std::vector<const vectorized::ColumnPredicate*>& predicates,
-                                      const vectorized::ColumnPredicate* del_predicate,
-                                      vectorized::SparseRange* row_ranges) override {
+    [[nodiscard]] Status get_row_ranges_by_zone_map(const std::vector<const ColumnPredicate*>& predicates,
+                                                    const ColumnPredicate* del_predicate,
+                                                    SparseRange<>* row_ranges) override {
         return Status::NotSupported("Not supported by RowIdColumnIterator: get_row_ranges_by_zone_map");
     }
 
@@ -90,11 +98,11 @@ public:
 
     int dict_lookup(const Slice& word) override { return -1; }
 
-    Status next_dict_codes(size_t* n, vectorized::Column* dst) override {
+    [[nodiscard]] Status next_dict_codes(size_t* n, Column* dst) override {
         return Status::NotSupported("Not supported by RowIdColumnIterator: next_dict_codes");
     }
 
-    Status decode_dict_codes(const int32_t* codes, size_t size, vectorized::Column* words) override {
+    [[nodiscard]] Status decode_dict_codes(const int32_t* codes, size_t size, Column* words) override {
         return Status::NotSupported("Not supported by RowIdColumnIterator: decode_dict_codes");
     }
 
@@ -103,4 +111,4 @@ private:
     ordinal_t _current_rowid = 0;
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/segment_v2/segment_writer.h
 
@@ -30,6 +43,8 @@
 #include "gen_cpp/segment.pb.h"
 #include "gutil/macros.h"
 #include "runtime/global_dict/types.h"
+#include "storage/row_store_encoder_factory.h"
+#include "storage/tablet_schema.h"
 
 namespace starrocks {
 
@@ -39,19 +54,20 @@ class TabletColumn;
 class ShortKeyIndexBuilder;
 class MemTracker;
 class WritableFile;
-
-namespace vectorized {
 class Chunk;
-}
-
 class ColumnWriter;
+class Schema;
 
 extern const char* const k_segment_magic;
 extern const uint32_t k_segment_magic_length;
 
 struct SegmentWriterOptions {
+#ifdef BE_TEST
+    uint32_t num_rows_per_block = 100;
+#else
     uint32_t num_rows_per_block = 1024;
-    vectorized::GlobalDictByNameMaps* global_dicts = nullptr;
+#endif
+    GlobalDictByNameMaps* global_dicts = nullptr;
     std::vector<int32_t> referenced_column_ids;
 };
 
@@ -80,8 +96,8 @@ struct SegmentWriterOptions {
 //
 class SegmentWriter {
 public:
-    SegmentWriter(std::unique_ptr<WritableFile> block, uint32_t segment_id, const TabletSchema* tablet_schema,
-                  const SegmentWriterOptions& opts);
+    SegmentWriter(std::unique_ptr<WritableFile> block, uint32_t segment_id, TabletSchemaCSPtr tablet_schema,
+                  SegmentWriterOptions opts);
     ~SegmentWriter();
 
     SegmentWriter(const SegmentWriter&) = delete;
@@ -89,12 +105,14 @@ public:
 
     Status init();
 
+    Status init(bool has_key);
+
     // Used for vertical compaction
     // footer is used for partial update
     Status init(const std::vector<uint32_t>& column_indexes, bool has_key, SegmentFooterPB* footer = nullptr);
 
     // |chunk| contains partial or all columns data corresponding to _column_writers.
-    Status append_chunk(const vectorized::Chunk& chunk);
+    Status append_chunk(const Chunk& chunk);
 
     uint64_t estimate_segment_size();
 
@@ -112,9 +130,11 @@ public:
 
     uint32_t segment_id() const { return _segment_id; }
 
-    const vectorized::DictColumnsValidMap& global_dict_columns_valid_info() { return _global_dict_columns_valid_info; }
+    const DictColumnsValidMap& global_dict_columns_valid_info() { return _global_dict_columns_valid_info; }
 
-    std::string segment_path() const;
+    const std::string& segment_path() const;
+
+    uint64_t current_filesz() const;
 
 private:
     Status _write_short_key_index();
@@ -123,7 +143,7 @@ private:
     void _init_column_meta(ColumnMetaPB* meta, uint32_t column_id, const TabletColumn& column);
 
     uint32_t _segment_id;
-    const TabletSchema* _tablet_schema;
+    TabletSchemaCSPtr _tablet_schema;
     SegmentWriterOptions _opts;
 
     std::unique_ptr<WritableFile> _wfile;
@@ -133,13 +153,15 @@ private:
     std::vector<std::unique_ptr<ColumnWriter>> _column_writers;
     std::vector<uint32_t> _column_indexes;
     bool _has_key = true;
+    std::vector<uint32_t> _sort_column_indexes;
+    std::unique_ptr<Schema> _schema_without_full_row_column;
 
     // num rows written when appending [partial] columns
     uint32_t _num_rows_written = 0;
     // segment total num rows
     uint32_t _num_rows = 0;
 
-    vectorized::DictColumnsValidMap _global_dict_columns_valid_info;
+    DictColumnsValidMap _global_dict_columns_valid_info;
 };
 
 } // namespace starrocks

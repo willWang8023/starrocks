@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -45,6 +57,8 @@ public:
     virtual size_t capacity() const = 0;
     // The default capacity when there isn't chunk memory usage statistics.
     virtual size_t default_capacity() const = 0;
+    // Update mem limit of this chunk buffer
+    virtual void update_mem_limit(int64_t value) {}
 };
 
 // The capacity of this limiter is unlimited.
@@ -103,8 +117,8 @@ public:
             : _capacity(default_capacity),
               _max_capacity(max_capacity),
               _default_capacity(default_capacity),
-              _mem_limit(mem_limit),
-              _chunk_size(chunk_size) {}
+              _mem_limit(mem_limit) {}
+
     ~DynamicChunkBufferLimiter() override = default;
 
     void update_avg_row_bytes(size_t added_sum_row_bytes, size_t added_num_rows, size_t max_chunk_rows) override;
@@ -115,6 +129,7 @@ public:
     size_t size() const override { return _pinned_chunks_counter; }
     size_t capacity() const override { return _capacity; }
     size_t default_capacity() const override { return _default_capacity; }
+    void update_mem_limit(int64_t value) override;
 
 private:
     void _unpin(int num_chunks);
@@ -128,8 +143,7 @@ private:
     const size_t _max_capacity;
     const size_t _default_capacity;
 
-    const int64_t _mem_limit;
-    const int _chunk_size;
+    std::atomic<int64_t> _mem_limit;
 
     std::atomic<int> _pinned_chunks_counter = 0;
 };

@@ -1,11 +1,26 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "runtime/sorted_chunks_merger.h"
 
 #include "column/chunk.h"
 #include "exec/sort_exec_exprs.h"
+#include "exec/sorting/sorting.h"
+#include "runtime/chunk_cursor.h"
+#include "runtime/runtime_state.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 SortedChunksMerger::SortedChunksMerger(RuntimeState* state, bool is_pipeline)
         : _state(state), _is_pipeline(is_pipeline) {}
@@ -95,7 +110,7 @@ void SortedChunksMerger::init_for_min_heap() {
         _min_heap.reserve(_cursors.size());
         for (auto& cursor_ptr : _cursors) {
             ChunkCursor* cursor = cursor_ptr.get();
-            cursor->reset_with_next_chunk_for_pipeline();
+            cursor->next_chunk_for_pipeline();
             cursor->next_for_pipeline();
             if (cursor->is_valid()) {
                 _min_heap.push_back(cursor);
@@ -201,10 +216,10 @@ Status SortedChunksMerger::get_next_for_pipeline(ChunkPtr* chunk, std::atomic<bo
 
     /*
      * Because compute thread couldn't blocking in pipeline, and merge-sort is
-     * accept chunks from network in default, so if chunk hasn't come compute thread
-     * should exit this operator and come back when you have data.
-     * STEP 0 as the process to collect merged result.
-     * STEP 1 as the process to drive cursor move to next row then execute STEP 0.
+     * accept chunks from network in default, so if chunk hasn't come, this process
+     * should exit get back when data is arrived.
+     * STEP 0 denotes the process of collecting merged result.
+     * STEP 1 denotes the process to driving cursor move to next row then execute STEP 0.
      * STEP 2 is almost like STEP 1 except it is executed when data is ready. 
      * 
      */
@@ -286,4 +301,97 @@ void SortedChunksMerger::collect_merged_chunks(ChunkPtr* chunk) {
     _row_number = 0;
 }
 
-} // namespace starrocks::vectorized
+CascadeChunkMerger::CascadeChunkMerger(RuntimeState* state) : ChunkMerger(state), _sort_exprs(nullptr) {}
+
+Status CascadeChunkMerger::init(const std::vector<ChunkProvider>& providers,
+                                const std::vector<ExprContext*>* sort_exprs, const SortDescs& sort_desc) {
+    std::vector<std::unique_ptr<SimpleChunkSortCursor>> cursors;
+    for (const auto& provider : providers) {
+        cursors.push_back(std::make_unique<SimpleChunkSortCursor>(provider, sort_exprs));
+    }
+    _sort_exprs = sort_exprs;
+    _sort_desc = sort_desc;
+    _merger = std::make_unique<MergeCursorsCascade>();
+    RETURN_IF_ERROR(_merger->init(_sort_desc, std::move(cursors)));
+    return Status::OK();
+}
+Status CascadeChunkMerger::init(const std::vector<ChunkProvider>& providers,
+                                const std::vector<ExprContext*>* sort_exprs, const std::vector<bool>* sort_orders,
+                                const std::vector<bool>* null_firsts) {
+    auto descs = SortDescs(*sort_orders, *null_firsts);
+    RETURN_IF_ERROR(init(providers, sort_exprs, descs));
+    return Status::OK();
+}
+
+bool CascadeChunkMerger::is_data_ready() {
+    return _merger->is_data_ready();
+}
+
+Status CascadeChunkMerger::get_next(ChunkUniquePtr* output, std::atomic<bool>* eos, bool* should_exit) {
+    if (_merger->is_eos()) {
+        *eos = true;
+        *should_exit = true;
+        return Status::OK();
+    }
+    if (_current_chunk.empty()) {
+        ChunkUniquePtr chunk = _merger->try_get_next();
+        if (!chunk) {
+            *eos = _merger->is_eos();
+            *should_exit = true;
+            return Status::OK();
+        }
+        _current_chunk.reset(std::move(chunk));
+    }
+    *output = _current_chunk.cutoff(_state->chunk_size());
+
+    return Status::OK();
+}
+
+ConstChunkMerger::ConstChunkMerger(RuntimeState* state) : ChunkMerger(state) {}
+
+Status ConstChunkMerger::init(const std::vector<ChunkProvider>& providers, const std::vector<ExprContext*>* sort_exprs,
+                              const SortDescs& sort_desc) {
+    for (const auto& expr : *sort_exprs) {
+        DCHECK(expr->root()->is_constant());
+    }
+    _providers = providers;
+    return Status::OK();
+}
+Status ConstChunkMerger::init(const std::vector<ChunkProvider>& providers, const std::vector<ExprContext*>* sort_exprs,
+                              const std::vector<bool>* sort_orders, const std::vector<bool>* null_firsts) {
+    for (const auto& expr : *sort_exprs) {
+        DCHECK(expr->root()->is_constant());
+    }
+    _providers = providers;
+    return Status::OK();
+}
+
+bool ConstChunkMerger::is_data_ready() {
+    for (const auto& p : _providers) {
+        if (p(nullptr, nullptr)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+Status ConstChunkMerger::get_next(ChunkUniquePtr* output, std::atomic<bool>* eos, bool* should_exit) {
+    bool all = true;
+    bool c = false;
+    for (const auto& p : _providers) {
+        c = false;
+        if (p(output, &c)) {
+            *eos = false;
+            return Status::OK();
+        }
+        all &= c;
+    }
+
+    *eos = all;
+    if (*eos) {
+        *should_exit = true;
+    }
+    return Status::OK();
+}
+
+} // namespace starrocks

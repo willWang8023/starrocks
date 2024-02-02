@@ -26,6 +26,7 @@
 
 #include "common/compiler_util.h"
 #include "gutil/macros.h"
+#include "util/cpu_info.h"
 
 namespace starrocks {
 
@@ -117,7 +118,7 @@ public:
         }
     }
 
-    ~CoreLocalValue() {
+    ~CoreLocalValue() noexcept {
         for (int i = 0; i < _size; ++i) {
             _values[i]->~T();
         }

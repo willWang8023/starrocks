@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 #include "storage/horizontal_compaction_task.h"
 
 #include <vector>
@@ -20,6 +33,7 @@ namespace starrocks {
 
 Status HorizontalCompactionTask::run_impl() {
     Statistics statistics;
+    RETURN_IF_ERROR(_shortcut_compact(&statistics));
     RETURN_IF_ERROR(_horizontal_compact_data(&statistics));
 
     TRACE_COUNTER_INCREMENT("merged_rows", statistics.merged_rows);
@@ -29,26 +43,30 @@ Status HorizontalCompactionTask::run_impl() {
     RETURN_IF_ERROR(_validate_compaction(statistics));
     TRACE("[Compaction] horizontal compaction validated");
 
-    _commit_compaction();
+    RETURN_IF_ERROR(_commit_compaction());
     TRACE("[Compaction] horizontal compaction committed");
 
     return Status::OK();
 }
 
 Status HorizontalCompactionTask::_horizontal_compact_data(Statistics* statistics) {
+    if (_output_rowset != nullptr) {
+        return Status::OK();
+    }
     TRACE("[Compaction] start horizontal comapction data");
     // 1: init
     int64_t max_rows_per_segment = CompactionUtils::get_segment_max_rows(
             config::max_segment_file_size, _task_info.input_rows_num, _task_info.input_rowsets_size);
 
     std::unique_ptr<RowsetWriter> output_rs_writer;
-    RETURN_IF_ERROR(CompactionUtils::construct_output_rowset_writer(
-            _tablet.get(), max_rows_per_segment, _task_info.algorithm, _task_info.output_version, &output_rs_writer));
+    RETURN_IF_ERROR(CompactionUtils::construct_output_rowset_writer(_tablet.get(), max_rows_per_segment,
+                                                                    _task_info.algorithm, _task_info.output_version,
+                                                                    &output_rs_writer, _tablet_schema));
 
-    vectorized::Schema schema = ChunkHelper::convert_schema_to_format_v2(_tablet->tablet_schema());
-    vectorized::TabletReader reader(std::static_pointer_cast<Tablet>(_tablet->shared_from_this()),
-                                    output_rs_writer->version(), schema);
-    vectorized::TabletReaderParams reader_params;
+    Schema schema = ChunkHelper::convert_schema(_tablet_schema);
+    TabletReader reader(std::static_pointer_cast<Tablet>(_tablet->shared_from_this()), output_rs_writer->version(),
+                        schema, _tablet_schema);
+    TabletReaderParams reader_params;
     DCHECK(compaction_type() == BASE_COMPACTION || compaction_type() == CUMULATIVE_COMPACTION);
     reader_params.reader_type =
             compaction_type() == BASE_COMPACTION ? READER_BASE_COMPACTION : READER_CUMULATIVE_COMPACTION;
@@ -98,11 +116,14 @@ Status HorizontalCompactionTask::_horizontal_compact_data(Statistics* statistics
         statistics->filtered_rows = reader.stats().rows_del_filtered;
     }
 
+    if (config::enable_rowset_verify) {
+        RETURN_IF_ERROR(_output_rowset->verify());
+    }
+
     return Status::OK();
 }
 
-StatusOr<size_t> HorizontalCompactionTask::_compact_data(int32_t chunk_size, vectorized::TabletReader& reader,
-                                                         const vectorized::Schema& schema,
+StatusOr<size_t> HorizontalCompactionTask::_compact_data(int32_t chunk_size, TabletReader& reader, const Schema& schema,
                                                          RowsetWriter* output_rs_writer) {
     TRACE("[Compaction] start to compact data");
     auto status = Status::OK();
@@ -130,7 +151,7 @@ StatusOr<size_t> HorizontalCompactionTask::_compact_data(int32_t chunk_size, vec
             }
         }
 
-        ChunkHelper::padding_char_columns(char_field_indexes, schema, _tablet->tablet_schema(), chunk.get());
+        ChunkHelper::padding_char_columns(char_field_indexes, schema, _tablet_schema, chunk.get());
 
         RETURN_IF_ERROR(output_rs_writer->add_chunk(*chunk));
         output_rows += chunk->num_rows();

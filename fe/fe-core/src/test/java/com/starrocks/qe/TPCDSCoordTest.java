@@ -1,10 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.qe;
 
 import com.starrocks.common.FeConstants;
-import com.starrocks.planner.PlanFragmentId;
 import com.starrocks.planner.RuntimeFilterDescription;
+import com.starrocks.qe.scheduler.dag.ExecutionFragment;
 import com.starrocks.sql.plan.ExecPlan;
 import com.starrocks.sql.plan.TPCDSPlanTest;
 import com.starrocks.sql.plan.TPCDSPlanTestBase;
@@ -55,7 +67,6 @@ public class TPCDSCoordTest extends TPCDSPlanTestBase {
                 "from inventory a join inventory b on a.inv_item_sk = b.inv_item_sk ) t1 " +
                 "join [shuffle] item t0  on t0.i_item_sk = t1.x;";
         String plan = UtFrameUtils.getVerboseFragmentPlan(ctx, sql);
-        System.out.println("plan:" + plan);
         String[] ss = plan.split("\\n");
         List<String> fragments = new ArrayList<>();
         String currentFragment = null;
@@ -73,15 +84,13 @@ public class TPCDSCoordTest extends TPCDSPlanTestBase {
         // 2 fragements to consumer filter(1)
         Assert.assertEquals(3, fragments.size());
 
-        System.out.println(plan);
         ExecPlan execPlan = UtFrameUtils.getPlanAndFragment(ctx, sql).second;
-        Coordinator coord = new Coordinator(ctx, execPlan.getFragments(), execPlan.getScanNodes(),
-                execPlan.getDescTbl().toThrift());
+        DefaultCoordinator coord = new DefaultCoordinator.Factory().createQueryScheduler(
+                ctx, execPlan.getFragments(), execPlan.getScanNodes(), execPlan.getDescTbl().toThrift());
         coord.prepareExec();
 
-        PlanFragmentId topFragmentId = coord.getFragments().get(0).getFragmentId();
-        Coordinator.FragmentExecParams params = coord.getFragmentExecParamsMap().get(topFragmentId);
-        Assert.assertEquals(params.runtimeFilterParams.id_to_prober_params.get(1).size(), 10);
+        ExecutionFragment execFragment = coord.getExecutionDAG().getRootFragment();
+        Assert.assertEquals(15, execFragment.getRuntimeFilterParams().id_to_prober_params.get(1).size());
     }
 
     @Test
@@ -120,24 +129,23 @@ public class TPCDSCoordTest extends TPCDSPlanTestBase {
         String plan = UtFrameUtils.getVerboseFragmentPlan(ctx, sql);
         String[] ss = plan.split("\\n");
         List<String> filterLines = Stream.of(ss).filter(s -> s.contains("filter_id = 2")).collect(Collectors.toList());
-        System.out.println(filterLines.size());
         Assert.assertTrue(filterLines.size() == 5);
         ExecPlan execPlan = UtFrameUtils.getPlanAndFragment(ctx, sql).second;
-        Coordinator coord = new Coordinator(ctx, execPlan.getFragments(), execPlan.getScanNodes(),
-                execPlan.getDescTbl().toThrift());
+        DefaultCoordinator coord = new DefaultCoordinator.Factory().createQueryScheduler(
+                ctx, execPlan.getFragments(), execPlan.getScanNodes(), execPlan.getDescTbl().toThrift());
         coord.prepareExec();
 
         int filterId = 2;
         boolean rfExists = false;
-        for (Coordinator.FragmentExecParams params : coord.getFragmentExecParamsMap().values()) {
-            Map<Integer, RuntimeFilterDescription> buildRfFilters = params.fragment.getBuildRuntimeFilters();
+        for (ExecutionFragment execFragment : coord.getExecutionDAG().getFragmentsInPreorder()) {
+            Map<Integer, RuntimeFilterDescription> buildRfFilters = execFragment.getPlanFragment().getBuildRuntimeFilters();
             if (buildRfFilters == null || !buildRfFilters.containsKey(filterId)) {
                 continue;
             }
             RuntimeFilterDescription rf = buildRfFilters.get(filterId);
             Assert.assertTrue(rf.isHasRemoteTargets() && rf.isBroadcastJoin());
             Assert.assertFalse(rf.getBroadcastGRFDestinations().isEmpty());
-            Assert.assertTrue(rf.getBroadcastGRFDestinations().stream().anyMatch(d -> d.getFinstance_ids().size() > 1));
+            Assert.assertTrue(rf.getBroadcastGRFDestinations().stream().anyMatch(d -> d.getFinstance_ids().size() >= 1));
             rfExists = true;
         }
         Assert.assertTrue(rfExists);

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.optimizer.rule.tree;
 
@@ -11,6 +23,7 @@ import com.starrocks.sql.optimizer.operator.scalar.CallOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CaseWhenOperator;
 import com.starrocks.sql.optimizer.operator.scalar.CastOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
+import com.starrocks.sql.optimizer.operator.scalar.CompoundPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ConstantOperator;
 import com.starrocks.sql.optimizer.operator.scalar.DictMappingOperator;
 import com.starrocks.sql.optimizer.operator.scalar.InPredicateOperator;
@@ -21,7 +34,7 @@ import com.starrocks.sql.optimizer.operator.scalar.ScalarOperatorVisitor;
 
 import java.util.List;
 
-import static com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator.BinaryType.EQ_FOR_NULL;
+import static com.starrocks.analysis.BinaryType.EQ_FOR_NULL;
 
 // Rewrite ScalarOperator as DictMappingOperator
 // if a ScalarOperator support dictionary optimization, we will rewrite it to DictMappingOperator
@@ -92,9 +105,8 @@ public class DictMappingRewriter {
                     hasApplied = hasApplied || context.hasAppliedOperator;
                     disableApplied = disableApplied || context.hasUnsupportedOperator;
                 }
-                Preconditions.checkState(hasApplied);
-                if (!disableApplied) {
-                    context.hasAppliedOperator = true;
+                if (!disableApplied || !hasApplied) {
+                    context.hasAppliedOperator = hasApplied;
                     return operator;
                 } else {
                     context.hasAppliedOperator = false;
@@ -140,7 +152,7 @@ public class DictMappingRewriter {
 
         @Override
         public ScalarOperator visitCall(CallOperator call, RewriterContext context) {
-            if (!call.getFunction().isCouldApplyDictOptimize()) {
+            if (call.getFunction() == null || !call.getFunction().isCouldApplyDictOptimize()) {
                 context.hasAppliedOperator = false;
                 context.hasUnsupportedOperator = true;
                 return visit(call, context);
@@ -150,7 +162,8 @@ public class DictMappingRewriter {
 
         @Override
         public ScalarOperator visitBinaryPredicate(BinaryPredicateOperator predicate, RewriterContext context) {
-            if (predicate.getBinaryType() == EQ_FOR_NULL) {
+            if (predicate.getBinaryType() == EQ_FOR_NULL || !predicate.getChild(1).isConstant() ||
+                    !predicate.getChild(0).isColumnRef()) {
                 context.hasAppliedOperator = false;
                 context.hasUnsupportedOperator = true;
                 return visit(predicate, context);
@@ -208,6 +221,11 @@ public class DictMappingRewriter {
         public ScalarOperator visitLikePredicateOperator(LikePredicateOperator operator, RewriterContext context) {
             operator.setChild(0, operator.getChild(0).accept(this, context));
             return operator;
+        }
+
+        @Override
+        public ScalarOperator visitCompoundPredicate(CompoundPredicateOperator operator, RewriterContext context) {
+            return rewriteForScalarOperator(operator, context);
         }
 
     }

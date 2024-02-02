@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/mysql_result_writer.cpp
 
@@ -28,14 +41,18 @@
 #include "exprs/expr.h"
 #include "runtime/buffer_control_block.h"
 #include "runtime/current_thread.h"
-#include "runtime/primitive_type.h"
+#include "types/logical_type.h"
 #include "util/mysql_row_buffer.h"
 
 namespace starrocks {
 
 MysqlResultWriter::MysqlResultWriter(BufferControlBlock* sinker, const std::vector<ExprContext*>& output_expr_ctxs,
-                                     RuntimeProfile* parent_profile)
-        : _sinker(sinker), _output_expr_ctxs(output_expr_ctxs), _row_buffer(nullptr), _parent_profile(parent_profile) {}
+                                     bool is_binary_format, RuntimeProfile* parent_profile)
+        : _sinker(sinker),
+          _output_expr_ctxs(output_expr_ctxs),
+          _row_buffer(nullptr),
+          _is_binary_format(is_binary_format),
+          _parent_profile(parent_profile) {}
 
 MysqlResultWriter::~MysqlResultWriter() {
     delete _row_buffer;
@@ -47,7 +64,7 @@ Status MysqlResultWriter::init(RuntimeState* state) {
         return Status::InternalError("sinker is NULL pointer.");
     }
 
-    _row_buffer = new (std::nothrow) MysqlRowBuffer();
+    _row_buffer = new (std::nothrow) MysqlRowBuffer(_is_binary_format);
 
     if (nullptr == _row_buffer) {
         return Status::InternalError("no memory to alloc.");
@@ -63,7 +80,7 @@ void MysqlResultWriter::_init_profile() {
     _sent_rows_counter = ADD_COUNTER(_parent_profile, "NumSentRows", TUnit::UNIT);
 }
 
-Status MysqlResultWriter::append_chunk(vectorized::Chunk* chunk) {
+Status MysqlResultWriter::append_chunk(Chunk* chunk) {
     if (nullptr == chunk || 0 == chunk->num_rows()) {
         return Status::OK();
     }
@@ -79,8 +96,8 @@ Status MysqlResultWriter::append_chunk(vectorized::Chunk* chunk) {
     // Note: this method will delete result pointer if status is OK
     // TODO(kks): use std::unique_ptr instead of raw pointer
     auto add_status = _sinker->add_batch(fetch_data);
-    if (status.ok()) {
-        _written_rows += num_rows;
+    if (add_status.ok()) {
+        _written_rows += static_cast<int64_t>(num_rows);
         return add_status;
     } else {
         LOG(WARNING) << "append result batch to sink failed.";
@@ -95,14 +112,14 @@ Status MysqlResultWriter::close() {
     return Status::OK();
 }
 
-StatusOr<TFetchDataResultPtr> MysqlResultWriter::_process_chunk(vectorized::Chunk* chunk) {
+StatusOr<TFetchDataResultPtr> MysqlResultWriter::_process_chunk(Chunk* chunk) {
     SCOPED_TIMER(_append_chunk_timer);
     int num_rows = chunk->num_rows();
     auto result = std::make_unique<TFetchDataResult>();
     auto& result_rows = result->result_batch.rows;
     result_rows.resize(num_rows);
 
-    vectorized::Columns result_columns;
+    Columns result_columns;
     // Step 1: compute expr
     int num_columns = _output_expr_ctxs.size();
     result_columns.reserve(num_columns);
@@ -110,7 +127,7 @@ StatusOr<TFetchDataResultPtr> MysqlResultWriter::_process_chunk(vectorized::Chun
     for (int i = 0; i < num_columns; ++i) {
         ASSIGN_OR_RETURN(ColumnPtr column, _output_expr_ctxs[i]->evaluate(chunk));
         column = _output_expr_ctxs[i]->root()->type().type == TYPE_TIME
-                         ? vectorized::ColumnHelper::convert_time_column_from_double_to_str(column)
+                         ? ColumnHelper::convert_time_column_from_double_to_str(column)
                          : column;
         result_columns.emplace_back(std::move(column));
     }
@@ -121,6 +138,9 @@ StatusOr<TFetchDataResultPtr> MysqlResultWriter::_process_chunk(vectorized::Chun
         SCOPED_TIMER(_convert_tuple_timer);
         for (int i = 0; i < num_rows; ++i) {
             DCHECK_EQ(0, _row_buffer->length());
+            if (_is_binary_format) {
+                _row_buffer->start_binary_row(num_columns);
+            };
             for (auto& result_column : result_columns) {
                 result_column->put_mysql_row_buffer(_row_buffer, i);
             }
@@ -132,12 +152,12 @@ StatusOr<TFetchDataResultPtr> MysqlResultWriter::_process_chunk(vectorized::Chun
     return result;
 }
 
-StatusOr<TFetchDataResultPtrs> MysqlResultWriter::process_chunk(vectorized::Chunk* chunk) {
+StatusOr<TFetchDataResultPtrs> MysqlResultWriter::process_chunk(Chunk* chunk) {
     SCOPED_TIMER(_append_chunk_timer);
     int num_rows = chunk->num_rows();
     std::vector<TFetchDataResultPtr> results;
 
-    vectorized::Columns result_columns;
+    Columns result_columns;
     // Step 1: compute expr
     int num_columns = _output_expr_ctxs.size();
     result_columns.reserve(num_columns);
@@ -145,7 +165,7 @@ StatusOr<TFetchDataResultPtrs> MysqlResultWriter::process_chunk(vectorized::Chun
     for (int i = 0; i < num_columns; ++i) {
         ASSIGN_OR_RETURN(ColumnPtr column, _output_expr_ctxs[i]->evaluate(chunk));
         column = _output_expr_ctxs[i]->root()->type().type == TYPE_TIME
-                         ? vectorized::ColumnHelper::convert_time_column_from_double_to_str(column)
+                         ? ColumnHelper::convert_time_column_from_double_to_str(column)
                          : column;
         result_columns.emplace_back(std::move(column));
     }
@@ -163,6 +183,9 @@ StatusOr<TFetchDataResultPtrs> MysqlResultWriter::process_chunk(vectorized::Chun
 
         for (int i = 0; i < num_rows; ++i) {
             DCHECK_EQ(0, _row_buffer->length());
+            if (_is_binary_format) {
+                _row_buffer->start_binary_row(num_columns);
+            }
             for (auto& result_column : result_columns) {
                 result_column->put_mysql_row_buffer(_row_buffer, i);
             }

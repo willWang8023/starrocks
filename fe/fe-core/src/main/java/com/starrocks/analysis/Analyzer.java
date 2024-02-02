@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/Analyzer.java
 
@@ -21,7 +34,6 @@
 
 package com.starrocks.analysis;
 
-import com.google.common.base.Strings;
 import com.google.common.collect.ArrayListMultimap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
@@ -29,10 +41,7 @@ import com.google.common.collect.Multimap;
 import com.google.common.collect.Sets;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.Database;
-import com.starrocks.catalog.OlapTable;
-import com.starrocks.catalog.OlapTable.OlapTableState;
 import com.starrocks.catalog.Table;
-import com.starrocks.catalog.Table.TableType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ErrorCode;
@@ -91,7 +100,7 @@ public class Analyzer {
     // a tuple is outer/semi joined, etc. Remove the maps in favor of making
     // them properties of the tuple descriptor itself.
     private static class GlobalState {
-        private final DescriptorTable descTbl = new DescriptorTable();
+        private DescriptorTable descTbl = new DescriptorTable();
         private final GlobalStateMgr globalStateMgr;
         private final ConnectContext context;
 
@@ -219,64 +228,6 @@ public class Analyzer {
         return result;
     }
 
-    /**
-     * Resolves the given TableRef into a concrete BaseTableRef, ViewRef or
-     * CollectionTableRef. Returns the new resolved table ref or the given table
-     * ref if it is already resolved.
-     * Registers privilege requests and throws an AnalysisException if the tableRef's
-     * path could not be resolved. The privilege requests are added to ensure that
-     * an AuthorizationException is preferred over an AnalysisException so as not to
-     * accidentally reveal the non-existence of tables/databases.
-     * <p>
-     * TODO(zc): support collection table ref
-     */
-    public TableRef resolveTableRef(TableRef tableRef) throws AnalysisException {
-        // Return the table if it is already resolved.
-        if (tableRef.isResolved()) {
-            return tableRef;
-        }
-        // Try to find a matching local view.
-        TableName tableName = tableRef.getName();
-        if (!tableName.isFullyQualified()) {
-            // Searches the hierarchy of analyzers bottom-up for a registered local view with
-            // a matching alias.
-            String viewAlias = tableName.getTbl();
-            Analyzer analyzer = this;
-            do {
-                analyzer = (analyzer.ancestors.isEmpty() ? null : analyzer.ancestors.get(0));
-            } while (analyzer != null);
-        }
-
-        // Resolve the table ref's path and determine what resolved table ref
-        // to replace it with.
-        String dbName = tableName.getDb();
-        if (Strings.isNullOrEmpty(dbName)) {
-            dbName = getDefaultDb();
-        }
-        if (Strings.isNullOrEmpty(dbName)) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_NO_DB_ERROR);
-        }
-
-        Database database = globalState.globalStateMgr.getDb(dbName);
-        if (database == null) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
-        }
-
-        Table table = database.getTable(tableName.getTbl());
-        if (table == null) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_TABLE_ERROR, tableName.getTbl());
-        }
-
-        if (table.getType() == TableType.OLAP && (((OlapTable) table).getState() == OlapTableState.RESTORE
-                || ((OlapTable) table).getState() == OlapTableState.RESTORE_WITH_LOAD)) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_TABLE_STATE, "RESTORING");
-        }
-
-        TableName tblName = new TableName(database.getFullName(), table.getName());
-        // The table must be a base table.
-        return new BaseTableRef(tableRef, table, tblName);
-    }
-
     public Table getTable(TableName tblName) {
         Database db = globalState.globalStateMgr.getDb(tblName.getDb());
         if (db == null) {
@@ -384,6 +335,10 @@ public class Analyzer {
         return globalState.descTbl;
     }
 
+    public void setDescTbl(DescriptorTable descTbl) {
+        this.globalState.descTbl = descTbl;
+    }
+
     public GlobalStateMgr getCatalog() {
         return globalState.globalStateMgr;
     }
@@ -410,10 +365,6 @@ public class Analyzer {
 
     public String getDefaultCatalog() {
         return globalState.context.getCurrentCatalog();
-    }
-
-    public String getQualifiedUser() {
-        return globalState.context.getQualifiedUser();
     }
 
     public ConnectContext getContext() {

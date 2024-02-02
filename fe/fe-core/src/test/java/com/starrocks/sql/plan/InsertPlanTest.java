@@ -1,18 +1,49 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.plan;
 
-import com.starrocks.analysis.StatementBase;
+import com.google.common.collect.Lists;
+import com.starrocks.catalog.Column;
+import com.starrocks.catalog.Database;
+import com.starrocks.catalog.IcebergTable;
+import com.starrocks.catalog.Type;
+import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
+import com.starrocks.common.util.UUIDUtil;
+import com.starrocks.qe.SessionVariable;
+import com.starrocks.server.MetadataMgr;
 import com.starrocks.sql.InsertPlanner;
 import com.starrocks.sql.StatementPlanner;
+import com.starrocks.sql.analyzer.AstToSQLBuilder;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.InsertStmt;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.optimizer.dump.QueryDumpInfo;
+import com.starrocks.sql.parser.SqlParser;
 import com.starrocks.thrift.TExplainLevel;
+import mockit.Expectations;
+import org.apache.iceberg.BaseTable;
+import org.apache.iceberg.SortOrder;
+import org.apache.iceberg.Table;
+import org.apache.iceberg.hadoop.HadoopFileIO;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.stream.Stream;
 
 public class InsertPlanTest extends PlanTestBase {
@@ -80,8 +111,7 @@ public class InsertPlanTest extends PlanTestBase {
                 "     tabletRatio=0/0\n" +
                 "     tabletList=\n" +
                 "     cardinality=1\n" +
-                "     avgRowSize=3.0\n" +
-                "     numNodes=0"));
+                "     avgRowSize=3.0\n"));
     }
 
     @Test
@@ -95,8 +125,7 @@ public class InsertPlanTest extends PlanTestBase {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         String createMVSQL = "create materialized view mvs as select v1,sum(v2) from test_insert_mv_sum group by v1";
@@ -134,8 +163,7 @@ public class InsertPlanTest extends PlanTestBase {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         String createMVSQL =
@@ -152,11 +180,11 @@ public class InsertPlanTest extends PlanTestBase {
 
         explainString = getInsertExecPlan("insert into test_insert_mv_count(v1) values(1)");
         Assert.assertTrue(explainString.contains("OUTPUT EXPRS:1: column_0 | 2: expr | 3: expr | 4: if"));
-        Assert.assertTrue(explainString.contains(
+        Assert.assertTrue(explainString, explainString.contains(
                 "  |  <slot 1> : 1: column_0\n" +
                         "  |  <slot 2> : NULL\n" +
                         "  |  <slot 3> : NULL\n" +
-                        "  |  <slot 4> : if(NULL IS NULL, 0, 1)"));
+                        "  |  <slot 4> : 0"));
 
         explainString = getInsertExecPlan("insert into test_insert_mv_count(v3,v1) values(3,1)");
 
@@ -165,16 +193,16 @@ public class InsertPlanTest extends PlanTestBase {
                 "  |  <slot 1> : 1: column_0\n" +
                         "  |  <slot 2> : 2: column_1\n" +
                         "  |  <slot 3> : NULL\n" +
-                        "  |  <slot 4> : if(NULL IS NULL, 0, 1)"));
+                        "  |  <slot 4> : 0"));
 
         explainString = getInsertExecPlan("insert into test_insert_mv_count select 1,2,3");
         Assert.assertTrue(explainString.contains("OUTPUT EXPRS:6: v1 | 7: v2 | 8: v3 | 5: if"));
         Assert.assertTrue(explainString.contains(
                 "1:Project\n" +
-                        "  |  <slot 5> : if(2 IS NULL, 0, 1)\n" +
-                        "  |  <slot 6> : CAST(1 AS BIGINT)\n" +
-                        "  |  <slot 7> : CAST(2 AS BIGINT)\n" +
-                        "  |  <slot 8> : CAST(3 AS BIGINT)"));
+                        "  |  <slot 5> : 1\n" +
+                        "  |  <slot 6> : 1\n" +
+                        "  |  <slot 7> : 2\n" +
+                        "  |  <slot 8> : 3"));
 
         starRocksAssert.dropTable("test_insert_mv_count");
     }
@@ -190,8 +218,7 @@ public class InsertPlanTest extends PlanTestBase {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         starRocksAssert.withTable("CREATE TABLE `ti2` (\n" +
@@ -203,8 +230,7 @@ public class InsertPlanTest extends PlanTestBase {
                 "DISTRIBUTED BY HASH(`v1`) BUCKETS 3\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
 
         String explainString = getInsertExecPlan("insert into ti1 select * from ti2");
@@ -224,17 +250,18 @@ public class InsertPlanTest extends PlanTestBase {
         explainString = getInsertExecPlan("insert into ti2(v2,v1,v3) select v1,2,NULL from ti1");
         Assert.assertTrue(explainString.contains("OUTPUT EXPRS:7: v1 | 1: v1 | 8: v3 | 6: to_bitmap"));
         Assert.assertTrue(explainString.contains(
-                "  |  <slot 1> : 1: v1\n" +
-                        "  |  <slot 6> : to_bitmap(CAST(1: v1 AS VARCHAR))\n" +
-                        "  |  <slot 7> : CAST(2 AS BIGINT)\n" +
+                "  1:Project\n" +
+                        "  |  <slot 1> : 1: v1\n" +
+                        "  |  <slot 6> : to_bitmap(1: v1)\n" +
+                        "  |  <slot 7> : 2\n" +
                         "  |  <slot 8> : NULL\n"));
 
         explainString = getInsertExecPlan("insert into ti2 select * from ti2");
-        Assert.assertTrue(explainString.contains("  1:Project\n" +
+        Assert.assertTrue(explainString.contains("1:Project\n" +
                 "  |  <slot 1> : 1: v1\n" +
                 "  |  <slot 2> : 2: v2\n" +
                 "  |  <slot 3> : 3: v3\n" +
-                "  |  <slot 5> : to_bitmap(CAST(2: v2 AS VARCHAR))"));
+                "  |  <slot 5> : to_bitmap(2: v2)"));
     }
 
     @Test
@@ -260,8 +287,7 @@ public class InsertPlanTest extends PlanTestBase {
                 "     tabletRatio=0/0\n" +
                 "     tabletList=\n" +
                 "     cardinality=1\n" +
-                "     avgRowSize=4.0\n" +
-                "     numNodes=0"));
+                "     avgRowSize=4.0\n"));
 
         sql = "insert into test.mysql_table(k1) select v1 from t0";
         explainString = getInsertExecPlan(sql);
@@ -284,8 +310,7 @@ public class InsertPlanTest extends PlanTestBase {
                 "     tabletRatio=0/0\n" +
                 "     tabletList=\n" +
                 "     cardinality=1\n" +
-                "     avgRowSize=3.0\n" +
-                "     numNodes=0"));
+                "     avgRowSize=3.0\n"));
     }
 
     @Test
@@ -307,7 +332,7 @@ public class InsertPlanTest extends PlanTestBase {
                 ") ENGINE=OLAP DUPLICATE KEY(`k1`, `k2`, `k3`, `k4`, `k5`) " +
                 "COMMENT \"OLAP\" DISTRIBUTED BY HASH(`k1`, `k2`, `k3`, `k4`, `k5`) " +
                 "BUCKETS 3 " +
-                "PROPERTIES ( \"replication_num\" = \"1\", \"storage_format\" = \"v2\" );");
+                "PROPERTIES ( \"replication_num\" = \"1\" );");
         String sql = "insert into duplicate_table_with_default values " +
                 "('2020-06-25', '2020-06-25 00:16:23', 'beijing', 'haidian', 0, 87, -31785, " +
                 "default, default, -18446744073709550633, default, default, -2.18);";
@@ -335,17 +360,20 @@ public class InsertPlanTest extends PlanTestBase {
         try {
             getInsertExecPlan(sql);
         } catch (SemanticException e) {
-            Assert.assertTrue(e.getMessage().equals("Column has no default value, column=k5"));
+            Assert.assertTrue(e.getMessage(), e.getMessage().equals("Getting analyzing error. Detail message: " +
+                    "Column has no default value, column=k5."));
         }
 
         sql = "insert into duplicate_table_with_default(K1,k2,k3) " +
-                        "values('2020-06-25', '2020-06-25 00:16:23', 'beijing')";
+                "values('2020-06-25', '2020-06-25 00:16:23', 'beijing')";
         explainString = getInsertExecPlan(sql);
         Assert.assertTrue(explainString.contains("<slot 1> : 1: column_0"));
     }
 
     public static String getInsertExecPlan(String originStmt) throws Exception {
-        connectContext.setDumpInfo(new QueryDumpInfo(connectContext.getSessionVariable()));
+        connectContext.setQueryId(UUIDUtil.genUUID());
+        connectContext.setExecutionId(UUIDUtil.toTUniqueId(connectContext.getQueryId()));
+        connectContext.setDumpInfo(new QueryDumpInfo(connectContext));
         StatementBase statementBase =
                 com.starrocks.sql.parser.SqlParser.parse(originStmt, connectContext.getSessionVariable().getSqlMode())
                         .get(0);
@@ -364,8 +392,9 @@ public class InsertPlanTest extends PlanTestBase {
     public void testBitmapInsertInto() throws Exception {
         String sql = "INSERT INTO test.bitmap_table (id, id2) VALUES (1001, to_bitmap(1000)), (1001, to_bitmap(2000));";
         String plan = getInsertExecPlan(sql);
-        containsKeywords(plan, "OUTPUT EXPRS:1: column_0 | 2: column_1", "OLAP TABLE SINK",
-                "constant exprs:", "1001 | to_bitmap('1000')", "1001 | to_bitmap('2000')");
+        containsKeywords(plan, "constant exprs: \n" +
+                "         1001 | to_bitmap(1000)\n" +
+                "         1001 | to_bitmap(2000)");
 
         sql = "insert into test.bitmap_table select id, bitmap_union(id2) from test.bitmap_table_2 group by id;";
         plan = getInsertExecPlan(sql);
@@ -438,8 +467,7 @@ public class InsertPlanTest extends PlanTestBase {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
                 "\"colocate_with\" = \"edu\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
         starRocksAssert.withTable("CREATE TABLE `user_info` (\n" +
                 "  `distinct_id` bigint(20) NULL ,\n" +
@@ -554,15 +582,15 @@ public class InsertPlanTest extends PlanTestBase {
         Assert.assertTrue(plan.contains("  11:HASH JOIN\n" +
                 "  |  join op: LEFT OUTER JOIN (COLOCATE)\n" +
                 "  |  colocate: true\n" +
-                "  |  equal join conjunct: 1: distinct_id = 49: distinct_id"));
+                "  |  equal join conjunct: 1: distinct_id = 41: distinct_id"));
         Assert.assertTrue(plan.contains("  7:HASH JOIN\n" +
                 "  |  join op: LEFT OUTER JOIN (COLOCATE)\n" +
                 "  |  colocate: true\n" +
-                "  |  equal join conjunct: 1: distinct_id = 45: distinct_id"));
+                "  |  equal join conjunct: 1: distinct_id = 49: distinct_id"));
         Assert.assertTrue(plan.contains("  3:HASH JOIN\n" +
                 "  |  join op: LEFT OUTER JOIN (COLOCATE)\n" +
                 "  |  colocate: true\n" +
-                "  |  equal join conjunct: 1: distinct_id = 41: distinct_id"));
+                "  |  equal join conjunct: 1: distinct_id = 45: distinct_id"));
         FeConstants.runningUnitTest = false;
     }
 
@@ -579,6 +607,7 @@ public class InsertPlanTest extends PlanTestBase {
     public void testInsertExchange() throws Exception {
         FeConstants.runningUnitTest = true;
         InsertPlanner.enableSingleReplicationShuffle = true;
+        Config.eliminate_shuffle_load_by_replicated_storage = false;
         {
             // keysType is DUP_KEYS
             String sql = "explain insert into t0 select * from t0";
@@ -699,12 +728,12 @@ public class InsertPlanTest extends PlanTestBase {
         }
         InsertPlanner.enableSingleReplicationShuffle = false;
         FeConstants.runningUnitTest = false;
+        Config.eliminate_shuffle_load_by_replicated_storage = true;
     }
 
     @Test
     public void testInsertSelectWithConstant() throws Exception {
         String explainString = getInsertExecPlan("insert into tarray select 1,null,null from tarray");
-        System.out.printf("%s\n", explainString);
         Assert.assertTrue(explainString.contains("PLAN FRAGMENT 0\n" +
                 " OUTPUT EXPRS:7: v1 | 8: v2 | 9: v3\n" +
                 "  PARTITION: RANDOM\n" +
@@ -715,9 +744,30 @@ public class InsertPlanTest extends PlanTestBase {
                 "    RANDOM\n" +
                 "\n" +
                 "  1:Project\n" +
-                "  |  <slot 7> : CAST(1 AS BIGINT)\n" +
+                "  |  <slot 7> : 1\n" +
                 "  |  <slot 8> : NULL\n" +
                 "  |  <slot 9> : NULL"));
+    }
+
+    @Test
+    public void testInsertMapColumn() throws Exception {
+        String explainString = getInsertExecPlan("insert into tmap values (2,2,map())");
+        Assert.assertTrue(explainString.contains("2 | 2 | map{}"));
+
+        explainString = getInsertExecPlan("insert into tmap values (2,2,null)");
+        Assert.assertTrue(explainString.contains("2 | 2 | NULL"));
+
+        explainString = getInsertExecPlan("insert into tmap values (2,2,map(2,2))");
+        Assert.assertTrue(explainString.contains("2 | 2 | map{2:'2'}")); // implicit cast
+
+        explainString = getInsertExecPlan("insert into tmap values (2,2,map{})");
+        Assert.assertTrue(explainString.contains("2 | 2 | map{}"));
+
+        explainString = getInsertExecPlan("insert into tmap values (2,2,map{2:3, 2:4})");
+        Assert.assertTrue(explainString.contains("2 | 2 | map{2:'3',2:'4'}")); // will distinct in BE
+
+        explainString = getInsertExecPlan("insert into tmap values (2,2,map{2:2})");
+        Assert.assertTrue(explainString.contains("2 | 2 | map{2:'2'}")); // implicit cast
     }
 
     @Test
@@ -735,5 +785,221 @@ public class InsertPlanTest extends PlanTestBase {
             InsertPlanner.enableSingleReplicationShuffle = false;
             FeConstants.runningUnitTest = false;
         }
+    }
+
+    @Test
+    public void testInsertIcebergTableSink() throws Exception {
+        String createIcebergCatalogStmt = "create external catalog iceberg_catalog properties (\"type\"=\"iceberg\", " +
+                "\"hive.metastore.uris\"=\"thrift://hms:9083\", \"iceberg.catalog.type\"=\"hive\")";
+        starRocksAssert.withCatalog(createIcebergCatalogStmt);
+        MetadataMgr metadata = starRocksAssert.getCtx().getGlobalStateMgr().getMetadataMgr();
+
+        Table nativeTable = new BaseTable(null, null);
+
+        Column k1 = new Column("k1", Type.INT);
+        Column k2 = new Column("k2", Type.INT);
+        IcebergTable.Builder builder = IcebergTable.builder();
+        builder.setCatalogName("iceberg_catalog");
+        builder.setRemoteDbName("iceberg_db");
+        builder.setRemoteTableName("iceberg_table");
+        builder.setSrTableName("iceberg_table");
+        builder.setFullSchema(Lists.newArrayList(k1, k2));
+        builder.setNativeTable(nativeTable);
+        IcebergTable icebergTable = builder.build();
+
+        new Expectations(icebergTable) {
+            {
+                icebergTable.getUUID();
+                result = 12345566;
+                minTimes = 0;
+
+                icebergTable.isUnPartitioned();
+                result = true;
+                minTimes = 0;
+
+                icebergTable.getPartitionColumnNames();
+                result = new ArrayList<>();
+            }
+        };
+
+        new Expectations(nativeTable) {
+            {
+                nativeTable.sortOrder();
+                result = SortOrder.unsorted();
+                minTimes = 0;
+
+                nativeTable.location();
+                result = "hdfs://fake_location";
+                minTimes = 0;
+
+                nativeTable.properties();
+                result = new HashMap<String, String>();
+                minTimes = 0;
+
+                nativeTable.io();
+                result = new HadoopFileIO();
+                minTimes = 0;
+            }
+        };
+
+        new Expectations(metadata) {
+            {
+                metadata.getDb("iceberg_catalog", "iceberg_db");
+                result = new Database(12345566, "iceberg_db");
+                minTimes = 0;
+
+                metadata.getTable("iceberg_catalog", "iceberg_db", "iceberg_table");
+                result = icebergTable;
+                minTimes = 0;
+            }
+        };
+
+        String actualRes = getInsertExecPlan("explain insert into iceberg_catalog.iceberg_db.iceberg_table select 1, 2");
+        String expected = "PLAN FRAGMENT 0\n" +
+                " OUTPUT EXPRS:4: k1 | 5: k2\n" +
+                "  PARTITION: UNPARTITIONED\n" +
+                "\n" +
+                "  Iceberg TABLE SINK\n" +
+                "    TABLE: 12345566\n" +
+                "    TUPLE ID: 2\n" +
+                "    RANDOM\n" +
+                "\n" +
+                "  1:Project\n" +
+                "  |  <slot 4> : 1\n" +
+                "  |  <slot 5> : 2\n" +
+                "  |  \n" +
+                "  0:UNION\n" +
+                "     constant exprs: \n" +
+                "         NULL\n";
+        Assert.assertEquals(expected, actualRes);
+    }
+
+    @Test
+    public void insertToSql() {
+        String sql = "insert into test_all_type_partition_by_date " +
+                "partition(p1992) (t1a, id_date) SELECT `t1a`, `id_date` FROM `test_all_type_partition_by_date` ";
+        var stmts = SqlParser.parse(sql, new SessionVariable());
+        Assert.assertEquals(1, stmts.size());
+
+        // verify generated SQL
+        String genSql = AstToSQLBuilder.toSQL(stmts.get(0));
+        Assert.assertEquals("INSERT INTO `test_all_type_partition_by_date` " +
+                "PARTITION (p1992) (`t1a`,`id_date`) " +
+                "SELECT `t1a`, `id_date`\n" +
+                "FROM `test_all_type_partition_by_date`", genSql);
+
+        // parse it again
+        var stmts2 = SqlParser.parse(genSql, new SessionVariable());
+        Assert.assertEquals(genSql, AstToSQLBuilder.toSQL(stmts2.get(0)));
+    }
+
+    @Test
+    public void testInsertNotExistTable() {
+        try {
+            getInsertExecPlan("insert into not_exist_table values (1)");
+        } catch (Exception e) {
+            Assert.assertTrue(e.getMessage().contains("Table not_exist_table is not found"));
+        }
+    }
+
+    @Test
+    public void testInsertFiles() throws Exception {
+        String actual = getInsertExecPlan("insert into files " +
+                "(\"path\" = \"hdfs://127.0.0.1:9000/files/\", \"format\"=\"parquet\", \"compression\" = \"uncompressed\") " +
+                "select 1 as k1");
+        String expected = "PLAN FRAGMENT 0\n" +
+                " OUTPUT EXPRS:2: expr\n" +
+                "  PARTITION: RANDOM\n" +
+                "\n" +
+                "  TABLE FUNCTION TABLE SINK\n" +
+                "    PATH: hdfs://127.0.0.1:9000/files/data_\n" +
+                "    FORMAT: parquet\n" +
+                "    PARTITION BY: []\n" +
+                "    SINGLE: false\n" +
+                "    RANDOM\n" +
+                "\n" +
+                "  2:EXCHANGE\n" +
+                "\n" +
+                "PLAN FRAGMENT 1\n" +
+                " OUTPUT EXPRS:\n" +
+                "  PARTITION: UNPARTITIONED\n" +
+                "\n" +
+                "  STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 02\n" +
+                "    RANDOM\n" +
+                "\n" +
+                "  1:Project\n" +
+                "  |  <slot 2> : 1\n" +
+                "  |  \n" +
+                "  0:UNION\n" +
+                "     constant exprs: \n" +
+                "         NULL\n";
+        Assert.assertEquals(expected, actual);
+    }
+
+    @Test
+    public void testInsertFilesWithSingle() throws Exception {
+        String actual = getInsertExecPlan("insert into files " +
+                "(\"path\" = \"hdfs://127.0.0.1:9000/files/\", \"format\"=\"parquet\", \"compression\" = \"uncompressed\"," +
+                " \"single\" = \"true\") " +
+                "select 1 as k1, 2 as k2");
+        String expected = "PLAN FRAGMENT 0\n" +
+                " OUTPUT EXPRS:2: expr | 3: expr\n" +
+                "  PARTITION: UNPARTITIONED\n" +
+                "\n" +
+                "  TABLE FUNCTION TABLE SINK\n" +
+                "    PATH: hdfs://127.0.0.1:9000/files/\n" +
+                "    FORMAT: parquet\n" +
+                "    PARTITION BY: []\n" +
+                "    SINGLE: true\n" +
+                "    RANDOM\n" +
+                "\n" +
+                "  1:Project\n" +
+                "  |  <slot 2> : 1\n" +
+                "  |  <slot 3> : 2\n" +
+                "  |  \n" +
+                "  0:UNION\n" +
+                "     constant exprs: \n" +
+                "         NULL\n";
+        Assert.assertEquals(expected, actual);
+    }
+
+    @Test
+    public void testInsertFilesWithPartition() throws Exception {
+        String actual = getInsertExecPlan("insert into files " +
+                "(\"path\" = \"hdfs://127.0.0.1:9000/files/\", \"format\"=\"parquet\", \"compression\" = \"uncompressed\"," +
+                " \"partition_by\" = \"v1\") " +
+                "select v1, v2 from t0");
+        String expected = "PLAN FRAGMENT 0\n" +
+                " OUTPUT EXPRS:1: v1 | 2: v2\n" +
+                "  PARTITION: HASH_PARTITIONED: 1: v1\n" +
+                "\n" +
+                "  TABLE FUNCTION TABLE SINK\n" +
+                "    PATH: hdfs://127.0.0.1:9000/files/\n" +
+                "    FORMAT: parquet\n" +
+                "    PARTITION BY: [v1]\n" +
+                "    SINGLE: false\n" +
+                "    RANDOM\n" +
+                "\n" +
+                "  1:EXCHANGE\n" +
+                "\n" +
+                "PLAN FRAGMENT 1\n" +
+                " OUTPUT EXPRS:\n" +
+                "  PARTITION: RANDOM\n" +
+                "\n" +
+                "  STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 01\n" +
+                "    HASH_PARTITIONED: 1: v1\n" +
+                "\n" +
+                "  0:OlapScanNode\n" +
+                "     TABLE: t0\n" +
+                "     PREAGGREGATION: ON\n" +
+                "     partitions=0/1\n" +
+                "     rollup: t0\n" +
+                "     tabletRatio=0/0\n" +
+                "     tabletList=\n" +
+                "     cardinality=1\n" +
+                "     avgRowSize=2.0\n";
+        Assert.assertEquals(expected, actual);
     }
 }

@@ -1,30 +1,63 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.load;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Sets;
+import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.LiteralExpr;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.ListPartitionInfo;
+import com.starrocks.catalog.MaterializedIndex;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.PartitionInfo;
 import com.starrocks.catalog.PartitionType;
+import com.starrocks.catalog.SinglePartitionInfo;
 import com.starrocks.catalog.Table;
+import com.starrocks.catalog.Tablet;
+import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.persist.InsertOverwriteStateChangeInfo;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.QueryState;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.StatementPlanner;
+import com.starrocks.sql.analyzer.AnalyzerUtils;
+import com.starrocks.sql.analyzer.SemanticException;
+import com.starrocks.sql.ast.AddPartitionClause;
 import com.starrocks.sql.ast.InsertStmt;
+import com.starrocks.sql.ast.ListPartitionDesc;
+import com.starrocks.sql.ast.PartitionDesc;
 import com.starrocks.sql.ast.PartitionNames;
+import com.starrocks.sql.ast.RangePartitionDesc;
 import com.starrocks.sql.common.DmlException;
 import com.starrocks.sql.plan.ExecPlan;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
 import java.util.List;
+import java.util.Set;
 import java.util.stream.Collectors;
+
+import static com.starrocks.load.InsertOverwriteJobState.OVERWRITE_FAILED;
 
 // InsertOverwriteJobRunner will execute the insert overwrite.
 // The main idea is that:
@@ -37,14 +70,14 @@ import java.util.stream.Collectors;
 public class InsertOverwriteJobRunner {
     private static final Logger LOG = LogManager.getLogger(InsertOverwriteJobRunner.class);
 
-    private InsertOverwriteJob job;
+    private final InsertOverwriteJob job;
 
     private InsertStmt insertStmt;
     private StmtExecutor stmtExecutor;
     private ConnectContext context;
-    private long dbId;
-    private long tableId;
-    private String postfix;
+    private final long dbId;
+    private final long tableId;
+    private final String postfix;
 
     private long createPartitionElapse;
     private long insertElapse;
@@ -79,11 +112,12 @@ public class InsertOverwriteJobRunner {
     // there is no concurrent problem here
     public void cancel() {
         if (isFinished()) {
-            LOG.warn("cancel failed. insert overwrite job:{} already finished. state:{}", job.getJobState());
+            LOG.warn("cancel failed. insert overwrite job:{} already finished. state:{}", job.getJobId(),
+                    job.getJobState());
             return;
         }
         try {
-            transferTo(InsertOverwriteJobState.OVERWRITE_FAILED);
+            transferTo(OVERWRITE_FAILED);
         } catch (Exception e) {
             LOG.warn("cancel insert overwrite job:{} failed", job.getJobId(), e);
         }
@@ -93,8 +127,8 @@ public class InsertOverwriteJobRunner {
         try {
             handle();
         } catch (Exception e) {
-            if (job.getJobState() != InsertOverwriteJobState.OVERWRITE_FAILED) {
-                transferTo(InsertOverwriteJobState.OVERWRITE_FAILED);
+            if (job.getJobState() != OVERWRITE_FAILED) {
+                transferTo(OVERWRITE_FAILED);
             }
             throw e;
         }
@@ -109,7 +143,7 @@ public class InsertOverwriteJobRunner {
                 doLoad();
                 break;
             case OVERWRITE_FAILED:
-                gc();
+                gc(false);
                 LOG.warn("insert overwrite job:{} failed. createPartitionElapse:{} ms, insertElapse:{} ms",
                         job.getJobId(), createPartitionElapse, insertElapse);
                 break;
@@ -127,13 +161,19 @@ public class InsertOverwriteJobRunner {
         createTempPartitions();
         prepareInsert();
         executeInsert();
-        doCommit();
+        doCommit(false);
         transferTo(InsertOverwriteJobState.OVERWRITE_SUCCESS);
     }
 
     public void replayStateChange(InsertOverwriteStateChangeInfo info) {
         LOG.info("replay state change:{}", info);
-        if (job.getJobState() != info.getFromState()) {
+        // If the final status is failure, then GC must be done
+        if (info.getToState() == OVERWRITE_FAILED) {
+            job.setJobState(OVERWRITE_FAILED);
+            LOG.info("replay insert overwrite job:{} to FAILED", job.getJobId());
+            gc(true);
+            return;
+        } else if (job.getJobState() != info.getFromState()) {
             LOG.warn("invalid job info. current state:{}, from state:{}", job.getJobState(), info.getFromState());
             return;
         }
@@ -144,14 +184,9 @@ public class InsertOverwriteJobRunner {
                 job.setTmpPartitionIds(info.getTmpPartitionIds());
                 job.setJobState(InsertOverwriteJobState.OVERWRITE_RUNNING);
                 break;
-            case OVERWRITE_FAILED:
-                job.setJobState(InsertOverwriteJobState.OVERWRITE_FAILED);
-                LOG.info("replay insert overwrite job:{} to FAILED", job.getJobId());
-                gc();
-                break;
             case OVERWRITE_SUCCESS:
                 job.setJobState(InsertOverwriteJobState.OVERWRITE_SUCCESS);
-                doCommit();
+                doCommit(true);
                 LOG.info("replay insert overwrite job:{} to SUCCESS", job.getJobId());
                 break;
             default:
@@ -164,35 +199,139 @@ public class InsertOverwriteJobRunner {
         if (state == InsertOverwriteJobState.OVERWRITE_SUCCESS) {
             Preconditions.checkState(job.getJobState() == InsertOverwriteJobState.OVERWRITE_RUNNING);
         }
-        Database db = getAndWriteLockDatabase(dbId);
-        try {
-            InsertOverwriteStateChangeInfo info =
-                    new InsertOverwriteStateChangeInfo(job.getJobId(), job.getJobState(), state,
-                            job.getSourcePartitionIds(), job.getTmpPartitionIds());
-            GlobalStateMgr.getCurrentState().getEditLog().logInsertOverwriteStateChange(info);
-        } finally {
-            db.writeUnlock();
-        }
         job.setJobState(state);
         handle();
     }
 
     private void prepare() throws Exception {
         Preconditions.checkState(job.getJobState() == InsertOverwriteJobState.OVERWRITE_PENDING);
-        // get tmpPartitionIds first because they are used to drop created partitions when restart.
+        // support automatic partition
+        createPartitionByValue(insertStmt);
+        // get tmpPartitionIds first because they are used to drop created partitions when restarted.
         List<Long> tmpPartitionIds = Lists.newArrayList();
         for (int i = 0; i < job.getSourcePartitionIds().size(); ++i) {
             tmpPartitionIds.add(GlobalStateMgr.getCurrentState().getNextId());
         }
         job.setTmpPartitionIds(tmpPartitionIds);
+
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
+        if (db == null) {
+            throw new DmlException("database id:%s does not exist", dbId);
+        }
+        Locker locker = new Locker();
+        if (!locker.lockAndCheckExist(db, LockType.WRITE)) {
+            throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
+        }
+
+        try {
+            InsertOverwriteStateChangeInfo info = new InsertOverwriteStateChangeInfo(job.getJobId(), job.getJobState(),
+                    InsertOverwriteJobState.OVERWRITE_RUNNING, job.getSourcePartitionIds(), job.getTmpPartitionIds());
+            GlobalStateMgr.getCurrentState().getEditLog().logInsertOverwriteStateChange(info);
+        } finally {
+            locker.unLockDatabase(db, LockType.WRITE);
+        }
+
         transferTo(InsertOverwriteJobState.OVERWRITE_RUNNING);
+    }
+
+    private void createPartitionByValue(InsertStmt insertStmt) {
+        AddPartitionClause addPartitionClause;
+        if (insertStmt.getTargetPartitionNames() == null) {
+            return;
+        }
+        OlapTable olapTable = (OlapTable) insertStmt.getTargetTable();
+        List<List<String>> partitionValues = Lists.newArrayList();
+        if (!olapTable.getPartitionInfo().isAutomaticPartition()) {
+            return;
+        }
+
+        if (insertStmt.isSpecifyPartitionNames())  {
+            List<String> partitionNames = insertStmt.getTargetPartitionNames().getPartitionNames();
+            PartitionInfo partitionInfo = olapTable.getPartitionInfo();
+            for (String partitionName : partitionNames) {
+                Partition partition = olapTable.getPartition(partitionName);
+                if (partition == null) {
+                    throw new RuntimeException("Partition '" + partitionName
+                            + "' does not exist in table '" + olapTable.getName() + "'.");
+                }
+                if (partitionInfo instanceof ListPartitionInfo) {
+                    ListPartitionInfo listPartitionInfo = (ListPartitionInfo) partitionInfo;
+                    List<List<LiteralExpr>> lists = listPartitionInfo.getMultiLiteralExprValues().get(partition.getId());
+                    for (List<LiteralExpr> list : lists) {
+                        List<String> values = Lists.newArrayList();
+                        for (LiteralExpr literalExpr : list) {
+                            values.add(literalExpr.getStringValue());
+                        }
+                        partitionValues.add(values);
+                    }
+                } else {
+                    throw new RuntimeException("Specify the partition name, and automatically create partition names. " +
+                            "Currently, only List partitions are supported.");
+                }
+            }
+        } else {
+            List<Expr> partitionColValues = insertStmt.getTargetPartitionNames().getPartitionColValues();
+            // Currently we only support overwriting one partition at a time
+            List<String> firstValues = Lists.newArrayList();
+            partitionValues.add(firstValues);
+            for (Expr expr : partitionColValues) {
+                if (expr instanceof LiteralExpr) {
+                    firstValues.add(((LiteralExpr) expr).getStringValue());
+                } else {
+                    throw new SemanticException("Only support literal value for partition column.");
+                }
+            }
+        }
+
+        try {
+            addPartitionClause = AnalyzerUtils.getAddPartitionClauseFromPartitionValues(olapTable, partitionValues);
+        } catch (AnalysisException ex) {
+            LOG.warn(ex);
+            throw new RuntimeException(ex);
+        }
+        GlobalStateMgr state = GlobalStateMgr.getCurrentState();
+        String targetDb = insertStmt.getTableName().getDb();
+        Database db = state.getDb(targetDb);
+        List<Long> sourcePartitionIds = job.getSourcePartitionIds();
+        try {
+            state.getLocalMetastore().addPartitions(db, olapTable.getName(), addPartitionClause);
+        } catch (Exception ex) {
+            LOG.warn(ex);
+            throw new RuntimeException(ex);
+        }
+        PartitionDesc partitionDesc = addPartitionClause.getPartitionDesc();
+        List<String> partitionColNames;
+        if (partitionDesc instanceof RangePartitionDesc) {
+            partitionColNames = ((RangePartitionDesc) partitionDesc).getPartitionColNames();
+        } else if (partitionDesc instanceof ListPartitionDesc) {
+            partitionColNames = ((ListPartitionDesc) partitionDesc).getPartitionColNames();
+        } else {
+            throw new RuntimeException("Unsupported partitionDesc");
+        }
+        for (String partitionColName : partitionColNames) {
+            Partition partition = olapTable.getPartition(partitionColName);
+            if (!sourcePartitionIds.contains(partition.getId())) {
+                sourcePartitionIds.add(partition.getId());
+            }
+        }
     }
 
     private void executeInsert() throws Exception {
         long insertStartTimestamp = System.currentTimeMillis();
         // should replan here because prepareInsert has changed the targetPartitionNames of insertStmt
-        ExecPlan newPlan = new StatementPlanner().plan(insertStmt, context);
-        stmtExecutor.handleDMLStmt(newPlan, insertStmt);
+        try (var guard = context.bindScope()) {
+            ExecPlan newPlan = StatementPlanner.plan(insertStmt, context);
+            // Use `handleDMLStmt` instead of `handleDMLStmtWithProfile` because cannot call `writeProfile` in
+            // InsertOverwriteJobRunner.
+            // InsertOverWriteJob is executed as below:
+            // - StmtExecutor#handleDMLStmtWithProfile
+            //    - StmtExecutor#executeInsert
+            //  - StmtExecutor#handleInsertOverwrite#InsertOverwriteJobMgr#run
+            //  - InsertOverwriteJobRunner#executeInsert
+            //  - StmtExecutor#handleDMLStmt <- no call `handleDMLStmt` again.
+            // `writeProfile` is called in `handleDMLStmt`, and no need call it again later.
+            stmtExecutor.handleDMLStmt(newPlan, insertStmt);
+        }
         insertElapse = System.currentTimeMillis() - insertStartTimestamp;
         if (context.getState().getStateType() == QueryState.MysqlStateType.ERR) {
             LOG.warn("insert overwrite failed. error message:{}", context.getState().getErrorMessage());
@@ -202,49 +341,86 @@ public class InsertOverwriteJobRunner {
 
     private void createTempPartitions() throws DdlException {
         long createPartitionStartTimestamp = System.currentTimeMillis();
-        Database db = getAndReadLockDatabase(dbId);
-        OlapTable targetTable = null;
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
+        if (db == null) {
+            throw new DmlException("database id:%s does not exist", dbId);
+        }
+        Locker locker = new Locker();
+        if (!locker.lockAndCheckExist(db, LockType.READ)) {
+            throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
+        }
+        OlapTable targetTable;
         try {
             targetTable = checkAndGetTable(db, tableId);
         } finally {
-            db.readUnlock();
+            locker.unLockDatabase(db, LockType.READ);
         }
         PartitionUtils.createAndAddTempPartitionsForTable(db, targetTable, postfix,
-                job.getSourcePartitionIds(), job.getTmpPartitionIds());
+                job.getSourcePartitionIds(), job.getTmpPartitionIds(), null);
         createPartitionElapse = System.currentTimeMillis() - createPartitionStartTimestamp;
     }
 
-    private void gc() {
+    private void gc(boolean isReplay) {
         LOG.info("start to garbage collect");
-        Database db = getAndWriteLockDatabase(dbId);
+
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
+        if (db == null) {
+            throw new DmlException("database id:%s does not exist", dbId);
+        }
+        Locker locker = new Locker();
+        if (!locker.lockAndCheckExist(db, LockType.WRITE)) {
+            throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
+        }
+
         try {
             Table table = db.getTable(tableId);
             if (table == null) {
-                throw new DmlException("table:% does not exist in database:%s", tableId, db.getFullName());
+                throw new DmlException("table:%d does not exist in database:%s", tableId, db.getFullName());
             }
             Preconditions.checkState(table instanceof OlapTable);
             OlapTable targetTable = (OlapTable) table;
+            Set<Tablet> sourceTablets = Sets.newHashSet();
             if (job.getTmpPartitionIds() != null) {
                 for (long pid : job.getTmpPartitionIds()) {
                     LOG.info("drop temp partition:{}", pid);
 
                     Partition partition = targetTable.getPartition(pid);
                     if (partition != null) {
+                        for (MaterializedIndex index : partition.getMaterializedIndices(MaterializedIndex.IndexExtState.ALL)) {
+                            // hash set is able to deduplicate the elements
+                            sourceTablets.addAll(index.getTablets());
+                        }
                         targetTable.dropTempPartition(partition.getName(), true);
                     } else {
                         LOG.warn("partition {} is null", pid);
                     }
                 }
             }
+            if (!isReplay) {
+                // mark all source tablet ids force delete to drop it directly on BE,
+                // not to move it to trash
+                sourceTablets.forEach(GlobalStateMgr.getCurrentState().getTabletInvertedIndex()::markTabletForceDelete);
+
+                InsertOverwriteStateChangeInfo info = new InsertOverwriteStateChangeInfo(job.getJobId(), job.getJobState(),
+                        OVERWRITE_FAILED, job.getSourcePartitionIds(), job.getTmpPartitionIds());
+                GlobalStateMgr.getCurrentState().getEditLog().logInsertOverwriteStateChange(info);
+            }
         } catch (Exception e) {
             LOG.warn("exception when gc insert overwrite job.", e);
         } finally {
-            db.writeUnlock();
+            locker.unLockDatabase(db, LockType.WRITE);
         }
     }
 
-    private void doCommit() {
-        Database db = getAndWriteLockDatabase(dbId);
+    private void doCommit(boolean isReplay) {
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
+        if (db == null) {
+            throw new DmlException("database id:%s does not exist", dbId);
+        }
+        Locker locker = new Locker();
+        if (!locker.lockAndCheckExist(db, LockType.WRITE)) {
+            throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
+        }
         try {
             OlapTable targetTable = checkAndGetTable(db, tableId);
             List<String> sourcePartitionNames = job.getSourcePartitionIds().stream()
@@ -253,17 +429,47 @@ public class InsertOverwriteJobRunner {
             List<String> tmpPartitionNames = job.getTmpPartitionIds().stream()
                     .map(partitionId -> targetTable.getPartition(partitionId).getName())
                     .collect(Collectors.toList());
-            if (targetTable.getPartitionInfo().getType() == PartitionType.RANGE) {
+            Set<Tablet> sourceTablets = Sets.newHashSet();
+            sourcePartitionNames.forEach(name -> {
+                Partition partition = targetTable.getPartition(name);
+                for (MaterializedIndex index : partition.getMaterializedIndices(MaterializedIndex.IndexExtState.ALL)) {
+                    sourceTablets.addAll(index.getTablets());
+                }
+            });
+
+            PartitionInfo partitionInfo = targetTable.getPartitionInfo();
+            if (partitionInfo.isRangePartition() || partitionInfo.getType() == PartitionType.LIST) {
                 targetTable.replaceTempPartitions(sourcePartitionNames, tmpPartitionNames, true, false);
-            } else {
+            } else if (partitionInfo instanceof SinglePartitionInfo) {
                 targetTable.replacePartition(sourcePartitionNames.get(0), tmpPartitionNames.get(0));
+            } else {
+                throw new DdlException("partition type " + partitionInfo.getType() + " is not supported");
+            }
+            if (!isReplay) {
+                // mark all source tablet ids force delete to drop it directly on BE,
+                // not to move it to trash
+                sourceTablets.forEach(GlobalStateMgr.getCurrentState().getTabletInvertedIndex()::markTabletForceDelete);
+
+                InsertOverwriteStateChangeInfo info = new InsertOverwriteStateChangeInfo(job.getJobId(), job.getJobState(),
+                        InsertOverwriteJobState.OVERWRITE_SUCCESS, job.getSourcePartitionIds(), job.getTmpPartitionIds());
+                GlobalStateMgr.getCurrentState().getEditLog().logInsertOverwriteStateChange(info);
+
+                try {
+                    GlobalStateMgr.getCurrentState().getColocateTableIndex().updateLakeTableColocationInfo(targetTable,
+                            true /* isJoin */, null /* expectGroupId */);
+                } catch (DdlException e) {
+                    // log an error if update colocation info failed, insert overwrite already succeeded
+                    LOG.error("table {} update colocation info failed after insert overwrite, {}.", tableId, e.getMessage());
+                }
+
+                targetTable.lastSchemaUpdateTime.set(System.nanoTime());
             }
         } catch (Exception e) {
-            LOG.warn("replace partitions failed when insert overwrite into dbId:{}, tableId:{}," +
-                    " sourcePartitionNames:{}, newPartitionNames:{}", job.getTargetDbId(), job.getTargetTableId(), e);
+            LOG.warn("replace partitions failed when insert overwrite into dbId:{}, tableId:{}",
+                    job.getTargetDbId(), job.getTargetTableId(), e);
             throw new DmlException("replace partitions failed", e);
         } finally {
-            db.writeUnlock();
+            locker.unLockDatabase(db, LockType.WRITE);
         }
     }
 
@@ -271,7 +477,14 @@ public class InsertOverwriteJobRunner {
         Preconditions.checkState(job.getJobState() == InsertOverwriteJobState.OVERWRITE_RUNNING);
         Preconditions.checkState(insertStmt != null);
 
-        Database db = getAndReadLockDatabase(dbId);
+        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
+        if (db == null) {
+            throw new DmlException("database id:%s does not exist", dbId);
+        }
+        Locker locker = new Locker();
+        if (!locker.lockAndCheckExist(db, LockType.READ)) {
+            throw new DmlException("insert overwrite commit failed because locking db:%s failed", dbId);
+        }
         try {
             OlapTable targetTable = checkAndGetTable(db, tableId);
             if (job.getTmpPartitionIds().stream().anyMatch(id -> targetTable.getPartition(id) == null)) {
@@ -283,37 +496,19 @@ public class InsertOverwriteJobRunner {
             PartitionNames partitionNames = new PartitionNames(true, tmpPartitionNames);
             // change the TargetPartitionNames from source partitions to new tmp partitions
             // should replan when load data
+            if (insertStmt.getTargetPartitionNames() == null) {
+                insertStmt.setPartitionNotSpecifiedInOverwrite(true);
+            }
             insertStmt.setTargetPartitionNames(partitionNames);
             insertStmt.setTargetPartitionIds(job.getTmpPartitionIds());
+            insertStmt.setOverwrite(false);
+            insertStmt.setSystem(true);
+
         } catch (Exception e) {
             throw new DmlException("prepareInsert exception", e);
         } finally {
-            db.readUnlock();
+            locker.unLockDatabase(db, LockType.READ);
         }
-    }
-
-    // when this function return, write lock of db is acquired
-    private Database getAndWriteLockDatabase(long dbId) {
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
-        if (db == null) {
-            throw new DmlException("database id:%s does not exist", dbId);
-        }
-        if (!db.writeLockAndCheckExist()) {
-            throw new DmlException("insert overwrite commit failed because db:%s lock failed", dbId);
-        }
-        return db;
-    }
-
-    // when this function return, read lock of db is acquired
-    private Database getAndReadLockDatabase(long dbId) {
-        Database db = GlobalStateMgr.getCurrentState().getDb(dbId);
-        if (db == null) {
-            throw new DmlException("database id:%s does not exist", dbId);
-        }
-        if (!db.readLockAndCheckExist()) {
-            throw new DmlException("insert overwrite commit failed because db:%s lock failed", dbId);
-        }
-        return db;
     }
 
     private OlapTable checkAndGetTable(Database db, long tableId) {

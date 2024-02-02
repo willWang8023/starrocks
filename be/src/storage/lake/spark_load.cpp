@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Limited.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/lake/spark_load.h"
 
@@ -10,7 +22,7 @@
 
 namespace starrocks::lake {
 
-using PushBrokerReader = starrocks::vectorized::PushBrokerReader;
+using PushBrokerReader = starrocks::PushBrokerReader;
 
 Status SparkLoadHandler::process_streaming_ingestion(Tablet& tablet, const TPushReq& request, PushType push_type,
                                                      std::vector<TTabletInfo>* tablet_info_vec) {
@@ -37,13 +49,13 @@ Status SparkLoadHandler::_load_convert(Tablet& cur_tablet) {
     VLOG(3) << "start to convert delta file.";
 
     // 1. init writer
-    ASSIGN_OR_RETURN(auto writer, cur_tablet.new_writer());
+    ASSIGN_OR_RETURN(auto writer, cur_tablet.new_writer(kHorizontal, _request.transaction_id));
     RETURN_IF_ERROR(writer->open());
     DeferOp defer([&]() { writer->close(); });
 
     ASSIGN_OR_RETURN(auto tablet_schema, cur_tablet.get_schema());
-    vectorized::Schema schema = ChunkHelper::convert_schema_to_format_v2(*tablet_schema);
-    auto chunk = ChunkHelper::new_chunk(schema, 0);
+    Schema schema = ChunkHelper::convert_schema(tablet_schema);
+    ChunkPtr chunk = ChunkHelper::new_chunk(schema, 0);
     auto char_field_indexes = ChunkHelper::get_char_field_indexes(schema);
 
     // 2. Init PushBrokerReader to read broker file if exist,
@@ -84,7 +96,7 @@ Status SparkLoadHandler::_load_convert(Tablet& cur_tablet) {
                     break;
                 }
 
-                ChunkHelper::padding_char_columns(char_field_indexes, schema, *tablet_schema, chunk.get());
+                ChunkHelper::padding_char_columns(char_field_indexes, schema, tablet_schema, chunk.get());
                 RETURN_IF_ERROR(writer->write(*chunk));
                 chunk->reset();
             }
@@ -100,10 +112,11 @@ Status SparkLoadHandler::_load_convert(Tablet& cur_tablet) {
     txn_log->set_txn_id(_request.transaction_id);
     auto op_write = txn_log->mutable_op_write();
     for (auto& f : writer->files()) {
-        if (is_segment(f)) {
-            op_write->mutable_rowset()->add_segments(std::move(f));
+        if (is_segment(f.path)) {
+            op_write->mutable_rowset()->add_segments(std::move(f.path));
+            op_write->mutable_rowset()->add_segment_size(f.size.value());
         } else {
-            return Status::InternalError(fmt::format("unknown file {}", f));
+            return Status::InternalError(fmt::format("unknown file {}", f.path));
         }
     }
     op_write->mutable_rowset()->set_num_rows(writer->num_rows());

@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -24,6 +36,7 @@ enum class TaskWorkerType {
     REPORT_DISK_STATE,
     REPORT_OLAP_TABLE,
     REPORT_WORKGROUP,
+    REPORT_DATACACHE_METRICS,
     UPLOAD,
     DOWNLOAD,
     MAKE_SNAPSHOT,
@@ -74,6 +87,8 @@ struct AgentTaskRequestWithoutReqBody {
     int64_t recv_time;
 };
 
+const int MIN_TRANSACTION_PUBLISH_WORKER_COUNT = 1;
+
 using CreateTabletAgentTaskRequest = AgentTaskRequestWithReqBody<TCreateTabletReq>;
 using DropTabletAgentTaskRequest = AgentTaskRequestWithReqBody<TDropTabletReq>;
 using PushReqAgentTaskRequest = AgentTaskRequestWithReqBody<TPushReq>;
@@ -83,11 +98,16 @@ using AlterTabletAgentTaskRequest = AgentTaskRequestWithReqBody<TAlterTabletReqV
 using CloneAgentTaskRequest = AgentTaskRequestWithReqBody<TCloneReq>;
 using StorageMediumMigrateTaskRequest = AgentTaskRequestWithReqBody<TStorageMediumMigrateReq>;
 using CheckConsistencyTaskRequest = AgentTaskRequestWithReqBody<TCheckConsistencyReq>;
+using CompactionTaskRequest = AgentTaskRequestWithReqBody<TCompactionReq>;
 using UploadAgentTaskRequest = AgentTaskRequestWithReqBody<TUploadReq>;
 using DownloadAgentTaskRequest = AgentTaskRequestWithReqBody<TDownloadReq>;
 using SnapshotAgentTaskRequest = AgentTaskRequestWithReqBody<TSnapshotRequest>;
 using ReleaseSnapshotAgentTaskRequest = AgentTaskRequestWithReqBody<TReleaseSnapshotRequest>;
 using MoveDirAgentTaskRequest = AgentTaskRequestWithReqBody<TMoveDirReq>;
 using UpdateTabletMetaInfoAgentTaskRequest = AgentTaskRequestWithReqBody<TUpdateTabletMetaInfoReq>;
+using DropAutoIncrementMapAgentTaskRequest = AgentTaskRequestWithReqBody<TDropAutoIncrementMapReq>;
+using RemoteSnapshotAgentTaskRequest = AgentTaskRequestWithReqBody<TRemoteSnapshotRequest>;
+using ReplicateSnapshotAgentTaskRequest = AgentTaskRequestWithReqBody<TReplicateSnapshotRequest>;
+using UpdateSchemaTaskRequest = AgentTaskRequestWithReqBody<TUpdateSchemaReq>;
 
 } // namespace starrocks

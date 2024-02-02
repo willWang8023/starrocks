@@ -1,11 +1,32 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.plan;
 
+import com.starrocks.catalog.LocalTablet;
+import com.starrocks.catalog.MaterializedIndex;
+import com.starrocks.catalog.OlapTable;
+import com.starrocks.catalog.Partition;
+import com.starrocks.catalog.Tablet;
 import com.starrocks.common.FeConstants;
+import com.starrocks.planner.ScanNode;
 import com.starrocks.planner.SchemaScanNode;
 import org.junit.Assert;
 import org.junit.Test;
+
+import java.util.Collection;
+import java.util.List;
 
 public class ScanTest extends PlanTestBase {
     @Test
@@ -79,9 +100,9 @@ public class ScanTest extends PlanTestBase {
 
         sql = "select 0 from baseall inner join t0 on v1 = k1 group by (v2 + k2),k1";
         plan = getFragmentPlan(sql);
-        assertContains(plan, "0:OlapScanNode\n" +
+        assertContains(plan, "OlapScanNode\n" +
                 "     TABLE: baseall\n" +
-                "     PREAGGREGATION: OFF. Reason: Group columns isn't bound table baseall");
+                "     PREAGGREGATION: OFF. Reason: Has can not pre-aggregation Join");
     }
 
     @Test
@@ -153,8 +174,7 @@ public class ScanTest extends PlanTestBase {
                 "     tabletRatio=0/0\n" +
                 "     tabletList=\n" +
                 "     cardinality=1\n" +
-                "     avgRowSize=3.0\n" +
-                "     numNodes=0");
+                "     avgRowSize=3.0\n");
         connectContext.getSessionVariable().setSingleNodeExecPlan(false);
     }
 
@@ -305,24 +325,23 @@ public class ScanTest extends PlanTestBase {
 
     @Test
     public void testMergeTwoFilters() throws Exception {
-        String sql = "select v1 from t0 where v2 < null group by v1 HAVING NULL IS NULL;";
+        String sql = "select v1 from t0 where v2 < 3 group by v1 HAVING v1 IS NULL;";
         String planFragment = getFragmentPlan(sql);
-        Assert.assertTrue(planFragment.contains("  1:AGGREGATE (update finalize)\n"
-                + "  |  group by: 1: v1\n"
-                + "  |  having: TRUE\n"));
+        assertContains(planFragment, "  2:AGGREGATE (update finalize)\n" +
+                "  |  group by: 1: v1");
 
-        Assert.assertTrue(planFragment.contains("  0:EMPTYSET\n"));
+        Assert.assertTrue(planFragment.contains("1: v1 IS NULL, 2: v2 < 3"));
     }
 
     @Test
     public void testScalarReuseIsNull() throws Exception {
-        String sql =
+        String plan =
                 getFragmentPlan("SELECT (abs(1) IS NULL) = true AND ((abs(1) IS NULL) IS NOT NULL) as count FROM t1;");
-        Assert.assertTrue(sql.contains("1:Project\n"
-                + "  |  <slot 4> : (6: expr = TRUE) AND (6: expr IS NOT NULL)\n"
-                + "  |  common expressions:\n"
-                + "  |  <slot 5> : abs(1)\n"
-                + "  |  <slot 6> : 5: abs IS NULL"));
+        Assert.assertTrue(plan, plan.contains("1:Project\n" +
+                "  |  <slot 4> : (6: expr) AND (6: expr IS NOT NULL)\n" +
+                "  |  common expressions:\n" +
+                "  |  <slot 5> : abs(1)\n" +
+                "  |  <slot 6> : 5: abs IS NULL"));
     }
 
     @Test
@@ -331,8 +350,7 @@ public class ScanTest extends PlanTestBase {
         String explainString = getFragmentPlan(queryStr);
         Assert.assertTrue(explainString.contains("  1:AGGREGATE (update finalize)\n"
                 + "  |  output: min(1: v1)\n"
-                + "  |  group by: \n"
-                + "  |  having: TRUE\n"));
+                + "  |  group by: \n"));
     }
 
     @Test
@@ -380,5 +398,167 @@ public class ScanTest extends PlanTestBase {
                 "TABLE_TYPE IN ('BASE TABLE','SYSTEM VERSIONED','PARTITIONED TABLE','VIEW','FOREIGN TABLE'," +
                 "'MATERIALIZED VIEW','EXTERNAL TABLE') ORDER BY TABLE_TYPE, TABLE_SCHEMA, TABLE_NAME";
         getExecPlan(sql);
+    }
+
+    @Test
+    public void testPushDownExternalTableMissNot() throws Exception {
+        String sql = "select * from ods_order where order_no not like \"%hehe%\"";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "predicates: NOT (order_no LIKE '%hehe%')");
+
+        sql = "select * from ods_order where order_no in (1,2,3)";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "FROM `ods_order` WHERE (order_no IN ('1', '2', '3'))");
+
+        sql = "select * from ods_order where order_no not in (1,2,3)";
+        plan = getFragmentPlan(sql);
+        assertContains(plan, "FROM `ods_order` WHERE (order_no NOT IN ('1', '2', '3'))");
+    }
+
+    @Test
+    public void testMetaScanWithCount() throws Exception {
+        String sql = "select count(*),count(),count(t1a),count(t1b),count(t1c) from test_all_type[_META_]";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  1:AGGREGATE (update serialize)\n" +
+                "  |  output: sum(count_t1a), sum(count_t1a), sum(count_t1a), sum(count_t1a)\n" +
+                "  |  group by: \n" +
+                "  |  \n" +
+                "  0:MetaScan\n" +
+                "     Table: test_all_type\n" +
+                "     <id 16> : count_t1a");
+        // compatibility test
+        // we should keep nullable attribute of columns consistent with previous version,
+        // see more detail in the description of https://github.com/StarRocks/starrocks/pull/17619
+        // without count, all columns should be not null
+        sql = "select min(t1a),max(t1a),dict_merge(t1a) from test_all_type_not_null[_META_]";
+        plan = getVerboseExplain(sql);
+        assertContains(plan, "aggregate: " +
+                "min[([min_t1a, VARCHAR, false]); args: VARCHAR; result: VARCHAR; " +
+                "args nullable: false; result nullable: true], " +
+                "max[([max_t1a, VARCHAR, false]); args: VARCHAR; result: VARCHAR; " +
+                "args nullable: false; result nullable: true], " +
+                "dict_merge[([dict_merge_t1a, VARCHAR, false]); args: INVALID_TYPE; " +
+                "result: VARCHAR; args nullable: false; result nullable: true]");
+
+        // with count, all columns should be nullable
+        sql = "select min(t1a),max(t1a),dict_merge(t1a),count() from test_all_type_not_null[_META_]";
+        plan = getVerboseExplain(sql);
+        assertContains(plan, "min[([min_t1a, VARCHAR, true]); args: VARCHAR; result: VARCHAR; " +
+                "args nullable: true; result nullable: true], " +
+                "max[([max_t1a, VARCHAR, true]); args: VARCHAR; result: VARCHAR; " +
+                "args nullable: true; result nullable: true], " +
+                "dict_merge[([dict_merge_t1a, VARCHAR, true]); args: INVALID_TYPE; result: VARCHAR; " +
+                "args nullable: true; result nullable: true], " +
+                "sum[([count_t1a, VARCHAR, true]); args: BIGINT; result: BIGINT; " +
+                "args nullable: true; result nullable: true]");
+    }
+
+    @Test
+    public void testImplicitCast() throws Exception {
+        String sql = "select count(distinct v1||v2) from t0";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "2:AGGREGATE (update finalize)\n" +
+                "  |  output: multi_distinct_count((CAST(1: v1 AS BOOLEAN)) OR (CAST(2: v2 AS BOOLEAN)))");
+    }
+
+    @Test
+    public void testHint() throws Exception {
+        OlapTable tb = getOlapTable("t0");
+        Long replicaId = null;
+        Collection<Partition> partitions = tb.getPartitions();
+        acquireReplica:
+        for (Partition partition : partitions) {
+            MaterializedIndex index = partition.getIndex(tb.getBaseIndexId());
+            for (Tablet tablet : index.getTablets()) {
+                replicaId = ((LocalTablet) tablet).getImmutableReplicas().get(0).getId();
+                break acquireReplica;
+            }
+        }
+        String sql = "select count(distinct v1||v2) from t0 replica(" + replicaId + ")";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  0:OlapScanNode\n" +
+                "     TABLE: t0");
+    }
+
+    @Test
+    public void testPruneColumnTest() throws Exception {
+        connectContext.getSessionVariable().setEnableCountStarOptimization(true);
+        String[] sqlString = {
+                "select count(*) from lineitem_partition",
+                // for olap, partition key is not partition column.
+                "select count(*) from lineitem_partition where l_shipdate = '1996-01-01'"
+        };
+        boolean[] expexted = {true, false};
+        Assert.assertEquals(sqlString.length, expexted.length);
+        for (int i = 0; i < sqlString.length; i++) {
+            String sql = sqlString[i];
+            ExecPlan plan = getExecPlan(sql);
+            List<ScanNode> scanNodeList = plan.getScanNodes();
+            Assert.assertEquals(scanNodeList.get(0).getScanOptimzeOption().getCanUseAnyColumn(), expexted[i]);
+        }
+
+        connectContext.getSessionVariable().setEnableCountStarOptimization(false);
+        for (int i = 0; i < sqlString.length; i++) {
+            String sql = sqlString[i];
+            ExecPlan plan = getExecPlan(sql);
+            List<ScanNode> scanNodeList = plan.getScanNodes();
+            Assert.assertEquals(scanNodeList.get(0).getScanOptimzeOption().getCanUseAnyColumn(), false);
+        }
+        connectContext.getSessionVariable().setEnableCountStarOptimization(true);
+    }
+
+    @Test
+    public void testLabelMinMaxCountTest() throws Exception {
+        String[] sqlString = {
+                "select count(l_orderkey) from lineitem_partition", "true",
+                // for olap, partition key is not partition column.
+                "select count(l_orderkey) from lineitem_partition where l_shipdate = '1996-01-01'", "false",
+                "select count(distinct l_orderkey) from lineitem_partition", "false",
+                "select count(l_orderkey), min(l_partkey) from lineitem_partition", "true",
+                "select count(l_orderkey) from lineitem_partition group by l_partkey", "false",
+                "select count(l_orderkey) from lineitem_partition limit 10", "true",
+                "select count(l_orderkey), max(l_partkey), avg(l_partkey) from lineitem_partition", "false",
+                "select count(l_orderkey), max(l_partkey), min(l_partkey) from lineitem_partition", "true",
+        };
+        Assert.assertTrue(sqlString.length % 2 == 0);
+        for (int i = 0; i < sqlString.length; i += 2) {
+            String sql = sqlString[i];
+            boolean expexted = Boolean.valueOf(sqlString[i + 1]);
+            ExecPlan plan = getExecPlan(sql);
+            List<ScanNode> scanNodeList = plan.getScanNodes();
+            Assert.assertEquals(expexted, scanNodeList.get(0).getScanOptimzeOption().getCanUseMinMaxCountOpt());
+        }
+    }
+
+    @Test
+    public void testChangeDatePredicat() throws Exception {
+        connectContext.getSessionVariable().setCboSplitScanPredicateWithDate(true);
+        String sql = "select * from test_all_type where  id_datetime >= '2011-03-05 00:00:00'\n" +
+                "        and  id_datetime <= '2031-02-13 00:00:00';";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan,
+                "PREDICATES: ((((8: id_datetime >= '2011-03-05 00:00:00') AND (8: id_datetime < '2011-04-01 00:00:00')) " +
+                        "OR ((8: id_datetime >= '2031-02-01 00:00:00') AND (8: id_datetime <= '2031-02-13 00:00:00'))) " +
+                        "OR (((date_trunc('month', 8: id_datetime) >= '2011-04-01 00:00:00') " +
+                        "AND (date_trunc('month', 8: id_datetime) < '2012-01-01 00:00:00')) " +
+                        "OR ((date_trunc('month', 8: id_datetime) >= '2031-01-01 00:00:00') " +
+                        "AND (date_trunc('month', 8: id_datetime) < '2031-02-01 00:00:00')))) " +
+                        "OR ((date_trunc('year', 8: id_datetime) >= '2012-01-01 00:00:00') " +
+                        "AND (date_trunc('year', 8: id_datetime) < '2031-01-01 00:00:00'))");
+
+        sql = "select * from test_all_type where  id_date >= '2011-03-05'\n" +
+                "        and  id_date <= '2031-02-13';";
+        plan = getFragmentPlan(sql);
+        assertContains(plan,
+                "PREDICATES: ((((9: id_date >= '2011-03-05') AND (9: id_date < '2011-04-01')) " +
+                        "OR ((9: id_date >= '2031-02-01') AND (9: id_date <= '2031-02-13'))) " +
+                        "OR (((date_trunc('month', 9: id_date) >= '2011-04-01') " +
+                        "AND (date_trunc('month', 9: id_date) < '2012-01-01')) " +
+                        "OR ((date_trunc('month', 9: id_date) >= '2031-01-01') " +
+                        "AND (date_trunc('month', 9: id_date) < '2031-02-01')))) " +
+                        "OR ((date_trunc('year', 9: id_date) >= '2012-01-01') " +
+                        "AND (date_trunc('year', 9: id_date) < '2031-01-01'))");
+
+        connectContext.getSessionVariable().setCboSplitScanPredicateWithDate(false);
     }
 }

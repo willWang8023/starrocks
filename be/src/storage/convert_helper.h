@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -9,17 +21,13 @@
 #include "column/datum.h"
 #include "common/status.h"
 #include "storage/olap_common.h"
+#include "types/logical_type.h"
 
 namespace starrocks {
-class ColumnVectorBatch;
 class TabletSchema;
 class Schema;
 class TabletColumn;
 class TypeInfo;
-} // namespace starrocks
-
-namespace starrocks::vectorized {
-
 class Schema;
 
 // Used for schema change
@@ -40,7 +48,7 @@ private:
                                  MemPool* mem_pool) const = 0;
 };
 
-const TypeConverter* get_type_converter(FieldType from_type, FieldType to_type);
+const TypeConverter* get_type_converter(LogicalType from_type, LogicalType to_type);
 
 class MaterializeTypeConverter {
 public:
@@ -50,7 +58,7 @@ public:
     virtual Status convert_materialized(ColumnPtr src_col, ColumnPtr dst_col, TypeInfo* src_type) const = 0;
 };
 
-const MaterializeTypeConverter* get_materialized_converter(FieldType from_type, MaterializeType to_type);
+const MaterializeTypeConverter* get_materialized_converter(LogicalType from_type, MaterializeType to_type);
 
 class FieldConverter {
 public:
@@ -67,12 +75,9 @@ public:
         src->reset_column();
         return ret;
     }
-
-    virtual void convert(ColumnVectorBatch* dst, ColumnVectorBatch* src, const uint16_t* selection,
-                         uint16_t selected_size) const = 0;
 };
 
-const FieldConverter* get_field_converter(FieldType from_type, FieldType to_type);
+const FieldConverter* get_field_converter(LogicalType from_type, LogicalType to_type);
 
 class RowConverter {
 public:
@@ -80,7 +85,6 @@ public:
 
     Status init(const TabletSchema& in_schema, const TabletSchema& out_schema);
 
-    Status init(const ::starrocks::Schema& in_schema, const ::starrocks::Schema& out_schema);
     Status init(const Schema& in_schema, const Schema& out_schema);
 
     void convert(std::vector<Datum>* dst, const std::vector<Datum>& src) const;
@@ -90,19 +94,4 @@ private:
     std::vector<const FieldConverter*> _converters;
 };
 
-class ChunkConverter {
-public:
-    ChunkConverter() = default;
-
-    Status init(const Schema& in_schema, const Schema& out_schema);
-
-    std::unique_ptr<Chunk> copy_convert(const Chunk& from) const;
-
-    std::unique_ptr<Chunk> move_convert(Chunk* from) const;
-
-private:
-    std::shared_ptr<Schema> _out_schema;
-    std::vector<const FieldConverter*> _converters;
-};
-
-} // namespace starrocks::vectorized
+} // namespace starrocks

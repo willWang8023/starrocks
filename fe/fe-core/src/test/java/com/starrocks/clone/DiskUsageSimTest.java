@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.clone;
 
 import com.starrocks.common.Config;
@@ -46,7 +59,7 @@ public class DiskUsageSimTest {
     @Test
     public void test1SetInitialDiskCapacity() throws InterruptedException {
         PseudoCluster cluster = PseudoCluster.getInstance();
-        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentSystemInfo();
+        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
         // test default value
         Assert.assertEquals(PseudoBackend.DEFAULT_TOTA_CAP_B,
                 systemInfoService.getBackend(10001).getTotalCapacityB());
@@ -73,7 +86,7 @@ public class DiskUsageSimTest {
         be.setInitialCapacity(10 * bytesOneGB, 8 * bytesOneGB, 2 * bytesOneGB);
         cluster.runSql("test", "insert into test values (1,\"1\", 1), (2,\"2\",2), (3,\"3\",3);");
         Thread.sleep(PseudoBackend.reportIntervalMs + 1000);
-        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentSystemInfo();
+        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
         Assert.assertEquals(2 * bytesOneGB + PseudoBackend.DEFAULT_SIZE_ON_DISK_PER_ROWSET_B,
                 systemInfoService.getBackend(10001).getDataUsedCapacityB());
         Assert.assertEquals(8 * bytesOneGB - PseudoBackend.DEFAULT_SIZE_ON_DISK_PER_ROWSET_B + 1,
@@ -86,7 +99,7 @@ public class DiskUsageSimTest {
         // this will commit 2 transactions
         PseudoClusterUtils.triggerIncrementalCloneOnce(cluster, 10001);
         Thread.sleep(PseudoBackend.reportIntervalMs + 1000);
-        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentSystemInfo();
+        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
         System.out.println(systemInfoService.getBackend(10001).getDataUsedCapacityB());
         Assert.assertEquals(2 * bytesOneGB + PseudoBackend.DEFAULT_SIZE_ON_DISK_PER_ROWSET_B * 3,
                 systemInfoService.getBackend(10001).getDataUsedCapacityB());
@@ -102,18 +115,19 @@ public class DiskUsageSimTest {
         Config.tablet_sched_checker_interval_seconds = 100;
         be.setWriteFailureRate(1.0f);
         try {
-            cluster.runSql("test", "insert into test values (1,\"1\", 1), (2,\"2\",2), (3,\"3\",3);");
-            cluster.runSql("test", "insert into test values (1,\"1\", 1), (2,\"2\",2), (3,\"3\",3);");
-            cluster.runSql("test", "insert into test values (1,\"1\", 1), (2,\"2\",2), (3,\"3\",3);");
+            cluster.runSql("test", "insert into test values (1111,\"1\", 1), (2,\"2\",2), (3,\"3\",3);");
+            cluster.runSql("test", "insert into test values (1222,\"1\", 1), (2,\"2\",2), (3,\"3\",3);");
+            cluster.runSql("test", "insert into test values (1333,\"1\", 1), (2,\"2\",2), (3,\"3\",3);");
         } finally {
             be.setWriteFailureRate(0.0f);
         }
 
         // old versions of other replicas will be GCed, backend 10001 will have to full clone from other be
         long oldVersionExpireSec = Tablet.versionExpireSec;
+        PseudoBackend.tabletCheckIntervalMs = 1000;
         Tablet.versionExpireSec = 1;
         try {
-            Thread.sleep(Tablet.versionExpireSec + 2000);
+            Thread.sleep(Tablet.versionExpireSec * 1000 + PseudoBackend.tabletCheckIntervalMs + 2000);
         } finally {
             Tablet.versionExpireSec = oldVersionExpireSec;
         }
@@ -124,15 +138,16 @@ public class DiskUsageSimTest {
         long tabletId = cluster.listTablets("test", "test").get(0);
         Tablet tablet = be.getTablet(tabletId);
         while (true) {
-            if (tablet.getCloneExecuted() == 2) {
+            if (tablet.getCloneExecuted() >= 2) {
                 break;
             }
-            System.out.printf("wait tablet %d to finish full clone\n", tabletId);
+            System.out.printf("wait tablet %d to finish full clone, current clone executed: %d\n",
+                    tabletId, tablet.getCloneExecuted());
             Thread.sleep(1000);
         }
         // check disk usage after clone
         Thread.sleep(PseudoBackend.reportIntervalMs + 1000);
-        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentSystemInfo();
+        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
         Assert.assertEquals(2 * bytesOneGB + PseudoBackend.DEFAULT_SIZE_ON_DISK_PER_ROWSET_B * 6,
                 systemInfoService.getBackend(10001).getDataUsedCapacityB());
         Assert.assertEquals(8 * bytesOneGB - PseudoBackend.DEFAULT_SIZE_ON_DISK_PER_ROWSET_B * 6 + 1,
@@ -142,7 +157,7 @@ public class DiskUsageSimTest {
     @Test
     public void test5DiskUsageAfterTabletDropped() throws SQLException, InterruptedException {
         PseudoCluster cluster = PseudoCluster.getInstance();
-        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentSystemInfo();
+        SystemInfoService systemInfoService = GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
         cluster.runSql("test", "drop table test force");
         Thread.sleep(PseudoBackend.reportIntervalMs + 1000);
         // The disk usage should return to initial state after the only table dropped.

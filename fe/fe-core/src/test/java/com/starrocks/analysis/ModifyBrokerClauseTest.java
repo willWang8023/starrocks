@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.analysis;
 
 import com.google.common.collect.ImmutableSet;
@@ -67,6 +80,6 @@ public class ModifyBrokerClauseTest {
     @Test
     public void testNormal() throws Exception {
         analyzeFail("ALTER SYSTEM ADD BROKER `` \"127.0.0.1:8000\"", "Broker's name can't be empty.");
-        analyzeFail("ALTER SYSTEM ADD BROKER `broker1` \"127.0.0.1\"", "broker host or port is wrong!");
+        analyzeFail("ALTER SYSTEM ADD BROKER `broker1` \"127.0.0.1\"", "BROKER host or port is wrong.");
     }
 }

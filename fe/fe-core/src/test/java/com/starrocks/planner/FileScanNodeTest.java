@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.planner;
 
@@ -26,6 +39,7 @@ import com.starrocks.system.Backend;
 import com.starrocks.system.SystemInfoService;
 import com.starrocks.thrift.TBrokerFileStatus;
 import com.starrocks.thrift.TBrokerRangeDesc;
+import com.starrocks.thrift.TFileFormatType;
 import com.starrocks.thrift.TScanRangeLocations;
 import com.starrocks.thrift.TUniqueId;
 import mockit.Expectations;
@@ -93,7 +107,7 @@ public class FileScanNodeTest {
 
         new Expectations() {
             {
-                GlobalStateMgr.getCurrentSystemInfo();
+                GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo();
                 result = systemInfoService;
                 systemInfoService.getIdToBackend();
                 result = idToBackend;
@@ -343,5 +357,88 @@ public class FileScanNodeTest {
         List<TBrokerRangeDesc> rangeDescs = locationsList.get(0).scan_range.broker_scan_range.ranges;
         Assert.assertEquals(1, rangeDescs.size());
         Assert.assertEquals(0, rangeDescs.get(0).size);
+
+        // case 5
+        // 1 file which size is 0 in json format
+        // result: 1 range
+        // file groups
+
+        fileGroups = Lists.newArrayList();
+        files = Lists.newArrayList("hdfs://127.0.0.1:9001/file1");
+        desc = new DataDescription("testTable", null, files, columnNames, null, null, "json", false, null);
+        brokerFileGroup = new BrokerFileGroup(desc);
+        Deencapsulation.setField(brokerFileGroup, "columnSeparator", "\t");
+        Deencapsulation.setField(brokerFileGroup, "rowDelimiter", "\n");
+        Deencapsulation.setField(brokerFileGroup, "fileFormat", "json");
+        fileGroups.add(brokerFileGroup);
+
+        // file status
+        fileStatusesList = Lists.newArrayList();
+        fileStatusList = Lists.newArrayList();
+        fileStatusList.add(new TBrokerFileStatus("hdfs://127.0.0.1:9001/file1", false, 0, false));
+        fileStatusesList.add(fileStatusList);
+
+        analyzer = new Analyzer(GlobalStateMgr.getCurrentState(), new ConnectContext());
+        descTable = analyzer.getDescTbl();
+        tupleDesc = descTable.createTupleDescriptor("DestTableTuple");
+        scanNode = new FileScanNode(new PlanNodeId(0), tupleDesc, "FileScanNode", fileStatusesList, 1);
+        scanNode.setLoadInfo(jobId, txnId, table, brokerDesc, fileGroups, true, loadParallelInstanceNum);
+        scanNode.init(analyzer);
+        scanNode.finalizeStats(analyzer);
+
+        // check
+        locationsList = scanNode.getScanRangeLocations(0);
+        System.out.println(locationsList);
+        Assert.assertEquals(1, locationsList.size());
+        rangeDescs = locationsList.get(0).scan_range.broker_scan_range.ranges;
+        Assert.assertEquals(1, rangeDescs.size());
+        Assert.assertEquals(0, rangeDescs.get(0).size);
+
+        // case 6
+        // csv file compression type
+        // result: CSV_PLAIN, CSV_GZ, CSV_BZ2, CSV_LZ4, CSV_DFLATE, CSV_ZSTD
+
+        // file groups
+        fileGroups = Lists.newArrayList();
+        files = Lists.newArrayList("hdfs://127.0.0.1:9001/file1", "hdfs://127.0.0.1:9001/file2.csv",
+                "hdfs://127.0.0.1:9001/file3.gz", "hdfs://127.0.0.1:9001/file4.bz2", "hdfs://127.0.0.1:9001/file5.lz4", "hdfs://127.0.0.1:9001/file6.deflate", "hdfs://127.0.0.1:9001/file7.zst");
+        desc =
+                new DataDescription("testTable", null, files, columnNames, null, null, "csv", false, null);
+        brokerFileGroup = new BrokerFileGroup(desc);
+        Deencapsulation.setField(brokerFileGroup, "columnSeparator", "\t");
+        Deencapsulation.setField(brokerFileGroup, "rowDelimiter", "\n");
+        Deencapsulation.setField(brokerFileGroup, "fileFormat", "csv");
+        fileGroups.add(brokerFileGroup);
+
+        // file status
+        fileStatusesList = Lists.newArrayList();
+        fileStatusList = Lists.newArrayList();
+        for (String file : files) {
+            fileStatusList.add(new TBrokerFileStatus(file, false, 1024, true));
+        }
+        fileStatusesList.add(fileStatusList);
+
+        analyzer = new Analyzer(GlobalStateMgr.getCurrentState(), new ConnectContext());
+        descTable = analyzer.getDescTbl();
+        tupleDesc = descTable.createTupleDescriptor("DestTableTuple");
+        scanNode = new FileScanNode(new PlanNodeId(0), tupleDesc, "FileScanNode", fileStatusesList, 2);
+        scanNode.setLoadInfo(jobId, txnId, table, brokerDesc, fileGroups, true, loadParallelInstanceNum);
+        scanNode.init(analyzer);
+        scanNode.finalizeStats(analyzer);
+
+        // check
+        locationsList = scanNode.getScanRangeLocations(0);
+        Assert.assertEquals(1, locationsList.size());
+
+
+        Assert.assertEquals(7, locationsList.get(0).scan_range.broker_scan_range.ranges.size());
+
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_PLAIN, locationsList.get(0).scan_range.broker_scan_range.ranges.get(0).format_type);
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_PLAIN, locationsList.get(0).scan_range.broker_scan_range.ranges.get(1).format_type);
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_GZ, locationsList.get(0).scan_range.broker_scan_range.ranges.get(2).format_type);
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_BZ2, locationsList.get(0).scan_range.broker_scan_range.ranges.get(3).format_type);
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_LZ4_FRAME, locationsList.get(0).scan_range.broker_scan_range.ranges.get(4).format_type);
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_DEFLATE, locationsList.get(0).scan_range.broker_scan_range.ranges.get(5).format_type);
+        Assert.assertEquals(TFileFormatType.FORMAT_CSV_ZSTD, locationsList.get(0).scan_range.broker_scan_range.ranges.get(6).format_type);
     }
 }

@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.optimizer.rule.transformation;
 
 import com.google.common.collect.Lists;
@@ -52,7 +65,7 @@ public class RewriteMultiDistinctRule extends TransformationRule {
         List<CallOperator> distinctAggOperatorList = agg.getAggregations().values().stream()
                 .filter(CallOperator::isDistinct).collect(Collectors.toList());
 
-        boolean hasMultiColumns = distinctAggOperatorList.stream().anyMatch(f -> f.getChildren().size() > 1);
+        boolean hasMultiColumns = distinctAggOperatorList.stream().anyMatch(f -> f.getDistinctChildren().size() > 1);
         return (distinctAggOperatorList.size() > 1 || agg.getAggregations().values().stream()
                 .anyMatch(call -> call.isDistinct() && call.getFnName().equals(FunctionSet.AVG))) && !hasMultiColumns;
     }
@@ -66,11 +79,17 @@ public class RewriteMultiDistinctRule extends TransformationRule {
                 .entrySet()) {
             CallOperator oldFunctionCall = aggregation.getValue();
             if (oldFunctionCall.isDistinct()) {
-                CallOperator newAggOperator = oldFunctionCall;
+                CallOperator newAggOperator;
                 if (oldFunctionCall.getFnName().equalsIgnoreCase(FunctionSet.COUNT)) {
                     newAggOperator = buildMultiCountDistinct(oldFunctionCall);
                 } else if (oldFunctionCall.getFnName().equalsIgnoreCase(FunctionSet.SUM)) {
                     newAggOperator = buildMultiSumDistinct(oldFunctionCall);
+                } else if (oldFunctionCall.getFnName().equals(FunctionSet.ARRAY_AGG)) {
+                    newAggOperator = buildArrayAggDistinct(oldFunctionCall);
+                } else if (oldFunctionCall.getFnName().equalsIgnoreCase(FunctionSet.AVG)) {
+                    newAggOperator = oldFunctionCall;
+                } else {
+                    return Lists.newArrayList();
                 }
                 newAggMap.put(aggregation.getKey(), newAggOperator);
             } else {
@@ -135,15 +154,19 @@ public class RewriteMultiDistinctRule extends TransformationRule {
         OptExpression result;
         if (hasAvg) {
             OptExpression aggOpt = OptExpression
-                    .create(new LogicalAggregationOperator(AggType.GLOBAL, aggregationOperator.getGroupingKeys(),
-                                    newAggMapWithAvg),
+                    .create(new LogicalAggregationOperator.Builder().withOperator(aggregationOperator)
+                                    .setType(AggType.GLOBAL)
+                                    .setAggregations(newAggMapWithAvg)
+                                    .build(),
                             input.getInputs());
             aggregationOperator.getGroupingKeys().forEach(c -> projections.put(c, c));
             result = OptExpression.create(new LogicalProjectOperator(projections), Lists.newArrayList(aggOpt));
         } else {
             result = OptExpression
-                    .create(new LogicalAggregationOperator(AggType.GLOBAL, aggregationOperator.getGroupingKeys(),
-                                    newAggMap),
+                    .create(new LogicalAggregationOperator.Builder().withOperator(aggregationOperator)
+                                    .setType(AggType.GLOBAL)
+                                    .setAggregations(newAggMap)
+                                    .build(),
                             input.getInputs());
         }
 
@@ -161,6 +184,17 @@ public class RewriteMultiDistinctRule extends TransformationRule {
 
         return (CallOperator) scalarRewriter.rewrite(
                 new CallOperator(FunctionSet.MULTI_DISTINCT_COUNT, fn.getReturnType(), oldFunctionCall.getChildren(),
+                        fn),
+                DEFAULT_TYPE_CAST_RULE);
+    }
+
+    private CallOperator buildArrayAggDistinct(CallOperator oldFunctionCall) {
+        Function searchDesc = new Function(new FunctionName(FunctionSet.ARRAY_AGG_DISTINCT),
+                oldFunctionCall.getFunction().getArgs(), Type.INVALID, false);
+        Function fn = GlobalStateMgr.getCurrentState().getFunction(searchDesc, IS_NONSTRICT_SUPERTYPE_OF);
+
+        return (CallOperator) scalarRewriter.rewrite(
+                new CallOperator(FunctionSet.ARRAY_AGG_DISTINCT, fn.getReturnType(), oldFunctionCall.getChildren(),
                         fn),
                 DEFAULT_TYPE_CAST_RULE);
     }

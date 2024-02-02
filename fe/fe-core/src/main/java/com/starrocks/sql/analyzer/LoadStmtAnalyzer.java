@@ -1,21 +1,38 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.google.common.base.Strings;
 import com.starrocks.analysis.BrokerDesc;
 import com.starrocks.analysis.LabelName;
-import com.starrocks.analysis.LoadStmt;
+import com.starrocks.catalog.Database;
+import com.starrocks.catalog.OlapTable;
+import com.starrocks.catalog.PartitionType;
+import com.starrocks.catalog.Table;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
-import com.starrocks.common.FeNameFormat;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.load.EtlJobType;
-import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.DataDescription;
+import com.starrocks.sql.ast.LoadStmt;
 import com.starrocks.sql.ast.ResourceDesc;
 import org.apache.commons.collections.CollectionUtils;
 
@@ -40,7 +57,7 @@ public class LoadStmtAnalyzer {
         }
 
         @Override
-        public Void visitLoadStmt(LoadStmt statement, ConnectContext context) {
+        public Void visitLoadStatement(LoadStmt statement, ConnectContext context) {
             analyzeLabel(statement, context);
             analyzeDataDescriptions(statement);
             analyzeProperties(statement);
@@ -57,11 +74,7 @@ public class LoadStmtAnalyzer {
                 }
             }
             label.setDbName(dbName);
-            try {
-                FeNameFormat.checkLabel(label.getLabelName());
-            } catch (AnalysisException e) {
-                ErrorReport.reportSemanticException(ErrorCode.ERR_COMMON_ERROR, e.getMessage());
-            }
+            FeNameFormat.checkLabel(label.getLabelName());
         }
 
         private void analyzeDataDescriptions(LoadStmt statement) {
@@ -99,21 +112,40 @@ public class LoadStmtAnalyzer {
                 if (resourceDesc != null) {
                     resourceDesc.analyze();
                     etlJobType = resourceDesc.getEtlJobType();
-                    // check resource usage privilege
-                    if (!GlobalStateMgr.getCurrentState().getAuth().checkResourcePriv(ConnectContext.get(),
-                            resourceDesc.getName(),
-                            PrivPredicate.USAGE)) {
-                        ErrorReport.reportSemanticException(ErrorCode.ERR_COMMON_ERROR,
-                                "USAGE denied to user '" + ConnectContext.get().getQualifiedUser()
-                                        + "'@'" + ConnectContext.get().getRemoteIP()
-                                        + "' for resource '" + resourceDesc.getName() + "'");
-                    }
                 } else if (brokerDesc != null) {
                     etlJobType = EtlJobType.BROKER;
                 } else {
                     // if cluster is null, use default hadoop cluster
                     // if cluster is not null, use this hadoop cluster
                     etlJobType = EtlJobType.HADOOP;
+                }
+
+                String database = ConnectContext.get().getDatabase();
+                if (etlJobType == EtlJobType.SPARK && database != null) {
+                    for (DataDescription dataDescription : dataDescriptions) {
+                        String tableName = dataDescription.getTableName();
+                        Database db = GlobalStateMgr.getCurrentState().getDb(database);
+                        if (db == null) {
+                            continue;
+                        }
+                        Locker locker = new Locker();
+                        locker.lockDatabase(db, LockType.READ);
+                        try {
+                            Table table = db.getTable(tableName);
+                            if (table == null) {
+                                continue;
+                            }
+                            if (table.isOlapOrCloudNativeTable()) {
+                                OlapTable olapTable = (OlapTable) table;
+                                if (olapTable.getPartitionInfo().getType() == PartitionType.EXPR_RANGE) {
+                                    ErrorReport.reportSemanticException(ErrorCode.ERR_COMMON_ERROR,
+                                            "Currently spark load does not support automatic partition tables");
+                                }
+                            }
+                        } finally {
+                            locker.unLockDatabase(db, LockType.READ);
+                        }
+                    }
                 }
 
                 statement.setEtlJobType(etlJobType);

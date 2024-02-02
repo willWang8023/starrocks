@@ -18,15 +18,13 @@
 package com.starrocks.common;
 
 import com.google.common.collect.Sets;
+import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.thrift.TNetworkAddress;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 import org.apache.thrift.TProcessor;
 import org.apache.thrift.protocol.TBinaryProtocol;
 import org.apache.thrift.server.TServer;
-import org.apache.thrift.server.TSimpleServer;
-import org.apache.thrift.server.TThreadedSelectorServer;
-import org.apache.thrift.transport.TNonblockingServerSocket;
 import org.apache.thrift.transport.TServerSocket;
 import org.apache.thrift.transport.TTransportException;
 
@@ -37,71 +35,17 @@ import java.util.concurrent.ThreadPoolExecutor;
 
 public class ThriftServer {
     private static final Logger LOG = LogManager.getLogger(ThriftServer.class);
-    private ThriftServerType type;
     private int port;
     private TProcessor processor;
     private TServer server;
     private Thread serverThread;
     private Set<TNetworkAddress> connects;
-
-    public static final String SIMPLE = "SIMPLE";
-    public static final String THREADED = "THREADED";
-    public static final String THREAD_POOL = "THREAD_POOL";
-
-    public enum ThriftServerType {
-        // TSimplerServer
-        SIMPLE(ThriftServer.SIMPLE),
-        // TThreadedSelectorServer
-        THREADED(ThriftServer.THREADED),
-        // TThreadPoolServer
-        THREAD_POOL(ThriftServer.THREAD_POOL);
-
-        private final String value;
-
-        ThriftServerType(String value) {
-            this.value = value;
-        }
-
-        public String getValue() {
-            return value;
-        }
-
-        public static ThriftServerType getThriftServerType(String value) {
-            for (ThriftServerType val : ThriftServerType.values()) {
-                if (val.getValue().equalsIgnoreCase(value)) {
-                    return val;
-                }
-            }
-            return ThriftServerType.THREAD_POOL;
-        }
-    }
+    private static ThreadPoolExecutor executor;
 
     public ThriftServer(int port, TProcessor processor) {
         this.port = port;
         this.processor = processor;
         this.connects = Sets.newConcurrentHashSet();
-        this.type = ThriftServerType.getThriftServerType(Config.thrift_server_type);
-    }
-
-    public ThriftServerType getType() {
-        return type;
-    }
-
-    private void createSimpleServer() throws TTransportException {
-        TServer.Args args = new TServer.Args(new TServerSocket(port)).protocolFactory(
-                new TBinaryProtocol.Factory()).processor(processor);
-        server = new TSimpleServer(args);
-    }
-
-    private void createThreadedServer() throws TTransportException {
-        TThreadedSelectorServer.Args args =
-                new TThreadedSelectorServer.Args(new TNonblockingServerSocket(port, Config.thrift_client_timeout_ms))
-                        .protocolFactory(
-                                new TBinaryProtocol.Factory()).processor(processor);
-        ThreadPoolExecutor threadPoolExecutor = ThreadPoolManager
-                .newDaemonCacheThreadPool(Config.thrift_server_max_worker_threads, "thrift-server-pool", true);
-        args.executorService(threadPoolExecutor);
-        server = new TThreadedSelectorServer(args);
     }
 
     private void createThreadPoolServer() throws TTransportException {
@@ -110,27 +54,33 @@ public class ThriftServer {
                 .clientTimeout(Config.thrift_client_timeout_ms)
                 .backlog(Config.thrift_backlog_num);
 
+        TBinaryProtocol.Factory factory =
+                new TBinaryProtocol.Factory(Config.thrift_rpc_strict_mode, true, Config.thrift_rpc_max_body_size, -1);
         SRTThreadPoolServer.Args serverArgs =
                 new SRTThreadPoolServer.Args(new TServerSocket(socketTransportArgs)).protocolFactory(
-                        new TBinaryProtocol.Factory()).processor(processor);
+                        factory).processor(processor);
         ThreadPoolExecutor threadPoolExecutor = ThreadPoolManager
-                .newDaemonCacheThreadPool(Config.thrift_server_max_worker_threads, "thrift-server-pool", true);
+                .newDaemonFixedThreadPool(Config.thrift_server_max_worker_threads,
+                        Config.thrift_server_queue_size,
+                        "thrift-server-pool", true);
+        // allow core thread time out so that the thread can be released
+        // if not used for ThreadPoolManager.KEEP_ALIVE_TIME
+        threadPoolExecutor.allowCoreThreadTimeOut(true);
         serverArgs.executorService(threadPoolExecutor);
+        executor = threadPoolExecutor;
         server = new SRTThreadPoolServer(serverArgs);
+
+        GlobalStateMgr.getCurrentState().getConfigRefreshDaemon().registerListener(() -> {
+            if (threadPoolExecutor.getMaximumPoolSize() != Config.thrift_server_max_worker_threads) {
+                threadPoolExecutor.setCorePoolSize(Config.thrift_server_max_worker_threads);
+                threadPoolExecutor.setMaximumPoolSize(Config.thrift_server_max_worker_threads);
+            }
+        });
     }
 
     public void start() throws IOException {
         try {
-            switch (type) {
-                case SIMPLE:
-                    createSimpleServer();
-                    break;
-                case THREADED:
-                    createThreadedServer();
-                    break;
-                default:
-                    createThreadPoolServer();
-            }
+            createThreadPoolServer();
         } catch (TTransportException ex) {
             LOG.warn("create thrift server failed.", ex);
             throw new IOException("create thrift server failed.", ex);
@@ -169,5 +119,9 @@ public class ThriftServer {
 
     public void removeConnect(TNetworkAddress clientAddress) {
         connects.remove(clientAddress);
+    }
+
+    public static ThreadPoolExecutor getExecutor() {
+        return executor;
     }
 }

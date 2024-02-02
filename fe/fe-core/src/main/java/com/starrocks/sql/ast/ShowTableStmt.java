@@ -1,16 +1,33 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.ast;
 
+import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
+import com.starrocks.analysis.CompoundPredicate;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.ExprSubstitutionMap;
-import com.starrocks.analysis.ShowStmt;
 import com.starrocks.analysis.SlotRef;
+import com.starrocks.analysis.StringLiteral;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Column;
-import com.starrocks.catalog.InfoSchemaDb;
 import com.starrocks.catalog.ScalarType;
+import com.starrocks.catalog.system.information.InfoSchemaDb;
 import com.starrocks.qe.ShowResultSetMetaData;
+import com.starrocks.sql.parser.NodePosition;
 
 // SHOW TABLES
 public class ShowTableStmt extends ShowStmt {
@@ -21,19 +38,28 @@ public class ShowTableStmt extends ShowStmt {
     private final boolean isVerbose;
     private final String pattern;
     private Expr where;
+    private String catalogName;
 
     public ShowTableStmt(String db, boolean isVerbose, String pattern) {
-        this.db = db;
-        this.isVerbose = isVerbose;
-        this.pattern = pattern;
-        this.where = null;
+        this(db, isVerbose, pattern, null, null, NodePosition.ZERO);
     }
 
-    public ShowTableStmt(String db, boolean isVerbose, String pattern, Expr where) {
+    public ShowTableStmt(String db, boolean isVerbose, String pattern, String catalogName) {
+        this(db, isVerbose, pattern, null, catalogName, NodePosition.ZERO);
+    }
+
+    public ShowTableStmt(String db, boolean isVerbose, String pattern, Expr where, String catalogName) {
+        this(db, isVerbose, pattern, where, catalogName, NodePosition.ZERO);
+    }
+
+    public ShowTableStmt(String db, boolean isVerbose, String pattern, Expr where,
+                         String catalogName, NodePosition pos) {
+        super(pos);
         this.db = db;
         this.isVerbose = isVerbose;
         this.pattern = pattern;
         this.where = where;
+        this.catalogName = catalogName;
     }
 
     public String getDb() {
@@ -46,6 +72,10 @@ public class ShowTableStmt extends ShowStmt {
 
     public String getPattern() {
         return pattern;
+    }
+
+    public String getCatalogName() {
+        return catalogName;
     }
 
     @Override
@@ -67,8 +97,18 @@ public class ShowTableStmt extends ShowStmt {
             aliasMap.put(new SlotRef(null, TYPE_COL), item.getExpr().clone(null));
         }
         where = where.substitute(aliasMap);
+        // where databases_name = currentdb
+        Expr whereDbEQ = new BinaryPredicate(
+                BinaryType.EQ,
+                new SlotRef(TABLE_NAME, "TABLE_SCHEMA"),
+                new StringLiteral(db));
+        // old where + and + db where
+        Expr finalWhere = new CompoundPredicate(
+                CompoundPredicate.Operator.AND,
+                whereDbEQ,
+                where);
         return new QueryStatement(new SelectRelation(selectList, new TableRelation(TABLE_NAME),
-                where, null, null));
+                finalWhere, null, null), this.origStmt);
     }
 
     @Override
@@ -88,11 +128,6 @@ public class ShowTableStmt extends ShowStmt {
 
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
-        return visitor.visitShowTableStmt(this, context);
-    }
-
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
+        return visitor.visitShowTableStatement(this, context);
     }
 }

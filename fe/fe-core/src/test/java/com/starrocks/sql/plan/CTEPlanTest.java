@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.plan;
 
@@ -86,12 +99,15 @@ public class CTEPlanTest extends PlanTestBase {
     @Test
     public void testFromUseCte() throws Exception {
         String sql = "with x0 as (select * from t0) " +
-                "select * from (with x1 as (select * from t1) select * from x1 join x0 on x1.v4 = x0.v1) tt";
+                "select * from (" +
+                "   with x1 as (select * from t1) " +
+                "   select * from x1 join x0 on x1.v4 = x0.v1" +
+                ") tt";
         String plan = getFragmentPlan(sql);
-        Assert.assertTrue(plan.contains("  3:HASH JOIN\n" +
+        Assert.assertTrue(plan, plan.contains("  3:HASH JOIN\n" +
                 "  |  join op: INNER JOIN (BROADCAST)\n" +
                 "  |  colocate: false, reason: \n" +
-                "  |  equal join conjunct: 7: v4 = 10: v1"));
+                "  |  equal join conjunct: 1: v4 = 4: v1"));
         Assert.assertFalse(plan.contains("MultiCastDataSinks"));
     }
 
@@ -100,23 +116,23 @@ public class CTEPlanTest extends PlanTestBase {
         String sql = "with x0 as (select * from t0) " +
                 "select * from x0 x,t1 y where v1 in (select v2 from x0 z where z.v1 = x.v1)";
         String plan = getFragmentPlan(sql);
-        Assert.assertTrue(plan.contains("MultiCastDataSinks\n" +
+        assertContains(plan, "  MultiCastDataSinks\n" +
                 "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 02\n" +
+                "    EXCHANGE ID: 01\n" +
                 "    RANDOM\n" +
                 "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 04\n" +
-                "    RANDOM"));
+                "    EXCHANGE ID: 03\n" +
+                "    RANDOM");
 
         sql = "with x0 as (select * from t0) " +
                 "select * from x0 t,t1 where v1 in (select v2 from x0 where t.v1 = v1)";
         plan = getFragmentPlan(sql);
         Assert.assertTrue(plan.contains("MultiCastDataSinks\n" +
                 "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 02\n" +
+                "    EXCHANGE ID: 01\n" +
                 "    RANDOM\n" +
                 "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 04\n" +
+                "    EXCHANGE ID: 03\n" +
                 "    RANDOM"));
     }
 
@@ -194,7 +210,6 @@ public class CTEPlanTest extends PlanTestBase {
         Assert.assertTrue(plan.contains("MultiCastDataSinks"));
         Assert.assertTrue(plan.contains("cardinality=1\n" +
                 "     avgRowSize=24.0\n" +
-                "     numNodes=0\n" +
                 "     limit: 3"));
     }
 
@@ -205,7 +220,7 @@ public class CTEPlanTest extends PlanTestBase {
                 "(select * from xx where xx.v2 = 2 limit 1) x1 join " +
                 "(select * from xx where xx.v3 = 4 limit 3) x2 on x1.v2=x2.v3;";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  0:OlapScanNode\n" +
+        assertContains(plan, "0:OlapScanNode\n" +
                 "     TABLE: t0\n" +
                 "     PREAGGREGATION: ON\n" +
                 "     PREDICATES: (3: v3 = 4) OR (2: v2 = 2)\n" +
@@ -213,9 +228,8 @@ public class CTEPlanTest extends PlanTestBase {
                 "     rollup: t0\n" +
                 "     tabletRatio=0/0\n" +
                 "     tabletList=\n" +
-                "     cardinality=0\n" +
+                "     cardinality=1\n" +
                 "     avgRowSize=24.0\n" +
-                "     numNodes=0\n" +
                 "     limit: 3");
     }
 
@@ -276,10 +290,10 @@ public class CTEPlanTest extends PlanTestBase {
 
         String plan = getFragmentPlan(sql);
         defaultCTEReuse();
-        assertContains(plan, "  6:SELECT\n" +
+        assertContains(plan, "3:SELECT\n" +
                 "  |  predicates: 4: v1 = 2\n" +
                 "  |  \n" +
-                "  5:Project\n" +
+                "  2:Project\n" +
                 "  |  <slot 4> : 1: v1\n" +
                 "  |  <slot 5> : 2: v2\n" +
                 "  |  <slot 6> : 3: v3");
@@ -383,7 +397,7 @@ public class CTEPlanTest extends PlanTestBase {
     public void testEmptyCTE() throws Exception {
         String sql = "WITH w_t0 as (SELECT * FROM t0), " +
                 "          w_t1 as (select * from t1)\n" +
-                "SELECT v1, v2, v3 FROM  w_t0 x0 where false " +
+                "SELECT v1, v2, v3 FROM w_t0 x0 where false " +
                 "union " +
                 "select v1, v2, v3 from w_t0 x1 where abs(1) = 2 " +
                 "union " +
@@ -618,18 +632,186 @@ public class CTEPlanTest extends PlanTestBase {
     public void testAllCTEConsumePruned() throws Exception {
         String sql = "select * from t0 where (abs(2) = 1 or v1 in (select v4 from t1)) and v1 = 2 and v1 = 5";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "  |----2:EXCHANGE\n" +
-                "  |    \n" +
-                "  0:EMPTYSET\n" +
-                "\n" +
-                "PLAN FRAGMENT 1\n" +
-                " OUTPUT EXPRS:\n" +
-                "  PARTITION: UNPARTITIONED\n" +
-                "\n" +
+        assertContains(plan, "0:EMPTYSET");
+    }
+
+    @Test
+    public void testCTEColumnPruned() throws Exception {
+        String sql = "WITH x1 as (" +
+                " select * from t0" +
+                ") " +
+                "SELECT t1.* from t1, x1 " +
+                "UNION ALL " +
+                "SELECT t2.* from t2, x1 ";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  MultiCastDataSinks\n" +
                 "  STREAM DATA SINK\n" +
-                "    EXCHANGE ID: 02\n" +
-                "    UNPARTITIONED\n" +
+                "    EXCHANGE ID: 03\n" +
+                "    RANDOM\n" +
+                "  STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 10\n" +
+                "    RANDOM");
+    }
+
+    @Test
+    public void testMultiDistinctWithLimit() throws Exception {
+        {
+            String sql = "select sum(distinct(v1)), avg(distinct(v2)) from t0 limit 1";
+            String plan = getFragmentPlan(sql);
+            assertContains(plan, "2:Project\n" +
+                    "  |  <slot 4> : 4: sum\n" +
+                    "  |  <slot 5> : CAST(7: multi_distinct_sum AS DOUBLE) / CAST(6: multi_distinct_count AS DOUBLE)\n" +
+                    "  |  limit: 1\n" +
+                    "  |  \n" +
+                    "  1:AGGREGATE (update finalize)\n" +
+                    "  |  output: multi_distinct_sum(1: v1), multi_distinct_count(2: v2), multi_distinct_sum(2: v2)\n" +
+                    "  |  group by: \n" +
+                    "  |  limit: 1");
+        }
+        {
+            String sql = "select sum(distinct(v1)), avg(distinct(v2)) from t0 group by v3 limit 1";
+            String plan = getFragmentPlan(sql);
+            assertContains(plan, "2:Project\n" +
+                    "  |  <slot 4> : 4: sum\n" +
+                    "  |  <slot 5> : CAST(7: multi_distinct_sum AS DOUBLE) / CAST(6: multi_distinct_count AS DOUBLE)\n" +
+                    "  |  limit: 1\n" +
+                    "  |  \n" +
+                    "  1:AGGREGATE (update finalize)\n" +
+                    "  |  output: multi_distinct_sum(1: v1), multi_distinct_count(2: v2), multi_distinct_sum(2: v2)\n" +
+                    "  |  group by: 3: v3\n" +
+                    "  |  limit: 1");
+        }
+        {
+            String sql = "select count(distinct v1, v2), avg(distinct(v2)) from t0 limit 1";
+            String plan = getFragmentPlan(sql);
+            assertContains(plan, "29:Project\n" +
+                    "  |  <slot 4> : 4: count\n" +
+                    "  |  <slot 5> : CAST(8: sum AS DOUBLE) / CAST(10: count AS DOUBLE)\n" +
+                    "  |  limit: 1\n" +
+                    "  |  \n" +
+                    "  28:NESTLOOP JOIN\n" +
+                    "  |  join op: CROSS JOIN\n" +
+                    "  |  colocate: false, reason: \n" +
+                    "  |  limit: 1");
+        }
+        {
+            String sql = "select count(distinct v1, v2), avg(distinct(v2)) from t0 group by v3 limit 1";
+            String plan = getFragmentPlan(sql);
+            assertContains(plan, "20:HASH JOIN\n" +
+                    "  |  join op: INNER JOIN (BUCKET_SHUFFLE(S))\n" +
+                    "  |  colocate: false, reason: \n" +
+                    "  |  equal join conjunct: 8: v3 <=> 14: v3\n" +
+                    "  |  limit: 1");
+        }
+        {
+            String sql = "select count(distinct v2, v3) from t0 limit 5;\n";
+            String plan = getFragmentPlan(sql);
+            assertContains(plan, "6:AGGREGATE (merge finalize)\n" +
+                    "  |  output: count(4: count)\n" +
+                    "  |  group by: \n" +
+                    "  |  limit: 5\n" +
+                    "  |  \n" +
+                    "  5:EXCHANGE");
+        }
+    }
+
+    @Test
+    public void testNestCte() throws Exception {
+        String sql = "select /*+SET_VAR(cbo_max_reorder_node_use_exhaustive=1)*/* " +
+                "from t0 " +
+                "where (t0.v1 in (with c1 as (select 1 as v2) select x1.v2 from c1 x1 join c1 x2 join c1 x3)) is null;";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  MultiCastDataSinks\n" +
+                "  STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 15\n" +
+                "    RANDOM\n" +
+                "  STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 22\n" +
+                "    RANDOM");
+    }
+
+    @Test
+    public void testGatherWindowCTE() throws Exception {
+        String sql = " WITH with_t_0 as (\n" +
+                "  SELECT v3 FROM t0 \n" +
+                ")\n" +
+                "SELECT\n" +
+                "  subt0.v3,\n" +
+                "  ROW_NUMBER() OVER (PARTITION BY subt0.v3, subt0.v2),\n" +
+                "  LAST_VALUE(subt0.v1) OVER (ORDER BY subt0.v3)\n" +
+                "FROM t0 subt0, with_t_0\n" +
+                "UNION ALL\n" +
+                "SELECT\n" +
+                "  subt0.v3,\n" +
+                "  ROW_NUMBER() OVER (PARTITION BY subt0.v3, subt0.v2),\n" +
+                "  LAST_VALUE(subt0.v1) OVER (ORDER BY subt0.v3)\n" +
+                "FROM t0 subt0, with_t_0";
+
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "  24:ANALYTIC\n" +
+                "  |  functions: [, row_number(), ]\n" +
+                "  |  partition by: 14: v3, 13: v2\n" +
+                "  |  window: ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW\n" +
+                "  |  \n" +
+                "  23:SORT\n" +
+                "  |  order by: <slot 14> 14: v3 ASC, <slot 13> 13: v2 ASC\n" +
+                "  |  offset: 0");
+    }
+
+    @Test
+    public void testNullTypeHack() throws Exception {
+        String sql = "WITH cte_1 AS (\n" +
+                "  SELECT null v1\n" +
+                ")\n" +
+                "SELECT  \n" +
+                "  CASE \n" +
+                "    WHEN a.v1 = b.v1 THEN 1 \n" +
+                "    ELSE -1 \n" +
+                "  END IS_OK\n" +
+                "FROM cte_1 a, cte_1 b";
+
+        String plan = getThriftPlan(sql);
+        assertNotContains(plan, "NULL_TYPE");
+    }
+
+    @Test
+    public void testMergePushdownPredicate() throws Exception {
+        String sql = "with with_t_0 as (select v1, v2, v4 from t0 join t1),\n" +
+                "          with_t_1 as (select v1, v2, v5 from t0 join t1)\n" +
+                "select v5, 1 from with_t_1 join with_t_0 left semi join\n" +
+                "(select v2 from with_t_0 where v4 = 123) subwith_t_0\n" +
+                "on with_t_0.v1 = subwith_t_0.v2 and with_t_0.v1 > 0\n" +
+                "where with_t_0.v4 < 100;";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "6:SELECT\n" +
+                "  |  predicates: 13: v1 > 0, 16: v4 < 100");
+        assertContains(plan, "9:SELECT\n" +
+                "  |  predicates: 20: v2 > 0, 22: v4 = 123");
+    }
+
+    @Test
+    public void testCTEForceUseUnForce() throws Exception {
+        String sql = "with " +
+                "x1 as (select * from t0),\n" +
+                "y1 as (select count(distinct v1, v2), count(distinct v2, v3) from x1)," +
+                "y2 as (select count(distinct v3, v2), count(distinct v1, v3) from x1)" +
+                "select * " +
+                "from y1 join y2" +
+                "        join t3";
+        connectContext.getSessionVariable().setOptimizerExecuteTimeout(-1);
+        connectContext.getSessionVariable().setMaxTransformReorderJoins(1);
+        defaultCTEReuse();
+        String plan = getFragmentPlan(sql);
+        connectContext.getSessionVariable().setMaxTransformReorderJoins(8);
+        assertContains(plan, "  MultiCastDataSinks\n" +
+                "  STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 01\n" +
+                "    RANDOM\n" +
+                "  STREAM DATA SINK\n" +
+                "    EXCHANGE ID: 21\n" +
+                "    RANDOM\n" +
                 "\n" +
-                "  1:EMPTYSET");
+                "  0:OlapScanNode\n" +
+                "     TABLE: t0");
     }
 }

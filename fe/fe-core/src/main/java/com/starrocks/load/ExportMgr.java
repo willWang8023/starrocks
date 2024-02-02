@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/ExportMgr.java
 
@@ -21,28 +34,34 @@
 
 package com.starrocks.load;
 
+import com.google.common.collect.ImmutableMap;
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.gson.Gson;
-import com.starrocks.analysis.CancelExportStmt;
-import com.starrocks.analysis.ExportStmt;
 import com.starrocks.analysis.TableName;
 import com.starrocks.catalog.Database;
+import com.starrocks.catalog.InternalCatalog;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.ErrorCode;
-import com.starrocks.common.ErrorReport;
 import com.starrocks.common.FeConstants;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.UserException;
 import com.starrocks.common.util.ListComparator;
 import com.starrocks.common.util.OrderByPair;
 import com.starrocks.common.util.TimeUtils;
-import com.starrocks.mysql.privilege.PrivPredicate;
-import com.starrocks.mysql.privilege.Privilege;
+import com.starrocks.memory.MemoryTrackable;
+import com.starrocks.persist.metablock.SRMetaBlockEOFException;
+import com.starrocks.persist.metablock.SRMetaBlockException;
+import com.starrocks.persist.metablock.SRMetaBlockID;
+import com.starrocks.persist.metablock.SRMetaBlockReader;
+import com.starrocks.persist.metablock.SRMetaBlockWriter;
+import com.starrocks.privilege.AccessDeniedException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Authorizer;
+import com.starrocks.sql.ast.CancelExportStmt;
+import com.starrocks.sql.ast.ExportStmt;
+import com.starrocks.sql.common.MetaUtils;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -60,7 +79,7 @@ import java.util.UUID;
 import java.util.concurrent.locks.ReentrantReadWriteLock;
 import java.util.stream.Collectors;
 
-public class ExportMgr {
+public class ExportMgr implements MemoryTrackable {
     private static final Logger LOG = LogManager.getLogger(ExportJob.class);
 
     // lock for export job
@@ -117,15 +136,10 @@ public class ExportMgr {
         return job;
     }
 
-    public void cancelExportJob(CancelExportStmt stmt) throws UserException {
-        String dbName = stmt.getDbName();
+    public ExportJob getExportJob(String dbName, UUID queryId) throws AnalysisException {
         Database db = GlobalStateMgr.getCurrentState().getDb(dbName);
-        if (db == null) {
-            ErrorReport.reportAnalysisException(ErrorCode.ERR_BAD_DB_ERROR, dbName);
-        }
+        MetaUtils.checkDbNullAndReport(db, dbName);
         long dbId = db.getId();
-
-        UUID queryId = stmt.getQueryId();
         ExportJob matchedJob = null;
         readLock();
         try {
@@ -139,18 +153,15 @@ public class ExportMgr {
         } finally {
             readUnlock();
         }
+        return matchedJob;
+    }
+
+    public void cancelExportJob(CancelExportStmt stmt) throws UserException {
+        ExportJob matchedJob = getExportJob(stmt.getDbName(), stmt.getQueryId());
+        UUID queryId = stmt.getQueryId();
         if (matchedJob == null) {
             throw new AnalysisException("Export job [" + queryId.toString() + "] is not found");
         }
-
-        // check auth
-        TableName tableName = matchedJob.getTableName();
-        if (!GlobalStateMgr.getCurrentState().getAuth().checkTblPriv(ConnectContext.get(),
-                tableName.getDb(), tableName.getTbl(),
-                PrivPredicate.SELECT)) {
-            ErrorReport.reportDdlException(ErrorCode.ERR_SPECIFIC_ACCESS_DENIED_ERROR, Privilege.SELECT_PRIV);
-        }
-
         matchedJob.cancel(ExportFailMsg.CancelType.USER_CANCEL, "user cancel");
     }
 
@@ -168,6 +179,23 @@ public class ExportMgr {
         }
 
         return result;
+    }
+
+    public ExportJob getExportByQueryId(UUID queryId) {
+        if (queryId == null) {
+            return null;
+        }
+        readLock();
+        try {
+            for (ExportJob job : idToJob.values()) {
+                if (queryId.equals(job.getQueryId())) {
+                    return job;
+                }
+            }
+        } finally {
+            readUnlock();
+        }
+        return null;
     }
 
     // NOTE: jobid and states may both specified, or only one of them, or neither
@@ -214,14 +242,20 @@ public class ExportMgr {
                     if (db == null) {
                         continue;
                     }
-                    if (!GlobalStateMgr.getCurrentState().getAuth().checkDbPriv(ConnectContext.get(),
-                            db.getFullName(), PrivPredicate.SHOW)) {
+
+                    try {
+                        Authorizer.checkAnyActionOnOrInDb(ConnectContext.get().getCurrentUserIdentity(),
+                                ConnectContext.get().getCurrentRoleIds(),
+                                InternalCatalog.DEFAULT_INTERNAL_CATALOG_NAME,
+                                db.getFullName());
+                    } catch (AccessDeniedException e) {
                         continue;
                     }
                 } else {
-                    if (!GlobalStateMgr.getCurrentState().getAuth().checkTblPriv(ConnectContext.get(),
-                            tableName.getDb(), tableName.getTbl(),
-                            PrivPredicate.SHOW)) {
+                    try {
+                        Authorizer.checkAnyActionOnTable(ConnectContext.get().getCurrentUserIdentity(),
+                                ConnectContext.get().getCurrentRoleIds(), tableName);
+                    } catch (AccessDeniedException e) {
                         continue;
                     }
                 }
@@ -230,7 +264,7 @@ public class ExportMgr {
 
                 jobInfo.add(id);
                 // query id
-                jobInfo.add(jobQueryId != null ? jobQueryId.toString() : FeConstants.null_string);
+                jobInfo.add(jobQueryId != null ? jobQueryId.toString() : FeConstants.NULL_STRING);
                 jobInfo.add(state.name());
                 jobInfo.add(job.getProgress() + "%");
 
@@ -266,7 +300,7 @@ public class ExportMgr {
                     ExportFailMsg failMsg = job.getFailMsg();
                     jobInfo.add("type:" + failMsg.getCancelType() + "; msg:" + failMsg.getMsg());
                 } else {
-                    jobInfo.add(FeConstants.null_string);
+                    jobInfo.add(FeConstants.NULL_STRING);
                 }
 
                 exportJobInfos.add(jobInfo);
@@ -301,8 +335,8 @@ public class ExportMgr {
 
     private boolean isJobExpired(ExportJob job, long currentTimeMs) {
         return (currentTimeMs - job.getCreateTimeMs()) / 1000 > Config.history_job_keep_max_second
-                        && (job.getState() == ExportJob.JobState.CANCELLED
-                        || job.getState() == ExportJob.JobState.FINISHED);
+                && (job.getState() == ExportJob.JobState.CANCELLED
+                || job.getState() == ExportJob.JobState.FINISHED);
     }
 
     public void removeOldExportJobs() {
@@ -335,15 +369,34 @@ public class ExportMgr {
         }
     }
 
+    @Deprecated
     public void replayUpdateJobState(long jobId, ExportJob.JobState newState) {
         writeLock();
         try {
             ExportJob job = idToJob.get(jobId);
-            job.updateState(newState, true);
+            job.updateState(newState, true, System.currentTimeMillis());
             if (isJobExpired(job, System.currentTimeMillis())) {
                 LOG.info("remove expired job: {}", job);
                 idToJob.remove(jobId);
             }
+        } finally {
+            writeUnlock();
+        }
+    }
+
+    public void replayUpdateJobInfo(ExportJob.ExportUpdateInfo info) {
+        writeLock();
+        try {
+            ExportJob job = idToJob.get(info.jobId);
+            job.updateState(info.state, true, info.stateChangeTime);
+            if (isJobExpired(job, System.currentTimeMillis())) {
+                LOG.info("remove expired job: {}", job);
+                idToJob.remove(info.jobId);
+            }
+            job.setSnapshotPaths(info.deserialize(info.snapshotPaths));
+            job.setExportTempPath(info.exportTempPath);
+            job.setExportedFiles(info.exportedFiles);
+            job.setFailMsg(info.failMsg);
         } finally {
             writeUnlock();
         }
@@ -367,21 +420,19 @@ public class ExportMgr {
     public long loadExportJob(DataInputStream dis, long checksum) throws IOException, DdlException {
         long currentTimeMs = System.currentTimeMillis();
         long newChecksum = checksum;
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_32) {
-            int size = dis.readInt();
-            newChecksum = checksum ^ size;
-            for (int i = 0; i < size; ++i) {
-                long jobId = dis.readLong();
-                newChecksum ^= jobId;
-                ExportJob job = new ExportJob();
-                job.readFields(dis);
-                // discard expired job right away
-                if (isJobExpired(job, currentTimeMs)) {
-                    LOG.info("discard expired job: {}", job);
-                    continue;
-                }
-                unprotectAddJob(job);
+        int size = dis.readInt();
+        newChecksum = checksum ^ size;
+        for (int i = 0; i < size; ++i) {
+            long jobId = dis.readLong();
+            newChecksum ^= jobId;
+            ExportJob job = new ExportJob();
+            job.readFields(dis);
+            // discard expired job right away
+            if (isJobExpired(job, currentTimeMs)) {
+                LOG.info("discard expired job: {}", job);
+                continue;
             }
+            unprotectAddJob(job);
         }
         LOG.info("finished replay exportJob from image");
         return newChecksum;
@@ -400,5 +451,34 @@ public class ExportMgr {
         }
 
         return checksum;
+    }
+
+    public void saveExportJobV2(DataOutputStream dos) throws IOException, SRMetaBlockException {
+        int numJson = 1 + idToJob.size();
+        SRMetaBlockWriter writer = new SRMetaBlockWriter(dos, SRMetaBlockID.EXPORT_MGR, numJson);
+        writer.writeJson(idToJob.size());
+        for (ExportJob job : idToJob.values()) {
+            writer.writeJson(job);
+        }
+        writer.close();
+    }
+
+    public void loadExportJobV2(SRMetaBlockReader reader) throws IOException, SRMetaBlockException, SRMetaBlockEOFException {
+        int size = reader.readInt();
+        long currentTimeMs = System.currentTimeMillis();
+        for (int i = 0; i < size; i++) {
+            ExportJob job = reader.readJson(ExportJob.class);
+            // discard expired job right away
+            if (isJobExpired(job, currentTimeMs)) {
+                LOG.info("discard expired job: {}", job);
+                continue;
+            }
+            unprotectAddJob(job);
+        }
+    }
+
+    @Override
+    public Map<String, Long> estimateCount() {
+        return ImmutableMap.of("ExportJob", (long) idToJob.size());
     }
 }

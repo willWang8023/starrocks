@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/load/Load.java
 
@@ -29,13 +42,13 @@ import com.google.common.collect.Sets;
 import com.starrocks.alter.SchemaChangeHandler;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.CastExpr;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.ExprSubstitutionMap;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.FunctionName;
 import com.starrocks.analysis.FunctionParams;
-import com.starrocks.analysis.ImportColumnDesc;
 import com.starrocks.analysis.IntLiteral;
 import com.starrocks.analysis.IsNullPredicate;
 import com.starrocks.analysis.LiteralExpr;
@@ -43,10 +56,13 @@ import com.starrocks.analysis.NullLiteral;
 import com.starrocks.analysis.SlotDescriptor;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.StringLiteral;
+import com.starrocks.analysis.TableName;
 import com.starrocks.analysis.TupleDescriptor;
+import com.starrocks.authentication.AuthenticationMgr;
 import com.starrocks.backup.BlobStorage;
 import com.starrocks.backup.Status;
 import com.starrocks.catalog.Column;
+import com.starrocks.catalog.Database;
 import com.starrocks.catalog.FunctionSet;
 import com.starrocks.catalog.KeysType;
 import com.starrocks.catalog.OlapTable;
@@ -54,12 +70,21 @@ import com.starrocks.catalog.Table;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.Pair;
+import com.starrocks.common.StarRocksFEMetaVersion;
 import com.starrocks.common.UserException;
 import com.starrocks.load.loadv2.JobState;
+import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.AnalyzeState;
+import com.starrocks.sql.analyzer.ExpressionAnalyzer;
+import com.starrocks.sql.analyzer.Field;
+import com.starrocks.sql.analyzer.RelationFields;
+import com.starrocks.sql.analyzer.RelationId;
+import com.starrocks.sql.analyzer.Scope;
 import com.starrocks.sql.ast.DataDescription;
+import com.starrocks.sql.ast.ImportColumnDesc;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.thrift.TBrokerScanRangeParams;
 import com.starrocks.thrift.TOpType;
 import org.apache.logging.log4j.LogManager;
@@ -72,8 +97,11 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Map.Entry;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
+
+import static com.starrocks.catalog.DefaultExpr.SUPPORTED_DEFAULT_FNS;
 
 public class Load {
     private static final Logger LOG = LogManager.getLogger(Load.class);
@@ -84,6 +112,61 @@ public class Load {
     private LoadErrorHub.Param loadErrorHubParam = new LoadErrorHub.Param();
 
     public Load() {
+    }
+
+    /**
+     * Check merge condition string:
+     * 1. should be a valid column name
+     * 2. should not be bitmap/hll/percentile/json/varchar column
+     * 3. should not be primary key
+     * 4. table should be primary key model
+     * @param mergeCondition
+     * @param table
+     * @return
+     * @throws UserException
+     */
+    public static void checkMergeCondition(String mergeCondition, OlapTable table, List<Column> columns,
+            boolean missAutoIncrementColumn) throws DdlException {
+        if (mergeCondition == null || mergeCondition.isEmpty()) {
+            return;
+        }
+
+        if (table.getKeysType() != KeysType.PRIMARY_KEYS) {
+            throw new DdlException("Conditional update only support primary key table " + table.getName());
+        }
+
+        Optional<Column> conditionCol = columns.stream().filter(c -> c.getName().equalsIgnoreCase(mergeCondition)).findFirst();
+        if (!conditionCol.isPresent()) {
+            throw new DdlException("Merge condition column " + mergeCondition + 
+                    " does not exist. If you are doing partial update with condition update, please check condition column" +
+                    " is in the given update columns. Otherwise please check condition column is in table " + table.getName());
+        } else {
+            if (conditionCol.get().isKey()) {
+                throw new DdlException("Merge condition column " + mergeCondition
+                        + " should not be primary key!");
+            }
+            if (missAutoIncrementColumn && conditionCol.get().isAutoIncrement()) {
+                throw new DdlException("Merge condition column can not be auto increment column in partial update");
+            }
+            switch (conditionCol.get().getPrimitiveType()) {
+                case CHAR:
+                case VARCHAR:
+                case PERCENTILE:
+                case BITMAP:
+                case FUNCTION:
+                case BINARY:
+                case VARBINARY:
+                case JSON:
+                case HLL:
+                case UNKNOWN_TYPE:
+                case INVALID_TYPE:
+                case NULL_TYPE:
+                    throw new DdlException("Merge condition column has invalid type maybe" +
+                            " bitmap/hll/percentile/json/varchar!");
+                default:
+                    return;
+            }
+        }
     }
 
     /**
@@ -99,6 +182,10 @@ public class Load {
         for (Column column : tbl.getFullSchema()) {
             if (!column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PRFIX) &&
                     !column.isNameWithPrefix(SchemaChangeHandler.SHADOW_NAME_PRFIX_V1)) {
+                continue;
+            }
+
+            if (column.isGeneratedColumn()) {
                 continue;
             }
 
@@ -136,6 +223,37 @@ public class Load {
                  */
                 // do nothing
             }
+        }
+        return shadowColumnDescs;
+    }
+
+    public static List<ImportColumnDesc> getMaterializedShadowColumnDesc(Table tbl, String dbName, boolean analyze) {
+        List<ImportColumnDesc> shadowColumnDescs = Lists.newArrayList();
+        for (Column column : tbl.getFullSchema()) {
+            if (!column.isGeneratedColumn()) {
+                continue;
+            }
+
+            TableName tableName = new TableName(dbName, tbl.getName());
+
+            ConnectContext connectContext = new ConnectContext();
+            connectContext.setDatabase(dbName);
+            connectContext.setQualifiedUser(AuthenticationMgr.ROOT_USER);
+            connectContext.setCurrentUserIdentity(UserIdentity.ROOT);
+
+            // If fe restart and execute the streamload, this re-analyze is needed.
+            Expr expr = column.generatedColumnExpr();
+            // In case of spark load, we should get the unanalyzed expression
+            if (analyze) {
+                ExpressionAnalyzer.analyzeExpression(expr, new AnalyzeState(),
+                    new Scope(RelationId.anonymous(), new RelationFields(
+                            tbl.getBaseSchema().stream().map(col -> new Field(col.getName(),
+                                    col.getType(), tableName, null))
+                                .collect(Collectors.toList()))), connectContext);
+            }
+
+            ImportColumnDesc importColumnDesc = new ImportColumnDesc(column.getName(), expr);
+            shadowColumnDescs.add(importColumnDesc);
         }
         return shadowColumnDescs;
     }
@@ -200,8 +318,14 @@ public class Load {
         // !! all column mappings are in columnExprs !!
         Set<String> importColumnNames = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
         Set<String> mappingColumnNames = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
+        Set<String> mappingColumnRef = Sets.newTreeSet(String.CASE_INSENSITIVE_ORDER);
         for (ImportColumnDesc importColumnDesc : columnExprs) {
             String columnName = importColumnDesc.getColumnName();
+
+            if (tbl.getColumns().size() != 0 && tbl.getColumn(columnName) != null
+                    && tbl.getColumn(columnName).isGeneratedColumn()) {
+                throw new DdlException("generated column: " + columnName + " can not be specified");
+            }
 
             if (importColumnDesc.isColumn()) {
                 if (importColumnNames.contains(columnName)) {
@@ -209,6 +333,13 @@ public class Load {
                 }
                 importColumnNames.add(columnName);
                 continue;
+            } else {
+                Expr expr = importColumnDesc.getExpr();
+                List<SlotRef> slots = Lists.newArrayList();
+                expr.collect(SlotRef.class, slots);
+                for (SlotRef slot : slots) {
+                    mappingColumnRef.add(slot.getColumnName());
+                }
             }
 
             if (mappingColumnNames.contains(columnName)) {
@@ -221,6 +352,17 @@ public class Load {
             mappingColumnNames.add(columnName);
         }
 
+        for (String refName : mappingColumnRef) {
+            Column refColumn = tbl.getColumn(refName);
+            if (refColumn == null) {
+                continue;
+            }
+
+            if (refColumn.isGeneratedColumn()) {
+                throw new DdlException("Mapping column can not ref generated column: " + refName);
+            }
+        }
+
         // We make a copy of the columnExprs so that our subsequent changes
         // to the columnExprs will not affect the original columnExprs.
         List<ImportColumnDesc> copiedColumnExprs = Lists.newArrayList(columnExprs);
@@ -231,8 +373,10 @@ public class Load {
         if (!specifyFileFieldNames) {
             List<Column> columns = tbl.getBaseSchema();
             for (Column column : columns) {
-                ImportColumnDesc columnDesc = new ImportColumnDesc(column.getName());
-                copiedColumnExprs.add(columnDesc);
+                if (!column.isGeneratedColumn() && !column.isAutoIncrement()) {
+                    ImportColumnDesc columnDesc = new ImportColumnDesc(column.getName());
+                    copiedColumnExprs.add(columnDesc);
+                }
             }
         }
 
@@ -304,12 +448,24 @@ public class Load {
                     continue;
                 }
                 Column.DefaultValueType defaultValueType = column.getDefaultValueType();
-                if (defaultValueType == Column.DefaultValueType.NULL && !column.isAllowNull()) {
+                if (defaultValueType == Column.DefaultValueType.NULL && !column.isAllowNull() && !column.isAutoIncrement()
+                        && !column.isGeneratedColumn()) {
                     throw new DdlException("Column has no default value. column: " + columnName);
                 }
             }
         }
 
+        String dbName = "";
+        if (GlobalStateMgr.getCurrentState().getLocalMetastore().getIdToDb() != null) {
+            for (Map.Entry<Long, Database> entry : GlobalStateMgr.getCurrentState().getLocalMetastore().getIdToDb().entrySet()) {
+                Database db = entry.getValue();
+                if (db.getTable(tbl.getId()) != null) {
+                    dbName = db.getFullName();
+                }
+            }
+        }
+    
+        copiedColumnExprs.addAll(getMaterializedShadowColumnDesc(tbl, dbName, true));
         // get shadow column desc when table schema change
         copiedColumnExprs.addAll(getSchemaChangeShadowColumnDesc(tbl, columnExprMap));
 
@@ -357,6 +513,7 @@ public class Load {
             if (importColumnDesc.isColumn()) {
                 continue;
             }
+
             List<SlotRef> slots = Lists.newArrayList();
             importColumnDesc.getExpr().collect(SlotRef.class, slots);
             for (SlotRef slot : slots) {
@@ -495,8 +652,8 @@ public class Load {
         LOG.debug("after init column, exprMap: {}", exprsByName);
     }
 
-    public static List<Column> getPartialUpateColumns(Table tbl, List<ImportColumnDesc> columnExprs)
-            throws UserException {
+    public static List<Column> getPartialUpateColumns(Table tbl, List<ImportColumnDesc> columnExprs,
+             List<Boolean> missAutoIncrementColumn) throws UserException {
         Set<String> specified = columnExprs.stream().map(desc -> desc.getColumnName()).collect(Collectors.toSet());
         List<Column> ret = new ArrayList<>();
         for (Column col : tbl.getBaseSchema()) {
@@ -504,6 +661,33 @@ public class Load {
                 ret.add(col);
             } else if (col.isKey()) {
                 throw new DdlException("key column " + col.getName() + " not in partial update columns");
+            } else if (col.isAutoIncrement()) {
+                if (missAutoIncrementColumn != null) {
+                    missAutoIncrementColumn.add(Boolean.TRUE);
+                }
+                ret.add(col);
+            } else if (col.isGeneratedColumn()) {
+                ret.add(col);
+            }
+        }
+        // partial update column must be specified if generated column need it.
+        if (tbl instanceof OlapTable) {
+            OlapTable olaptable = ((OlapTable) tbl);
+            if (olaptable.hasGeneratedColumn()) {
+                for (Column col : olaptable.getBaseSchema()) {
+                    List<SlotRef> slots = col.getGeneratedColumnRef();
+                    if (slots != null) {
+                        for (SlotRef slot : slots) {
+                            Column originColumn = olaptable.getColumn(slot.getColumnName());
+
+                            if (!ret.contains(originColumn)) {
+                                throw new DdlException("column " + originColumn.getName() + " needs to be " +
+                                                       "used for expression evaluation for materialized " +
+                                                       "column " + col.getName());
+                            }
+                        }
+                    }
+                }
             }
         }
         return ret;
@@ -551,7 +735,7 @@ public class Load {
                 }
 
                 SlotRef slotRef = (SlotRef) child;
-                String columnName = slotRef.getColumn().getName();
+                String columnName = slotRef.getColumnName();
                 if (excludedColumns.contains(columnName)) {
                     continue;
                 }
@@ -572,6 +756,11 @@ public class Load {
                                             Map<String, Expr> mvDefineExpr, Map<String, SlotDescriptor> slotDescByName,
                                             boolean useVectorizedLoad) throws UserException {
         for (Map.Entry<String, Expr> entry : exprsByName.entrySet()) {
+            // only for normal column here
+            if (tbl.getColumn(entry.getKey()) != null && tbl.getColumn(entry.getKey()).isGeneratedColumn()) {
+                continue;
+            }
+
             ExprSubstitutionMap smap = new ExprSubstitutionMap();
             List<SlotRef> slots = Lists.newArrayList();
             entry.getValue().collect(SlotRef.class, slots);
@@ -588,6 +777,59 @@ public class Load {
                 SlotRef slotRef = new SlotRef(slotDesc);
                 slotRef.setColumnName(slot.getColumnName());
                 smap.getRhs().add(slotRef);
+            }
+            Expr expr = entry.getValue().clone(smap);
+
+            expr = Expr.analyzeAndCastFold(expr);
+
+            // check if contain aggregation
+            List<FunctionCallExpr> funcs = Lists.newArrayList();
+            expr.collect(FunctionCallExpr.class, funcs);
+            for (FunctionCallExpr fn : funcs) {
+                if (fn.isAggregateFunction()) {
+                    throw new UserException("Don't support aggregation function in load expression");
+                }
+            }
+            exprsByName.put(entry.getKey(), expr);
+        }
+
+        for (Map.Entry<String, Expr> entry : exprsByName.entrySet()) {
+            // only for generated column here
+            if (tbl.getColumn(entry.getKey()) == null || !tbl.getColumn(entry.getKey()).isGeneratedColumn()) {
+                continue;
+            }
+
+            ExprSubstitutionMap smap = new ExprSubstitutionMap();
+            List<SlotRef> slots = Lists.newArrayList();
+            entry.getValue().collect(SlotRef.class, slots);
+            for (SlotRef slot : slots) {
+                SlotDescriptor slotDesc = slotDescByName.get(slot.getColumnName());
+                // In this case, generated column ref some mapping column
+                // and the expression should be replace by mapping column expression.
+
+                // Notes that, if slotDesc != null and exprsByName.get(slot.getColumnName()) != null
+                // it means that the ref columns are both in column list and expression list.
+                // In this case, we should rewrite the generated column expression using
+                // the expression in expression list instead of column list.
+                if (slotDesc == null || exprsByName.get(slot.getColumnName()) != null) {
+                    smap.getLhs().add(slot);
+                    Expr replaceExpr = exprsByName.get(slot.getColumnName());
+                    if (replaceExpr.getType().matchesType(Type.VARCHAR) &&
+                            !replaceExpr.getType().matchesType(slot.getType())) {
+                        replaceExpr = replaceExpr.castTo(slot.getType());
+                    }
+                    smap.getRhs().add(replaceExpr);
+                } else {
+                    smap.getLhs().add(slot);
+                    SlotRef slotRef = new SlotRef(slotDesc);
+                    slotRef.setColumnName(slot.getColumnName());
+                    Expr replaceExpr = slotRef;
+                    if (replaceExpr.getType().matchesType(Type.VARCHAR) &&
+                            !replaceExpr.getType().matchesType(slot.getType())) {
+                        replaceExpr = replaceExpr.castTo(slot.getType());
+                    }
+                    smap.getRhs().add(replaceExpr);
+                }
             }
             Expr expr = entry.getValue().clone(smap);
 
@@ -684,8 +926,12 @@ public class Load {
                         if (defaultValueType == Column.DefaultValueType.CONST) {
                             exprs.add(new StringLiteral(column.calculatedDefaultValue()));
                         } else if (defaultValueType == Column.DefaultValueType.VARY) {
-                            throw new UserException("Column(" + columnName + ") has unsupported default value:"
-                                    + column.getDefaultExpr().getExpr());
+                            if (SUPPORTED_DEFAULT_FNS.contains(column.getDefaultExpr().getExpr())) {
+                                exprs.add(column.getDefaultExpr().obtainExpr());
+                            } else {
+                                throw new UserException("Column(" + columnName + ") has unsupported default value:"
+                                        + column.getDefaultExpr().getExpr());
+                            }
                         } else if (defaultValueType == Column.DefaultValueType.NULL) {
                             if (column.isAllowNull()) {
                                 exprs.add(NullLiteral.create(Type.VARCHAR));
@@ -698,7 +944,7 @@ public class Load {
                     // case 2
                     exprs.add(new IsNullPredicate(slotRef, true));
                     List<Expr> innerIfExprs = Lists.newArrayList();
-                    innerIfExprs.add(new BinaryPredicate(BinaryPredicate.Operator.NE, slotRef, funcExpr.getChild(0)));
+                    innerIfExprs.add(new BinaryPredicate(BinaryType.NE, slotRef, funcExpr.getChild(0)));
                     innerIfExprs.add(slotRef);
                     if (funcExpr.hasChild(1)) {
                         innerIfExprs.add(funcExpr.getChild(1));
@@ -707,8 +953,12 @@ public class Load {
                         if (defaultValueType == Column.DefaultValueType.CONST) {
                             innerIfExprs.add(new StringLiteral(column.calculatedDefaultValue()));
                         } else if (defaultValueType == Column.DefaultValueType.VARY) {
-                            throw new UserException("Column(" + columnName + ") has unsupported default value:"
-                                    + column.getDefaultExpr().getExpr());
+                            if (SUPPORTED_DEFAULT_FNS.contains(column.getDefaultExpr().getExpr())) {
+                                innerIfExprs.add(column.getDefaultExpr().obtainExpr());
+                            } else {
+                                throw new UserException("Column(" + columnName + ") has unsupported default value:"
+                                        + column.getDefaultExpr().getExpr());
+                            }
                         } else if (defaultValueType == Column.DefaultValueType.NULL) {
                             if (column.isAllowNull()) {
                                 innerIfExprs.add(NullLiteral.create(Type.VARCHAR));
@@ -752,7 +1002,6 @@ public class Load {
                  * UNIX_TIMESTAMP(DATE_FORMAT(FROM_UNIXTIME(ts), "%Y-01-01 00:00:00"));
                  *
                  */
-
                 // FROM_UNIXTIME
                 FunctionName fromUnixName = new FunctionName(FunctionSet.FROM_UNIXTIME);
                 List<Expr> fromUnixArgs = Lists.newArrayList(funcExpr.getChild(1));
@@ -814,6 +1063,7 @@ public class Load {
         this.loadErrorHubParam = info;
     }
 
+    // TODO [meta-format-change] deprecated
     public void setLoadErrorHubInfo(Map<String, String> properties) throws DdlException {
         String type = properties.get("type");
         if (type.equalsIgnoreCase("MYSQL")) {
@@ -898,36 +1148,39 @@ public class Load {
     }
 
     public long loadLoadJob(DataInputStream dis, long checksum) throws IOException {
+        if (GlobalStateMgr.getCurrentStateStarRocksMetaVersion() <= StarRocksFEMetaVersion.VERSION_3) {
+            return loadLoadJobV1(dis, checksum);
+        } else {
+            return checksum;
+        }
+    }
+
+    public long loadLoadJobV1(DataInputStream dis, long checksum) throws IOException {
         // load jobs
         int jobSize = dis.readInt();
         long newChecksum = checksum ^ jobSize;
         Preconditions.checkArgument(jobSize == 0, "Number of jobs must be 0");
 
         // delete jobs
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_11) {
-            jobSize = dis.readInt();
-            newChecksum ^= jobSize;
-            Preconditions.checkArgument(jobSize == 0, "Number of delete job infos must be 0");
-        }
+        jobSize = dis.readInt();
+        newChecksum ^= jobSize;
+        Preconditions.checkArgument(jobSize == 0, "Number of delete job infos must be 0");
 
         // load error hub info
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_24) {
-            LoadErrorHub.Param param = new LoadErrorHub.Param();
-            param.readFields(dis);
-            setLoadErrorHubInfo(param);
-        }
+        LoadErrorHub.Param param = new LoadErrorHub.Param();
+        param.readFields(dis);
+        setLoadErrorHubInfo(param);
 
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_45) {
-            // 4. load delete jobs
-            int deleteJobSize = dis.readInt();
-            newChecksum ^= deleteJobSize;
-            Preconditions.checkArgument(deleteJobSize == 0, "Number of delete jobs must be 0");
-        }
+        // 4. load delete jobs
+        int deleteJobSize = dis.readInt();
+        newChecksum ^= deleteJobSize;
+        Preconditions.checkArgument(deleteJobSize == 0, "Number of delete jobs must be 0");
 
         LOG.info("finished replay loadJob from image");
         return newChecksum;
     }
 
+    // TODO [meta-format-change] deprecated
     public long saveLoadJob(DataOutputStream dos, long checksum) throws IOException {
         // 1. save load.dbToLoadJob
         int jobSize = 0;

@@ -1,47 +1,61 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
 #include "runtime/mem_pool.h"
 #include "storage/chunk_iterator.h"
 #include "storage/delete_predicates.h"
-#include "storage/lake/tablet.h"
 #include "storage/tablet_reader_params.h"
 
 namespace starrocks {
 class OlapTuple;
 
-namespace vectorized {
 class Chunk;
 class ChunkIterator;
 class ColumnPredicate;
-class RowSourceMask;
+struct RowSourceMask;
 class RowSourceMaskBuffer;
 class SeekRange;
 class SeekTuple;
-} // namespace vectorized
+class TabletSchema;
 
 namespace lake {
 
 class Rowset;
+class TabletManager;
+class TabletMetadataPB;
 
-class TabletReader final : public vectorized::ChunkIterator {
-    using Chunk = starrocks::vectorized::Chunk;
-    using ChunkIteratorPtr = starrocks::vectorized::ChunkIteratorPtr;
-    using ColumnPredicate = starrocks::vectorized::ColumnPredicate;
-    using DeletePredicates = starrocks::vectorized::DeletePredicates;
+class TabletReader final : public ChunkIterator {
+    using Chunk = starrocks::Chunk;
+    using ChunkIteratorPtr = starrocks::ChunkIteratorPtr;
+    using ColumnPredicate = starrocks::ColumnPredicate;
+    using DeletePredicates = starrocks::DeletePredicates;
     using RowsetPtr = std::shared_ptr<Rowset>;
-    using RowSourceMask = starrocks::vectorized::RowSourceMask;
-    using RowSourceMaskBuffer = starrocks::vectorized::RowSourceMaskBuffer;
-    using Schema = starrocks::vectorized::Schema;
-    using SeekRange = starrocks::vectorized::SeekRange;
-    using SeekTuple = starrocks::vectorized::SeekTuple;
-    using TabletReaderParams = starrocks::vectorized::TabletReaderParams;
+    using RowSourceMask = starrocks::RowSourceMask;
+    using RowSourceMaskBuffer = starrocks::RowSourceMaskBuffer;
+    using Schema = starrocks::Schema;
+    using SeekRange = starrocks::SeekRange;
+    using SeekTuple = starrocks::SeekTuple;
+    using TabletReaderParams = starrocks::TabletReaderParams;
 
 public:
-    TabletReader(Tablet tablet, int64_t version, Schema schema);
-    TabletReader(Tablet tablet, int64_t version, Schema schema, const std::vector<RowsetPtr>& rowsets);
-    TabletReader(Tablet tablet, int64_t version, Schema schema, bool is_key, RowSourceMaskBuffer* mask_buffer);
+    TabletReader(TabletManager* tablet_mgr, std::shared_ptr<const TabletMetadataPB> metadata, Schema schema);
+    TabletReader(TabletManager* tablet_mgr, std::shared_ptr<const TabletMetadataPB> metadata, Schema schema,
+                 std::vector<RowsetPtr> rowsets);
+    TabletReader(TabletManager* tablet_mgr, std::shared_ptr<const TabletMetadataPB> metadata, Schema schema,
+                 std::vector<RowsetPtr> rowsets, bool is_key, RowSourceMaskBuffer* mask_buffer);
     ~TabletReader() override;
 
     DISALLOW_COPY_AND_MOVE(TabletReader);
@@ -83,9 +97,9 @@ private:
                                    const std::vector<OlapTuple>& range_end_key, std::vector<SeekRange>* ranges,
                                    MemPool* mempool);
 
-    Tablet _tablet;
+    TabletManager* _tablet_mgr;
+    std::shared_ptr<const TabletMetadataPB> _tablet_metadata;
     std::shared_ptr<const TabletSchema> _tablet_schema;
-    int64_t _version;
 
     // _rowsets is specified in the constructor when compaction
     bool _rowsets_inited = false;

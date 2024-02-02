@@ -1,10 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "segment_options.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
-Status SegmentReadOptions::convert_to(SegmentReadOptions* dst, const std::vector<FieldType>& new_types,
+Status SegmentReadOptions::convert_to(SegmentReadOptions* dst, const std::vector<LogicalType>& new_types,
                                       ObjectPool* obj_pool) const {
     // ranges
     int num_ranges = ranges.size();
@@ -34,6 +46,7 @@ Status SegmentReadOptions::convert_to(SegmentReadOptions* dst, const std::vector
     dst->global_dictmaps = global_dictmaps;
     dst->rowid_range_option = rowid_range_option;
     dst->short_key_ranges = short_key_ranges;
+    dst->is_first_split_of_segment = is_first_split_of_segment;
 
     return Status::OK();
 }
@@ -63,9 +76,9 @@ std::string SegmentReadOptions::debug_string() const {
         ss << "]}";
     }
     ss << "],delete_predicates={";
-    ss << "},tablet_schema={";
+    ss << "},unsafe_tablet_schema_ref={";
     ss << "},use_page_cache=" << use_page_cache;
     return ss.str();
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

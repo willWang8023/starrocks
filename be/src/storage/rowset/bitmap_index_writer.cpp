@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/rowset/segment_v2/bitmap_index_writer.cpp
 
@@ -39,14 +52,14 @@
 
 namespace starrocks {
 
-namespace {
+using Roaring = roaring::Roaring;
 
 class BitmapUpdateContext {
     static const size_t estimate_size_threshold = 1024;
 
 public:
-    explicit BitmapUpdateContext(rowid_t rid)
-            : _roaring(Roaring::bitmapOf(1, rid)), _previous_size(0), _element_count(1), _size_changed(false){};
+    explicit BitmapUpdateContext(rowid_t rid) : _roaring(Roaring::bitmapOf(1, rid)){};
+    explicit BitmapUpdateContext(rowid_t rid0, rowid_t rid1) : _roaring(Roaring::bitmapOfList({rid0, rid1})){};
 
     Roaring* roaring() { return &_roaring; }
 
@@ -98,19 +111,69 @@ public:
 
 private:
     Roaring _roaring;
-    uint64_t _previous_size;
-    uint32_t _element_count;
-    bool _size_changed;
+    uint64_t _previous_size{0};
+    uint32_t _element_count{1};
+    bool _size_changed{false};
+};
+
+// if last bit is 0 it is std::unique_ptr<BitmapUpdateContext>
+// else it is a single value
+class BitmapUpdateContextRefOrSingleValue {
+public:
+    BitmapUpdateContextRefOrSingleValue(const BitmapUpdateContextRefOrSingleValue& rhs) = delete;
+    BitmapUpdateContextRefOrSingleValue(uint32_t value) { _value = (value << 1) | 1; }
+    ~BitmapUpdateContextRefOrSingleValue() {
+        if (is_context()) {
+            delete context();
+        }
+    }
+    bool is_context() const { return (_value & 1) == 0; }
+    uint32_t value() const { return _value >> 1; }
+    BitmapUpdateContext* context() const {
+        return reinterpret_cast<BitmapUpdateContext*>(_value); // NOLINT
+    }
+    void add(rowid_t rid) {
+        if (is_context()) {
+            context()->roaring()->add(rid);
+        } else {
+            auto* context = new BitmapUpdateContext(value(), rid);
+            _value = reinterpret_cast<uint64_t>(context); // NOLINT
+        }
+    }
+    Roaring* roaring() { return context()->roaring(); }
+
+    static uint64_t estimate_size(int element_count) { return BitmapUpdateContext::estimate_size(element_count); }
+
+    static void init_estimate_size(uint64_t* reverted_index_size) {
+        return BitmapUpdateContext::init_estimate_size(reverted_index_size);
+    }
+
+    bool update_estimate_size(uint64_t* reverted_index_size) {
+        if (context()) {
+            return context()->update_estimate_size(reverted_index_size);
+        } else {
+            return false;
+        }
+    }
+
+    void late_update_size(uint64_t* reverted_index_size) {
+        if (is_context()) {
+            context()->late_update_size(reverted_index_size);
+        }
+    }
+
+private:
+    uint64_t _value;
 };
 
 template <typename CppType>
 struct BitmapIndexTraits {
-    using MemoryIndexType = std::map<CppType, std::unique_ptr<BitmapUpdateContext>>;
+    using MemoryIndexType = std::map<CppType, BitmapUpdateContextRefOrSingleValue>;
 };
 
 template <>
 struct BitmapIndexTraits<Slice> {
-    using MemoryIndexType = std::map<Slice, std::unique_ptr<BitmapUpdateContext>, Slice::Comparator>;
+    using MemoryIndexType = std::map<Slice, BitmapUpdateContextRefOrSingleValue, Slice::Comparator>;
 };
 
 // Builder for bitmap index. Bitmap index is comprised of two parts
@@ -126,13 +189,13 @@ struct BitmapIndexTraits<Slice> {
 //   bitmap for ID 1 : [1 1 1 0 0 0 1 0 0 0]
 //   the n-th bit is set to 1 if the n-th row equals to the corresponding value.
 //
-template <FieldType field_type>
+template <LogicalType field_type>
 class BitmapIndexWriterImpl : public BitmapIndexWriter {
 public:
     using CppType = typename CppTypeTraits<field_type>::CppType;
     using MemoryIndexType = typename BitmapIndexTraits<CppType>::MemoryIndexType;
 
-    explicit BitmapIndexWriterImpl(TypeInfoPtr type_info) : _typeinfo(std::move(type_info)), _reverted_index_size(0) {}
+    explicit BitmapIndexWriterImpl(TypeInfoPtr type_info) : _typeinfo(std::move(type_info)) {}
 
     ~BitmapIndexWriterImpl() override = default;
 
@@ -142,15 +205,15 @@ public:
             const CppType& value = unaligned_load<CppType>(p);
             auto it = _mem_index.find(value);
             if (it != _mem_index.end()) {
-                it->second->roaring()->add(_rid);
-                if (it->second->update_estimate_size(&_reverted_index_size)) {
-                    _late_update_context_vector.push_back(it->second.get());
+                it->second.add(_rid);
+                if (it->second.update_estimate_size(&_reverted_index_size)) {
+                    _late_update_context_vector.push_back(&(it->second));
                 }
             } else {
                 // new value, copy value and insert new key->bitmap pair
                 CppType new_value;
                 _typeinfo->deep_copy(&new_value, &value, &_pool);
-                _mem_index.emplace(new_value, std::make_unique<BitmapUpdateContext>(_rid));
+                _mem_index.emplace(new_value, _rid);
                 BitmapUpdateContext::init_estimate_size(&_reverted_index_size);
             }
             _rid++;
@@ -185,26 +248,26 @@ public:
             RETURN_IF_ERROR(dict_column_writer.finish(meta->mutable_dict_column()));
         }
         { // write bitmaps
-            std::vector<Roaring*> bitmaps;
+            std::vector<BitmapUpdateContextRefOrSingleValue*> bitmaps;
             for (auto& it : _mem_index) {
-                bitmaps.push_back(it.second->roaring());
-            }
-            if (!_null_bitmap.isEmpty()) {
-                bitmaps.push_back(&_null_bitmap);
+                bitmaps.push_back(&(it.second));
             }
 
             uint32_t max_bitmap_size = 0;
             std::vector<uint32_t> bitmap_sizes;
             for (auto& bitmap : bitmaps) {
-                bitmap->runOptimize();
-                uint32_t bitmap_size = bitmap->getSizeInBytes(false);
-                if (max_bitmap_size < bitmap_size) {
-                    max_bitmap_size = bitmap_size;
+                uint32_t bitmap_size = 0;
+                if (bitmap->is_context()) {
+                    bitmap->context()->roaring()->runOptimize();
+                    bitmap_size = bitmap->context()->roaring()->getSizeInBytes(false);
+                    if (max_bitmap_size < bitmap_size) {
+                        max_bitmap_size = bitmap_size;
+                    }
                 }
                 bitmap_sizes.push_back(bitmap_size);
             }
 
-            TypeInfoPtr bitmap_typeinfo = get_type_info(OLAP_FIELD_TYPE_OBJECT);
+            TypeInfoPtr bitmap_typeinfo = get_type_info(TYPE_OBJECT);
 
             IndexedColumnWriterOptions options;
             options.write_ordinal_index = true;
@@ -219,8 +282,23 @@ public:
             faststring buf;
             buf.reserve(max_bitmap_size);
             for (size_t i = 0; i < bitmaps.size(); ++i) {
-                buf.resize(bitmap_sizes[i]); // so that buf[0..size) can be read and written
-                bitmaps[i]->write(reinterpret_cast<char*>(buf.data()), false);
+                if (bitmaps[i]->is_context()) {
+                    buf.resize(bitmap_sizes[i]); // so that buf[0..size) can be read and written
+                    bitmaps[i]->context()->roaring()->write(reinterpret_cast<char*>(buf.data()), false);
+                } else {
+                    Roaring roar({bitmaps[i]->value()});
+                    roar.runOptimize();
+                    auto sz = roar.getSizeInBytes(false);
+                    buf.resize(sz);
+                    roar.write(reinterpret_cast<char*>(buf.data()), false);
+                }
+                Slice buf_slice(buf);
+                RETURN_IF_ERROR(bitmap_column_writer.add(&buf_slice));
+            }
+            if (!_null_bitmap.isEmpty()) {
+                _null_bitmap.runOptimize();
+                buf.resize(_null_bitmap.getSizeInBytes(false)); // so that buf[0..size) can be read and written
+                _null_bitmap.write(reinterpret_cast<char*>(buf.data()), false);
                 Slice buf_slice(buf);
                 RETURN_IF_ERROR(bitmap_column_writer.add(&buf_slice));
             }
@@ -232,7 +310,7 @@ public:
     uint64_t size() const override {
         uint64_t size = 0;
         size += _null_bitmap.getSizeInBytes(false);
-        for (BitmapUpdateContext* update_context : _late_update_context_vector) {
+        for (BitmapUpdateContextRefOrSingleValue* update_context : _late_update_context_vector) {
             update_context->late_update_size(&_reverted_index_size);
         }
         _late_update_context_vector.clear();
@@ -254,20 +332,18 @@ private:
 
     // roaring bitmap size
     mutable uint64_t _reverted_index_size = 0;
-    mutable vector<BitmapUpdateContext*> _late_update_context_vector;
+    mutable std::vector<BitmapUpdateContextRefOrSingleValue*> _late_update_context_vector;
 };
 
-} // namespace
-
 struct BitmapIndexWriterBuilder {
-    template <FieldType ftype>
+    template <LogicalType ftype>
     std::unique_ptr<BitmapIndexWriter> operator()(const TypeInfoPtr& typeinfo) {
         return std::make_unique<BitmapIndexWriterImpl<ftype>>(typeinfo);
     }
 };
 
 Status BitmapIndexWriter::create(const TypeInfoPtr& typeinfo, std::unique_ptr<BitmapIndexWriter>* res) {
-    FieldType type = typeinfo->type();
+    LogicalType type = typeinfo->type();
     *res = field_type_dispatch_bitmap_index(type, BitmapIndexWriterBuilder(), typeinfo);
 
     return Status::OK();

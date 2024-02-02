@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -56,6 +68,15 @@ public:
     Status skip(int64_t count) override;
 
     virtual void set_size(int64_t);
+
+    // Reads all the data in this stream and returns it as std::string.
+    //
+    // Some implementations may override this method to get all
+    // the data without calling `get_size()`.
+    // For example, S3InputStream can read the contents of an entire
+    // object directly with a single GET OBJECT call, without the need
+    // to first send a HEAD OBJECT request to get the object size.
+    virtual StatusOr<std::string> read_all();
 };
 
 class SeekableInputStreamWrapper : public SeekableInputStream {
@@ -82,8 +103,6 @@ public:
 
     Status skip(int64_t count) override { return _impl->skip(count); }
 
-    bool allows_peek() const override { return _impl->allows_peek(); }
-
     StatusOr<std::string_view> peek(int64_t nbytes) override { return _impl->peek(nbytes); }
 
     StatusOr<std::unique_ptr<NumericStatistics>> get_numeric_statistics() override {
@@ -105,6 +124,8 @@ public:
     Status seek(int64_t offset) override { return _impl->seek(offset); }
 
     void set_size(int64_t value) override { return _impl->set_size(value); }
+
+    StatusOr<std::string> read_all() override { return _impl->read_all(); }
 
 private:
     SeekableInputStream* _impl;

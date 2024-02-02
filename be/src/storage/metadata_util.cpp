@@ -1,23 +1,16 @@
-// This file is made available under Elastic License 2.0.
-// This file is based on code available under the Apache license here:
-//   https://github.com/apache/incubator-doris/blob/master/be/src/olap/tablet_meta.cpp
-
-// Licensed to the Apache Software Foundation (ASF) under one
-// or more contributor license agreements.  See the NOTICE file
-// distributed with this work for additional information
-// regarding copyright ownership.  The ASF licenses this file
-// to you under the Apache License, Version 2.0 (the
-// "License"); you may not use this file except in compliance
-// with the License.  You may obtain a copy of the License at
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
 //
-//   http://www.apache.org/licenses/LICENSE-2.0
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
 //
-// Unless required by applicable law or agreed to in writing,
-// software distributed under the License is distributed on an
-// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
-// KIND, either express or implied.  See the License for the
-// specific language governing permissions and limitations
-// under the License.
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/metadata_util.h"
 
@@ -26,18 +19,17 @@
 #include "common/config.h"
 #include "gen_cpp/AgentService_types.h"
 #include "gutil/strings/substitute.h"
+#include "storage/aggregate_type.h"
 #include "storage/olap_common.h"
 #include "storage/tablet_schema.h"
+#include "util/json_util.h"
+#include "utils.h"
 
 namespace starrocks {
 
-enum class FieldTypeVersion {
-    kV1,
-    kV2,
-};
-
 // Old version StarRocks use `TColumnType` to save type info, convert it into `TTypeDesc`.
-static void convert_to_new_version(TColumn* tcolumn) {
+// NOTE: This is only used for some legacy UT
+void convert_to_new_version(TColumn* tcolumn) {
     if (!tcolumn->__isset.type_desc) {
         tcolumn->__set_index_len(tcolumn->column_type.index_len);
 
@@ -53,150 +45,150 @@ static void convert_to_new_version(TColumn* tcolumn) {
         tcolumn->__isset.type_desc = true;
     }
 }
-
-static FieldAggregationMethod t_aggregation_type_to_field_aggregation_method(TAggregationType::type agg_type) {
+static StorageAggregateType t_aggregation_type_to_field_aggregation_method(TAggregationType::type agg_type) {
     switch (agg_type) {
     case TAggregationType::NONE:
-        return OLAP_FIELD_AGGREGATION_NONE;
+        return STORAGE_AGGREGATE_NONE;
     case TAggregationType::MAX:
-        return OLAP_FIELD_AGGREGATION_MAX;
+        return STORAGE_AGGREGATE_MAX;
     case TAggregationType::MIN:
-        return OLAP_FIELD_AGGREGATION_MIN;
+        return STORAGE_AGGREGATE_MIN;
     case TAggregationType::REPLACE:
-        return OLAP_FIELD_AGGREGATION_REPLACE;
+        return STORAGE_AGGREGATE_REPLACE;
     case TAggregationType::REPLACE_IF_NOT_NULL:
-        return OLAP_FIELD_AGGREGATION_REPLACE_IF_NOT_NULL;
+        return STORAGE_AGGREGATE_REPLACE_IF_NOT_NULL;
     case TAggregationType::BITMAP_UNION:
-        return OLAP_FIELD_AGGREGATION_BITMAP_UNION;
+        return STORAGE_AGGREGATE_BITMAP_UNION;
     case TAggregationType::HLL_UNION:
-        return OLAP_FIELD_AGGREGATION_HLL_UNION;
+        return STORAGE_AGGREGATE_HLL_UNION;
     case TAggregationType::SUM:
-        return OLAP_FIELD_AGGREGATION_SUM;
+        return STORAGE_AGGREGATE_SUM;
     case TAggregationType::PERCENTILE_UNION:
-        return OLAP_FIELD_AGGREGATION_PERCENTILE_UNION;
+        return STORAGE_AGGREGATE_PERCENTILE_UNION;
     }
-    return OLAP_FIELD_AGGREGATION_NONE;
+    return STORAGE_AGGREGATE_NONE;
 }
 
-static FieldType t_primitive_type_to_field_type(TPrimitiveType::type primitive_type, FieldTypeVersion v) {
-    switch (primitive_type) {
-    case TPrimitiveType::INVALID_TYPE:
-    case TPrimitiveType::NULL_TYPE:
-    case TPrimitiveType::BINARY:
-    case TPrimitiveType::TIME:
-        return OLAP_FIELD_TYPE_UNKNOWN;
-    case TPrimitiveType::BOOLEAN:
-        return OLAP_FIELD_TYPE_BOOL;
-    case TPrimitiveType::TINYINT:
-        return OLAP_FIELD_TYPE_TINYINT;
-    case TPrimitiveType::SMALLINT:
-        return OLAP_FIELD_TYPE_SMALLINT;
-    case TPrimitiveType::INT:
-        return OLAP_FIELD_TYPE_INT;
-    case TPrimitiveType::BIGINT:
-        return OLAP_FIELD_TYPE_BIGINT;
-    case TPrimitiveType::FLOAT:
-        return OLAP_FIELD_TYPE_FLOAT;
-    case TPrimitiveType::DOUBLE:
-        return OLAP_FIELD_TYPE_DOUBLE;
-    case TPrimitiveType::DATE:
-        return v == FieldTypeVersion::kV1 ? OLAP_FIELD_TYPE_DATE : OLAP_FIELD_TYPE_DATE_V2;
-    case TPrimitiveType::DATETIME:
-        return v == FieldTypeVersion::kV1 ? OLAP_FIELD_TYPE_DATETIME : OLAP_FIELD_TYPE_TIMESTAMP;
-    case TPrimitiveType::CHAR:
-        return OLAP_FIELD_TYPE_CHAR;
-    case TPrimitiveType::LARGEINT:
-        return OLAP_FIELD_TYPE_LARGEINT;
-    case TPrimitiveType::VARCHAR:
-        return OLAP_FIELD_TYPE_VARCHAR;
-    case TPrimitiveType::HLL:
-        return OLAP_FIELD_TYPE_HLL;
-    case TPrimitiveType::DECIMAL:
-    case TPrimitiveType::DECIMALV2:
-        return v == FieldTypeVersion::kV1 ? OLAP_FIELD_TYPE_DECIMAL : OLAP_FIELD_TYPE_DECIMAL_V2;
-    case TPrimitiveType::DECIMAL32:
-        return OLAP_FIELD_TYPE_DECIMAL32;
-    case TPrimitiveType::DECIMAL64:
-        return OLAP_FIELD_TYPE_DECIMAL64;
-    case TPrimitiveType::DECIMAL128:
-        return OLAP_FIELD_TYPE_DECIMAL128;
-    case TPrimitiveType::OBJECT:
-        return OLAP_FIELD_TYPE_OBJECT;
-    case TPrimitiveType::PERCENTILE:
-        return OLAP_FIELD_TYPE_PERCENTILE;
-    case TPrimitiveType::JSON:
-        return OLAP_FIELD_TYPE_JSON;
-    case TPrimitiveType::FUNCTION:
-        return OLAP_FIELD_TYPE_UNKNOWN;
-    }
-    return OLAP_FIELD_TYPE_UNKNOWN;
-}
-
-static Status t_column_to_pb_column(int32_t unique_id, const TColumn& t_column, FieldTypeVersion v, ColumnPB* column_pb,
-                                    size_t depth = 0) {
+// This function is used to initialize ColumnPB for subfield like element of Array.
+static void init_column_pb_for_sub_field(ColumnPB* field) {
     const int32_t kFakeUniqueId = -1;
 
-    const std::vector<TTypeNode>& types = t_column.type_desc.types;
-    if (depth == types.size()) {
-        return Status::InvalidArgument("type nodes must ended with scalar type");
-    }
+    field->set_unique_id(kFakeUniqueId);
+    field->set_is_key(false);
+    field->set_is_nullable(true);
+    field->set_aggregation(get_string_by_aggregation_type(STORAGE_AGGREGATE_NONE));
+}
 
-    // No names provided for child columns, assign them a fake name.
-    auto c_name = depth == 0 ? t_column.column_name : strings::Substitute("_$0_$1", t_column.column_name, depth);
-
-    // A child column cannot be a key column.
-    auto is_key = depth == 0 && t_column.is_key;
-    bool is_nullable = depth > 0 || t_column.is_allow_null;
-
-    column_pb->set_unique_id(unique_id);
-    column_pb->set_name(c_name);
-    column_pb->set_is_key(is_key);
-    column_pb->set_is_nullable(is_nullable);
-    if (depth > 0 || is_key) {
-        auto agg_method = OLAP_FIELD_AGGREGATION_NONE;
-        column_pb->set_aggregation(TabletColumn::get_string_by_aggregation_type(agg_method));
-    } else {
-        auto agg_method = t_aggregation_type_to_field_aggregation_method(t_column.aggregation_type);
-        column_pb->set_aggregation(TabletColumn::get_string_by_aggregation_type(agg_method));
-    }
-
-    const TTypeNode& curr_type_node = types[depth];
+// Because thrift doesn't support nested definition. So we use list to flatten the nested.
+// In thrift, types and index will be used together to present one type.
+// After this function returned, index will point to the next position to be parsed.
+static Status type_desc_to_pb(const std::vector<TTypeNode>& types, int* index, ColumnPB* column_pb) {
+    const TTypeNode& curr_type_node = types[*index];
+    ++(*index);
     switch (curr_type_node.type) {
     case TTypeNodeType::SCALAR: {
-        if (depth + 1 != types.size()) {
-            return Status::InvalidArgument("scalar type cannot have child node");
-        }
-        TScalarType scalar = curr_type_node.scalar_type;
+        auto& scalar = curr_type_node.scalar_type;
 
-        FieldType field_type = t_primitive_type_to_field_type(scalar.type, v);
-        column_pb->set_type(TabletColumn::get_string_by_field_type(field_type));
+        LogicalType field_type = thrift_to_type(scalar.type);
+        column_pb->set_type(logical_type_to_string(field_type));
         column_pb->set_length(TabletColumn::get_field_length_by_type(field_type, scalar.len));
         column_pb->set_index_length(column_pb->length());
         column_pb->set_frac(curr_type_node.scalar_type.scale);
         column_pb->set_precision(curr_type_node.scalar_type.precision);
-        if (field_type == OLAP_FIELD_TYPE_VARCHAR) {
-            int32_t index_len = depth == 0 && t_column.__isset.index_len ? t_column.index_len : 10;
-            column_pb->set_index_length(index_len);
-        }
-        if (depth == 0 && t_column.__isset.default_value) {
-            column_pb->set_default_value(t_column.default_value);
-        }
-        if (depth == 0 && t_column.__isset.is_bloom_filter_column) {
-            column_pb->set_is_bf_column(t_column.is_bloom_filter_column);
+        return Status::OK();
+    }
+    case TTypeNodeType::ARRAY: {
+        column_pb->set_type(logical_type_to_string(TYPE_ARRAY));
+
+        // FIXME: I'm not sure if these fields are necessary, just keep it to be safe
+        column_pb->set_length(TabletColumn::get_field_length_by_type(TYPE_ARRAY, sizeof(Collection)));
+        column_pb->set_index_length(column_pb->length());
+
+        // Currently, All array element is nullable
+        auto field_pb = column_pb->add_children_columns();
+        init_column_pb_for_sub_field(field_pb);
+        RETURN_IF_ERROR(type_desc_to_pb(types, index, field_pb));
+        field_pb->set_name("element");
+        return Status::OK();
+    }
+    case TTypeNodeType::STRUCT: {
+        column_pb->set_type(logical_type_to_string(TYPE_STRUCT));
+
+        // FIXME: I'm not sure if these fields are necessary, just keep it to be safe
+        column_pb->set_length(TabletColumn::get_field_length_by_type(TYPE_STRUCT, sizeof(Collection)));
+        column_pb->set_index_length(column_pb->length());
+
+        auto& fields = curr_type_node.struct_fields;
+        for (const auto& field : fields) {
+            auto field_pb = column_pb->add_children_columns();
+            init_column_pb_for_sub_field(field_pb);
+            // All struct fields all nullable now
+            RETURN_IF_ERROR(type_desc_to_pb(types, index, field_pb));
+            field_pb->set_name(field.name);
         }
         return Status::OK();
     }
-    case TTypeNodeType::ARRAY:
-        column_pb->set_type(TabletColumn::get_string_by_field_type(OLAP_FIELD_TYPE_ARRAY));
-        column_pb->set_length(TabletColumn::get_field_length_by_type(OLAP_FIELD_TYPE_ARRAY, sizeof(Collection)));
+    case TTypeNodeType::MAP: {
+        column_pb->set_type(logical_type_to_string(TYPE_MAP));
+
+        // FIXME: I'm not sure if these fields are necessary, just keep it to be safe
+        column_pb->set_length(TabletColumn::get_field_length_by_type(TYPE_MAP, sizeof(Collection)));
         column_pb->set_index_length(column_pb->length());
-        return t_column_to_pb_column(kFakeUniqueId, t_column, v, column_pb->add_children_columns(), depth + 1);
-    case TTypeNodeType::STRUCT:
-        return Status::NotSupported("struct not supported yet");
-    case TTypeNodeType::MAP:
-        return Status::NotSupported("map not supported yet");
+
+        {
+            auto key_pb = column_pb->add_children_columns();
+            init_column_pb_for_sub_field(key_pb);
+            RETURN_IF_ERROR(type_desc_to_pb(types, index, key_pb));
+            key_pb->set_name("key");
+        }
+        {
+            auto value_pb = column_pb->add_children_columns();
+            init_column_pb_for_sub_field(value_pb);
+            RETURN_IF_ERROR(type_desc_to_pb(types, index, value_pb));
+            value_pb->set_name("value");
+        }
+        return Status::OK();
+    }
     }
     return Status::InternalError("Unreachable path");
+}
+
+Status t_column_to_pb_column(int32_t unique_id, const TColumn& t_column, ColumnPB* column_pb) {
+    DCHECK(t_column.__isset.type_desc);
+    const std::vector<TTypeNode>& types = t_column.type_desc.types;
+    int index = 0;
+    RETURN_IF_ERROR(type_desc_to_pb(types, &index, column_pb));
+    if (index != types.size()) {
+        LOG(WARNING) << "Schema not match, size:" << types.size() << ", index=" << index;
+        return Status::InternalError("Failed to parse type, number of schema elements not match");
+    }
+    column_pb->set_unique_id(unique_id);
+    column_pb->set_name(t_column.column_name);
+    column_pb->set_is_key(t_column.is_key);
+    column_pb->set_is_nullable(t_column.is_allow_null);
+    column_pb->set_has_bitmap_index(t_column.has_bitmap_index);
+    column_pb->set_is_auto_increment(t_column.is_auto_increment);
+    if (t_column.is_key) {
+        auto agg_method = STORAGE_AGGREGATE_NONE;
+        column_pb->set_aggregation(get_string_by_aggregation_type(agg_method));
+    } else {
+        auto agg_method = t_aggregation_type_to_field_aggregation_method(t_column.aggregation_type);
+        column_pb->set_aggregation(get_string_by_aggregation_type(agg_method));
+    }
+
+    if (types[0].type == TTypeNodeType::SCALAR && types[0].scalar_type.type == TPrimitiveType::VARCHAR) {
+        int32_t index_len = t_column.__isset.index_len ? t_column.index_len : 10;
+        column_pb->set_index_length(index_len);
+    }
+    // Default value
+    if (t_column.__isset.default_value) {
+        column_pb->set_default_value(t_column.default_value);
+    }
+    if (t_column.__isset.is_bloom_filter_column) {
+        column_pb->set_is_bf_column(t_column.is_bloom_filter_column);
+    }
+
+    return Status::OK();
 }
 
 Status convert_t_schema_to_pb_schema(const TTabletSchema& tablet_schema, uint32_t next_unique_id,
@@ -204,6 +196,9 @@ Status convert_t_schema_to_pb_schema(const TTabletSchema& tablet_schema, uint32_
                                      TabletSchemaPB* schema, TCompressionType::type compression_type) {
     if (tablet_schema.__isset.id) {
         schema->set_id(tablet_schema.id);
+    }
+    if (tablet_schema.__isset.schema_version) {
+        schema->set_schema_version(tablet_schema.schema_version);
     }
     schema->set_num_short_key_columns(tablet_schema.short_key_column_count);
     schema->set_num_rows_per_row_block(config::default_num_rows_per_column_file_block);
@@ -223,7 +218,6 @@ Status convert_t_schema_to_pb_schema(const TTabletSchema& tablet_schema, uint32_
     default:
         CHECK(false) << "unsupported keys type " << tablet_schema.keys_type;
     }
-    schema->set_compress_kind(COMPRESS_LZ4);
 
     switch (compression_type) {
     case TCompressionType::LZ4_FRAME:
@@ -236,44 +230,100 @@ Status convert_t_schema_to_pb_schema(const TTabletSchema& tablet_schema, uint32_
     case TCompressionType::ZSTD:
         schema->set_compression_type(ZSTD);
         break;
+    case TCompressionType::SNAPPY:
+        schema->set_compression_type(SNAPPY);
+        break;
     default:
         LOG(WARNING) << "Unexpected compression type" << compression_type;
         return Status::InternalError("Unexpected compression type");
     }
 
-    FieldTypeVersion field_version = FieldTypeVersion::kV1;
-    if (config::storage_format_version == 2) {
-        field_version = FieldTypeVersion::kV2;
-    }
-
     // set column information
     uint32_t col_ordinal = 0;
-    uint32_t key_count = 0;
     bool has_bf_columns = false;
+    std::unordered_map<std::string, ColumnPB*> column_map;
+
+    uint32_t max_col_unique_id = 0;
     for (TColumn tcolumn : tablet_schema.columns) {
         convert_to_new_version(&tcolumn);
-        uint32_t col_unique_id = col_ordinal_to_unique_id.at(col_ordinal++);
+        uint32_t col_unique_id;
+        if (tcolumn.col_unique_id >= 0) {
+            col_unique_id = tcolumn.col_unique_id;
+        } else {
+            col_unique_id = col_ordinal_to_unique_id.at(col_ordinal);
+        }
+        max_col_unique_id = col_unique_id > max_col_unique_id ? col_unique_id : max_col_unique_id;
+        col_ordinal++;
         ColumnPB* column = schema->add_column();
 
-        RETURN_IF_ERROR(t_column_to_pb_column(col_unique_id, tcolumn, field_version, column));
+        RETURN_IF_ERROR(t_column_to_pb_column(col_unique_id, tcolumn, column));
 
-        key_count += column->is_key();
         has_bf_columns |= column->is_bf_column();
 
-        if (tablet_schema.__isset.indexes) {
-            for (auto& index : tablet_schema.indexes) {
-                if (index.index_type == TIndexType::type::BITMAP) {
-                    DCHECK_EQ(index.columns.size(), 1);
-                    if (boost::iequals(tcolumn.column_name, index.columns[0])) {
-                        column->set_has_bitmap_index(true);
-                        break;
-                    }
+        column_map.emplace(boost::to_lower_copy(column->name()), column);
+    }
+
+    if (tablet_schema.__isset.indexes) {
+        for (auto& index : tablet_schema.indexes) {
+            TabletIndexPB* index_pb = schema->add_table_indices();
+            index_pb->set_index_id(index.index_id);
+            index_pb->set_index_name(index.index_name);
+            if (index.index_type == TIndexType::type::BITMAP) {
+                RETURN_IF(index.columns.size() != 1,
+                          Status::Cancelled("BITMAP index " + index.index_name +
+                                            " do not support to build with more than one column"));
+
+                index_pb->set_index_type(IndexType::BITMAP);
+                const auto& mit = column_map.find(boost::to_lower_copy(index.columns[0]));
+
+                // TODO: Fix abnormal scenes when index column can not be found
+                if (mit != column_map.end()) {
+                    mit->second->set_has_bitmap_index(true);
+                } else {
+                    LOG(WARNING) << "index column (" << index.columns[0] << ") can not be found in table columns";
                 }
+            } else if (index.index_type == TIndexType::type::GIN) {
+                RETURN_IF(index.columns.size() != 1,
+                          Status::Cancelled("GIN index " + index.index_name +
+                                            " do not support to build with more than one column"));
+                index_pb->set_index_type(IndexType::GIN);
+
+                const auto& index_col_name = index.columns[0];
+                const auto& mit = column_map.find(index_col_name);
+
+                // TODO: Fix abnormal scenes when index column can not be found
+                if (mit != column_map.end()) {
+                    index_pb->add_col_unique_id(mit->second->unique_id());
+                } else {
+                    LOG(WARNING) << "index " << index_col_name << " can not be found in table columns";
+                }
+
+                std::map<std::string, std::map<std::string, std::string>> properties_map;
+                properties_map.emplace(COMMON_PROPERTIES, index.common_properties);
+                properties_map.emplace(INDEX_PROPERTIES, index.index_properties);
+                properties_map.emplace(SEARCH_PROPERTIES, index.search_properties);
+                properties_map.emplace(EXTRA_PROPERTIES, index.extra_properties);
+                index_pb->set_index_properties(to_json(properties_map));
+            } else {
+                std::string index_type;
+                EnumToString(TIndexType, index.index_type, index_type);
+                return Status::Cancelled(strings::Substitute("Not supported index type $0", index_type));
             }
         }
     }
+    for (const auto idx : tablet_schema.sort_key_idxes) {
+        schema->add_sort_key_idxes(idx);
+    }
+    for (const auto uid : tablet_schema.sort_key_unique_ids) {
+        schema->add_sort_key_unique_ids(uid);
+    }
 
-    schema->set_next_column_unique_id(next_unique_id);
+    if (max_col_unique_id + 1 > next_unique_id) {
+        schema->set_next_column_unique_id(max_col_unique_id + 1);
+    } else {
+        schema->set_next_column_unique_id(next_unique_id);
+    }
+
     if (has_bf_columns && tablet_schema.__isset.bloom_filter_fpp) {
         schema->set_bf_fpp(tablet_schema.bloom_filter_fpp);
     }

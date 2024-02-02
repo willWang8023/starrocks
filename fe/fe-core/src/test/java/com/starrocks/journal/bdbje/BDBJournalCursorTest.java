@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.journal.bdbje;
 
@@ -49,6 +62,7 @@ public class BDBJournalCursorTest {
         short op = OperationType.OP_SAVE_NEXTID;
         Text text = new Text(Long.toString(123));
         fakeJournalEntity.setData(text);
+        fakeJournalEntity.setOpCode(op);
         DataOutputBuffer buffer = new DataOutputBuffer();
         buffer.writeShort(op);
         text.write(buffer);
@@ -98,7 +112,7 @@ public class BDBJournalCursorTest {
         journal.open();
 
         //
-        // >>> write 1->6
+        // write 1->6
         //
         // db1: 1
         journal.batchWriteBegin();
@@ -126,7 +140,7 @@ public class BDBJournalCursorTest {
         journal.batchWriteCommit();
 
         for (int i = 1; i <= 5; ++ i) {
-            // <<< read from i to 6
+            // read from i to 6
             LOG.info("pretend I'm reading from {} to 6", i);
             BDBJournalCursor bdbJournalCursor = BDBJournalCursor.getJournalCursor(environment, i, -1);
             for (int j = i; j <= 6; ++ j) {
@@ -138,7 +152,7 @@ public class BDBJournalCursorTest {
         }
 
         //
-        // <<< read 6->6
+        // read 6->6
         //
         BDBJournalCursor bdbJournalCursor = BDBJournalCursor.getJournalCursor(environment, 6, -1);
         JournalEntity entity = bdbJournalCursor.next();
@@ -148,14 +162,14 @@ public class BDBJournalCursorTest {
         Assert.assertNull(bdbJournalCursor.next());
 
         //
-        // >>> write 7
+        // write 7
         //
         journal.batchWriteBegin();
         journal.batchWriteAppend(7, makeBuffer(7));
         journal.batchWriteCommit();
 
         //
-        // <<< read 7
+        // read 7
         //
         bdbJournalCursor.refresh();
         entity = bdbJournalCursor.next();
@@ -165,7 +179,7 @@ public class BDBJournalCursorTest {
         Assert.assertNull(bdbJournalCursor.next());
 
         //
-        // >>> write 8-9
+        // write 8-9
         //
         // db8: 8-9
         journal.rollJournal(8);
@@ -189,7 +203,7 @@ public class BDBJournalCursorTest {
         Assert.assertTrue(expected);
 
         //
-        // <<< read 8
+        // read 8
         //
         bdbJournalCursor.refresh();
 
@@ -198,7 +212,7 @@ public class BDBJournalCursorTest {
         Assert.assertEquals("8", entity.getData().toString());
 
         //
-        // >>> write 10
+        // write 10
         //
         // db10: 10
         journal.rollJournal(10);
@@ -211,7 +225,7 @@ public class BDBJournalCursorTest {
         journal.deleteJournals(8);
 
         //
-        // <<< read 9-10
+        // read 9-10
         //
         bdbJournalCursor.refresh();
 
@@ -398,7 +412,7 @@ public class BDBJournalCursorTest {
                     public OperationStatus fakeGet(
                             final Transaction txn, final DatabaseEntry key, final DatabaseEntry data,
                             LockMode lockMode) {
-                        data.setData(new String("lalala").getBytes());
+                        data.setData("lalala".getBytes());
                         return OperationStatus.SUCCESS;
                     }
                 };
@@ -495,5 +509,22 @@ public class BDBJournalCursorTest {
         BDBJEJournal journal = new BDBJEJournal(environment);
         JournalCursor cursor = journal.read(10, 10);
         cursor.refresh();
+    }
+
+    @Test
+    public void testDeserializeDataException() throws Exception {
+        DataOutputBuffer buffer = new DataOutputBuffer(128);
+        buffer.writeShort(OperationType.OP_HEARTBEAT_V2);
+        // set an invalid json string, it will throw exception in deserializeData()
+        Text.writeString(buffer, "aaa");
+        DatabaseEntry entry = new DatabaseEntry();
+        entry.setData(buffer.getData(), 0, buffer.getLength());
+
+        try {
+            BDBJournalCursor cursor = new BDBJournalCursor(null, null, 0, 0);
+            JournalEntity entity = cursor.deserializeData(entry);
+        } catch (JournalException e) {
+            Assert.assertEquals(OperationType.OP_HEARTBEAT_V2, e.getOpCode());
+        }
     }
 }

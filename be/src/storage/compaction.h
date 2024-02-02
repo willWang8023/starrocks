@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -16,7 +28,7 @@
 #include "util/runtime_profile.h"
 #include "util/semaphore.hpp"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 class DataDir;
 
@@ -79,8 +91,10 @@ private:
     // merge rows from vectorized reader and write into `_output_rs_writer`.
     // return Status::OK() and set statistics into `*stats_output`.
     // return others on error
-    Status _merge_rowsets_horizontally(size_t segment_iterator_num, Statistics* stats_output);
-    Status _merge_rowsets_vertically(size_t segment_iterator_num, Statistics* stats_output);
+    Status _merge_rowsets_horizontally(size_t segment_iterator_num, Statistics* stats_output,
+                                       const TabletSchemaCSPtr& tablet_schema);
+    Status _merge_rowsets_vertically(size_t segment_iterator_num, Statistics* stats_output,
+                                     const TabletSchemaCSPtr& tablet_schema);
 };
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

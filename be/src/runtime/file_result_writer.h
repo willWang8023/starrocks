@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/file_result_writer.h
 
@@ -21,8 +34,10 @@
 
 #pragma once
 
+#include "exec/parquet_builder.h"
 #include "fs/fs.h"
 #include "gen_cpp/DataSinks_types.h"
+#include "parquet/file_writer.h"
 #include "runtime/result_writer.h"
 #include "runtime/runtime_state.h"
 
@@ -35,7 +50,6 @@ class RuntimeProfile;
 class WritableFile;
 
 struct ResultFileOptions {
-    bool is_local_file;
     std::string file_path;
     TFileFormatType::type file_format;
     std::string column_separator;
@@ -46,6 +60,8 @@ struct ResultFileOptions {
     int write_buffer_size_kb;
     THdfsProperties hdfs_properties;
     bool use_broker;
+    std::vector<std::string> file_column_names;
+    parquet::ParquetBuilderOptions parquet_options;
 
     ResultFileOptions(const TResultFileSinkOptions& t_opt) {
         file_path = t_opt.file_path;
@@ -54,17 +70,14 @@ struct ResultFileOptions {
         row_delimiter = t_opt.__isset.row_delimiter ? t_opt.row_delimiter : "\n";
         max_file_size_bytes = t_opt.__isset.max_file_size_bytes ? t_opt.max_file_size_bytes : max_file_size_bytes;
 
-        is_local_file = true;
         if (t_opt.__isset.broker_addresses) {
             broker_addresses = t_opt.broker_addresses;
-            is_local_file = false;
         }
         if (t_opt.__isset.hdfs_write_buffer_size_kb) {
             write_buffer_size_kb = t_opt.hdfs_write_buffer_size_kb;
         }
         if (t_opt.__isset.hdfs_properties) {
             hdfs_properties = t_opt.hdfs_properties;
-            is_local_file = false;
         }
         if (t_opt.__isset.use_broker) {
             use_broker = t_opt.use_broker;
@@ -72,7 +85,20 @@ struct ResultFileOptions {
         if (t_opt.__isset.broker_properties) {
             broker_properties = t_opt.broker_properties;
         }
+        if (t_opt.__isset.file_column_names) {
+            file_column_names = t_opt.file_column_names;
+        }
+        if (t_opt.__isset.parquet_options && t_opt.parquet_options.__isset.parquet_max_group_bytes) {
+            parquet_options.row_group_max_size = t_opt.parquet_options.parquet_max_group_bytes;
+        }
+        if (t_opt.__isset.parquet_options && t_opt.parquet_options.__isset.use_dict) {
+            parquet_options.use_dict = t_opt.parquet_options.use_dict;
+        }
+        if (t_opt.__isset.parquet_options && t_opt.parquet_options.__isset.compression_type) {
+            parquet_options.compression_type = t_opt.parquet_options.compression_type;
+        }
     }
+
     ~ResultFileOptions() = default;
 };
 
@@ -84,12 +110,14 @@ public:
     ~FileResultWriter() override;
 
     Status init(RuntimeState* state) override;
-    Status append_chunk(vectorized::Chunk* chunk) override;
+    Status append_chunk(Chunk* chunk) override;
     Status close() override;
     Status open(RuntimeState* state) override;
 
 private:
     void _init_profile();
+
+    Status _create_fs();
 
     Status _create_file_writer();
     // get next export file name

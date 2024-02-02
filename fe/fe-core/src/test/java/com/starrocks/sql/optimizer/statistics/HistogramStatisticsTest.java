@@ -1,7 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.optimizer.statistics;
 
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.catalog.Type;
 import com.starrocks.sql.optimizer.operator.scalar.BinaryPredicateOperator;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
@@ -53,8 +67,8 @@ public class HistogramStatisticsTest {
         check(columnRefOperator, "GT", 48, statistics, 400);
         check(columnRefOperator, "GT", 49, statistics, 391);
         check(columnRefOperator, "GT", 99, statistics, 100);
-        check(columnRefOperator, "GT", 100, statistics, 0);
-        check(columnRefOperator, "GT", 105, statistics, 0);
+        check(columnRefOperator, "GT", 100, statistics, 1);
+        check(columnRefOperator, "GT", 105, statistics, 1);
 
         check(columnRefOperator, "GE", 0, statistics, 1000);
         check(columnRefOperator, "GE", 1, statistics, 1000);
@@ -68,10 +82,10 @@ public class HistogramStatisticsTest {
         check(columnRefOperator, "GE", 49, statistics, 391);
         check(columnRefOperator, "GE", 99, statistics, 120);
         check(columnRefOperator, "GE", 100, statistics, 100);
-        check(columnRefOperator, "GE", 105, statistics, 0);
+        check(columnRefOperator, "GE", 105, statistics, 1);
 
-        check(columnRefOperator, "LT", 0, statistics, 0);
-        check(columnRefOperator, "LT", 1, statistics, 0);
+        check(columnRefOperator, "LT", 0, statistics, 1);
+        check(columnRefOperator, "LT", 1, statistics, 1);
         check(columnRefOperator, "LT", 10, statistics, 80);
         check(columnRefOperator, "LT", 12, statistics, 100);
         check(columnRefOperator, "LT", 15, statistics, 100);
@@ -85,8 +99,8 @@ public class HistogramStatisticsTest {
         check(columnRefOperator, "LT", 100, statistics, 900);
         check(columnRefOperator, "LT", 105, statistics, 1000);
 
-        check(columnRefOperator, "LE", 0, statistics, 0);
-        check(columnRefOperator, "LE", 1, statistics, 0);
+        check(columnRefOperator, "LE", 0, statistics, 1);
+        check(columnRefOperator, "LE", 1, statistics, 1);
         check(columnRefOperator, "LE", 10, statistics, 100);
         check(columnRefOperator, "LE", 12, statistics, 100);
         check(columnRefOperator, "LE", 15, statistics, 100);
@@ -105,7 +119,7 @@ public class HistogramStatisticsTest {
         between(columnRefOperator, "GT", 1, "LT", 43, statistics, 348);
         between(columnRefOperator, "GT", 16, "LT", 47, statistics, 380);
         between(columnRefOperator, "GT", 16, "LT", 53, statistics, 513);
-        between(columnRefOperator, "GT", 46, "LT", 47, statistics, 0);
+        between(columnRefOperator, "GT", 46, "LT", 47, statistics, 1);
         between(columnRefOperator, "GT", 60, "LT", 99, statistics, 180);
         between(columnRefOperator, "GT", 1, "LT", 100, statistics, 900);
 
@@ -123,7 +137,7 @@ public class HistogramStatisticsTest {
 
     void check(ColumnRefOperator columnRefOperator, String type, int constant, Statistics statistics, int rowCount) {
         BinaryPredicateOperator binaryPredicateOperator
-                = new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.valueOf(type),
+                = new BinaryPredicateOperator(BinaryType.valueOf(type),
                 columnRefOperator, ConstantOperator.createBigint(constant));
         Statistics estimated = PredicateStatisticsCalculator.statisticsCalculate(binaryPredicateOperator, statistics);
         Assert.assertEquals(rowCount, estimated.getOutputRowCount(), 0.1);
@@ -132,12 +146,12 @@ public class HistogramStatisticsTest {
     void between(ColumnRefOperator columnRefOperator, String greaterType, int min, String lessType,
                  int max, Statistics statistics, int rowCount) {
         BinaryPredicateOperator binaryPredicateOperator = new BinaryPredicateOperator(
-                BinaryPredicateOperator.BinaryType.valueOf(greaterType),
+                BinaryType.valueOf(greaterType),
                 columnRefOperator,
                 ConstantOperator.createBigint(min));
         Statistics estimated = PredicateStatisticsCalculator.statisticsCalculate(binaryPredicateOperator, statistics);
 
-        binaryPredicateOperator = new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.valueOf(lessType),
+        binaryPredicateOperator = new BinaryPredicateOperator(BinaryType.valueOf(lessType),
                 columnRefOperator,
                 ConstantOperator.createBigint(max));
         estimated = PredicateStatisticsCalculator.statisticsCalculate(binaryPredicateOperator, estimated);

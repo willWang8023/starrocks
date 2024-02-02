@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/persist/ReplicaPersistInfo.java
 
@@ -21,9 +34,9 @@
 
 package com.starrocks.persist;
 
-import com.starrocks.common.FeMetaVersion;
+import com.google.common.base.Objects;
+import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.io.Writable;
-import com.starrocks.server.GlobalStateMgr;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -86,23 +99,37 @@ public class ReplicaPersistInfo implements Writable {
     }
 
     // required
+    @SerializedName("ot")
     private ReplicaOperationType opType;
+    @SerializedName("db")
     private long dbId;
+    @SerializedName("tb")
     private long tableId;
+    @SerializedName("pt")
     private long partitionId;
+    @SerializedName("idx")
     private long indexId;
+    @SerializedName("tbt")
     private long tabletId;
 
+    @SerializedName("rp")
     private long replicaId;
+    @SerializedName("bc")
     private long backendId;
 
+    @SerializedName("vs")
     private long version;
     private long minReadableVersion = 0;
+    @SerializedName("sh")
     private int schemaHash = -1;
+    @SerializedName("ds")
     private long dataSize;
+    @SerializedName("rc")
     private long rowCount;
 
+    @SerializedName("lfv")
     private long lastFailedVersion = -1L;
+    @SerializedName("lsv")
     private long lastSuccessVersion = -1L;
 
     public static ReplicaPersistInfo createForAdd(long dbId, long tableId, long partitionId, long indexId,
@@ -290,6 +317,10 @@ public class ReplicaPersistInfo implements Writable {
         return lastSuccessVersion;
     }
 
+    public long getMinReadableVersion() {
+        return minReadableVersion;
+    }
+
     public static ReplicaPersistInfo read(DataInput in) throws IOException {
         ReplicaPersistInfo replicaInfo = new ReplicaPersistInfo();
         replicaInfo.readFields(in);
@@ -332,21 +363,21 @@ public class ReplicaPersistInfo implements Writable {
         in.readLong(); // read a version_hash for compatibility
         dataSize = in.readLong();
         rowCount = in.readLong();
-        opType = ReplicaOperationType.DEFAULT_OP;
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_45) {
-            opType = ReplicaOperationType.findByValue(in.readInt());
-            if (opType == null) {
-                throw new IOException("could not parse operation type from replica info");
-            }
-            lastFailedVersion = in.readLong();
-            minReadableVersion = in.readLong(); // originally used as version_hash, now reused as minReadableVersion
-            lastSuccessVersion = in.readLong();
-            in.readLong(); // read a version_hash for compatibility
+        opType = ReplicaOperationType.findByValue(in.readInt());
+        if (opType == null) {
+            throw new IOException("could not parse operation type from replica info");
         }
+        lastFailedVersion = in.readLong();
+        minReadableVersion = in.readLong(); // originally used as version_hash, now reused as minReadableVersion
+        lastSuccessVersion = in.readLong();
+        in.readLong(); // read a version_hash for compatibility
 
-        if (GlobalStateMgr.getCurrentStateJournalVersion() >= FeMetaVersion.VERSION_48) {
-            schemaHash = in.readInt();
-        }
+        schemaHash = in.readInt();
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(replicaId);
     }
 
     @Override
@@ -381,7 +412,6 @@ public class ReplicaPersistInfo implements Writable {
         StringBuilder sb = new StringBuilder();
         sb.append("table id: ").append(tableId);
         sb.append(" partition id: ").append(partitionId);
-        sb.append(" index id: ").append(indexId);
         sb.append(" index id: ").append(indexId);
         sb.append(" tablet id: ").append(tabletId);
         sb.append(" backend id: ").append(backendId);

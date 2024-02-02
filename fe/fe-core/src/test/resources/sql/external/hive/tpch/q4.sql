@@ -1,25 +1,3 @@
-[sql]
-select
-    o_orderpriority,
-    count(*) as order_count
-from
-    orders
-where
-        o_orderdate >= date '1994-09-01'
-  and o_orderdate < date '1994-12-01'
-  and exists (
-        select
-            *
-        from
-            lineitem
-        where
-                l_orderkey = o_orderkey
-          and l_receiptdate > l_commitdate
-    )
-group by
-    o_orderpriority
-order by
-    o_orderpriority ;
 [fragment statistics]
 PLAN FRAGMENT 0(F06)
 Output Exprs:6: o_orderpriority | 27: count
@@ -27,10 +5,11 @@ Input Partition: UNPARTITIONED
 RESULT SINK
 
 12:MERGING-EXCHANGE
+distribution type: GATHER
 cardinality: 5
 column statistics:
 * o_orderpriority-->[-Infinity, Infinity, 0.0, 15.0, 5.0] ESTIMATE
-* count-->[0.0, 5.0, 0.0, 8.0, 5.0] ESTIMATE
+* count-->[0.0, 5675675.675675674, 0.0, 8.0, 5.0] ESTIMATE
 
 PLAN FRAGMENT 1(F05)
 
@@ -44,7 +23,7 @@ OutPut Exchange Id: 12
 |  cardinality: 5
 |  column statistics:
 |  * o_orderpriority-->[-Infinity, Infinity, 0.0, 15.0, 5.0] ESTIMATE
-|  * count-->[0.0, 5.0, 0.0, 8.0, 5.0] ESTIMATE
+|  * count-->[0.0, 5675675.675675674, 0.0, 8.0, 5.0] ESTIMATE
 |
 10:AGGREGATE (merge finalize)
 |  aggregate: count[([27: count, BIGINT, false]); args: ; result: BIGINT; args nullable: true; result nullable: false]
@@ -52,9 +31,11 @@ OutPut Exchange Id: 12
 |  cardinality: 5
 |  column statistics:
 |  * o_orderpriority-->[-Infinity, Infinity, 0.0, 15.0, 5.0] ESTIMATE
-|  * count-->[0.0, 5.0, 0.0, 8.0, 5.0] ESTIMATE
+|  * count-->[0.0, 5675675.675675674, 0.0, 8.0, 5.0] ESTIMATE
 |
 9:EXCHANGE
+distribution type: SHUFFLE
+partition exprs: [6: o_orderpriority, VARCHAR, true]
 cardinality: 5
 
 PLAN FRAGMENT 2(F04)
@@ -92,9 +73,13 @@ OutPut Exchange Id: 09
 |  * l_orderkey-->[1.0, 6.0E8, 0.0, 8.0, 5675675.675675674] ESTIMATE
 |
 |----5:EXCHANGE
+|       distribution type: SHUFFLE
+|       partition exprs: [1: o_orderkey, INT, true]
 |       cardinality: 5675676
 |
 2:EXCHANGE
+distribution type: SHUFFLE
+partition exprs: [10: l_orderkey, INT, true]
 cardinality: 300018951
 
 PLAN FRAGMENT 3(F02)
@@ -115,10 +100,9 @@ OutPut Exchange Id: 05
 3:HdfsScanNode
 TABLE: orders
 NON-PARTITION PREDICATES: 5: o_orderdate >= '1994-09-01', 5: o_orderdate < '1994-12-01'
-MIN/MAX PREDICATES: 28: o_orderdate >= '1994-09-01', 29: o_orderdate < '1994-12-01'
+MIN/MAX PREDICATES: 5: o_orderdate >= '1994-09-01', 5: o_orderdate < '1994-12-01'
 partitions=1/1
 avgRowSize=27.0
-numNodes=0
 cardinality: 5675676
 column statistics:
 * o_orderkey-->[1.0, 6.0E8, 0.0, 8.0, 5675675.675675674] ESTIMATE
@@ -143,7 +127,6 @@ TABLE: lineitem
 NON-PARTITION PREDICATES: 22: l_receiptdate > 21: l_commitdate
 partitions=1/1
 avgRowSize=16.0
-numNodes=0
 cardinality: 300018951
 probe runtime filters:
 - filter_id = 0, probe_expr = (10: l_orderkey)

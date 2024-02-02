@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/proc/JobsProcDir.java
 
@@ -31,7 +44,7 @@ import com.starrocks.catalog.Database;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.load.ExportJob;
 import com.starrocks.load.ExportMgr;
-import com.starrocks.load.loadv2.LoadManager;
+import com.starrocks.load.loadv2.LoadMgr;
 import com.starrocks.server.GlobalStateMgr;
 
 /*
@@ -49,6 +62,7 @@ public class JobsProcDir implements ProcDirInterface {
     private static final String ROLLUP = "rollup";
     private static final String SCHEMA_CHANGE = "schema_change";
     private static final String EXPORT = "export";
+    private static final String OPTIMIZE = "optimize";
 
     private GlobalStateMgr globalStateMgr;
     private Database db;
@@ -72,12 +86,14 @@ public class JobsProcDir implements ProcDirInterface {
         if (jobTypeName.equals(LOAD)) {
             return new LoadProcDir(db);
         } else if (jobTypeName.equals(DELETE)) {
-            return new DeleteInfoProcDir(globalStateMgr.getDeleteHandler(), globalStateMgr.getLoadInstance(),
+            return new DeleteInfoProcDir(globalStateMgr.getDeleteMgr(), globalStateMgr.getLoadInstance(),
                     db.getId());
         } else if (jobTypeName.equals(ROLLUP)) {
             return new RollupProcDir(globalStateMgr.getRollupHandler(), db);
         } else if (jobTypeName.equals(SCHEMA_CHANGE)) {
             return new SchemaChangeProcDir(globalStateMgr.getSchemaChangeHandler(), db);
+        } else if (jobTypeName.equals(OPTIMIZE)) {
+            return new OptimizeProcDir(globalStateMgr.getSchemaChangeHandler(), db);
         } else if (jobTypeName.equals(EXPORT)) {
             return new ExportProcNode(globalStateMgr.getExportMgr(), db);
         } else {
@@ -95,7 +111,7 @@ public class JobsProcDir implements ProcDirInterface {
 
         long dbId = db.getId();
         // load
-        LoadManager loadManager = GlobalStateMgr.getCurrentState().getLoadManager();
+        LoadMgr loadManager = GlobalStateMgr.getCurrentState().getLoadMgr();
         Long pendingNum = loadManager.getLoadJobNum(com.starrocks.load.loadv2.JobState.PENDING, dbId);
         Long runningNum = loadManager.getLoadJobNum(com.starrocks.load.loadv2.JobState.LOADING, dbId);
         Long finishedNum = loadManager.getLoadJobNum(com.starrocks.load.loadv2.JobState.FINISHED, dbId);

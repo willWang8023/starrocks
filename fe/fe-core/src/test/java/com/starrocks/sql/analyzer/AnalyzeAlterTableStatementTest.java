@@ -1,17 +1,34 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.analyzer;
 
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.TableName;
-import com.starrocks.common.Config;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.QueryState;
 import com.starrocks.qe.StmtExecutor;
+import com.starrocks.server.RunMode;
 import com.starrocks.sql.ast.AlterClause;
 import com.starrocks.sql.ast.AlterTableStmt;
+import com.starrocks.sql.ast.CompactionClause;
 import com.starrocks.sql.ast.TableRenameClause;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.utframe.UtFrameUtils;
+import mockit.Mock;
+import mockit.MockUp;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
@@ -23,7 +40,7 @@ import static com.starrocks.sql.analyzer.AnalyzeTestUtil.analyzeSuccess;
 
 public class AnalyzeAlterTableStatementTest {
     private static ConnectContext connectContext;
-    private static AlterTableStatementAnalyzer.AlterTableClauseAnalyzerVisitor clauseAnalyzerVisitor;
+    private static AlterTableClauseVisitor clauseAnalyzerVisitor;
 
     @BeforeClass
     public static void beforeClass() throws Exception {
@@ -32,7 +49,7 @@ public class AnalyzeAlterTableStatementTest {
         UtFrameUtils.addMockBackend(10002);
         UtFrameUtils.addMockBackend(10003);
         connectContext = AnalyzeTestUtil.getConnectContext();
-        clauseAnalyzerVisitor = new AlterTableStatementAnalyzer.AlterTableClauseAnalyzerVisitor();
+        clauseAnalyzerVisitor = new AlterTableClauseVisitor();
     }
 
     @Test
@@ -50,14 +67,24 @@ public class AnalyzeAlterTableStatementTest {
     }
 
     @Test(expected = SemanticException.class)
-    public void testIllegalNewTableName() {
-        TableRenameClause clause = new TableRenameClause("_newName");
-        clauseAnalyzerVisitor.analyze(clause, connectContext);
+    public void testNoClause() {
+        List<AlterClause> ops = Lists.newArrayList();
+        AlterTableStmt alterTableStmt = new AlterTableStmt(new TableName("testDb", "testTbl"), ops);
+        AlterTableStatementAnalyzer.analyze(alterTableStmt, AnalyzeTestUtil.getConnectContext());
     }
 
     @Test(expected = SemanticException.class)
-    public void testNoClause() {
+    public void testCompactionClause()  {
+        new MockUp<RunMode>() {
+            @Mock
+            public RunMode getCurrentRunMode() {
+                return RunMode.SHARED_DATA;
+            }
+        };
+
         List<AlterClause> ops = Lists.newArrayList();
+        NodePosition pos = new NodePosition(1, 23, 1, 48);
+        ops.add(new CompactionClause(true, pos));
         AlterTableStmt alterTableStmt = new AlterTableStmt(new TableName("testDb", "testTbl"), ops);
         AlterTableStatementAnalyzer.analyze(alterTableStmt, AnalyzeTestUtil.getConnectContext());
     }
@@ -83,14 +110,14 @@ public class AnalyzeAlterTableStatementTest {
     @Test
     public void testModifyTableProperties() {
         analyzeSuccess("ALTER TABLE test.t0 SET (\"default.replication_num\" = \"2\");");
+        analyzeSuccess("ALTER TABLE test.t0 SET (\"datacache.partition_duration\" = \"10 days\");");
+        analyzeFail("ALTER TABLE test.t0 SET (\"datacache.partition_duration\" = \"abcd\");", "Cannot parse text to Duration");
         analyzeFail("ALTER TABLE test.t0 SET (\"default.replication_num\" = \"2\", \"dynamic_partition.enable\" = \"true\");",
                 "Can only set one table property at a time");
         analyzeFail("ALTER TABLE test.t0 SET (\"abc\" = \"2\");",
-                "Unknown table property: [abc]");
+                "Unknown properties: {abc=2}");
         analyzeFail("ALTER TABLE test.t0 SET (\"send_clear_alter_tasks\" = \"FALSE\");",
                 "Property send_clear_alter_tasks should be set to true");
-        analyzeFail("ALTER TABLE test.t0 SET (\"storage_format\" = \"V1\");",
-                "Property storage_format should be v2");
         analyzeFail("ALTER TABLE test.t0 SET (\"tablet_type\" = \"V1\");",
                 "Alter tablet type not supported");
     }
@@ -110,8 +137,7 @@ public class AnalyzeAlterTableStatementTest {
                 ")\n" +
                 "DISTRIBUTED BY HASH(k2) BUCKETS 3\n" +
                 "PROPERTIES('replication_num' = '1');");
-        Config.enable_experimental_mv = true;
-        AnalyzeTestUtil.getStarRocksAssert().withNewMaterializedView("CREATE MATERIALIZED VIEW mv1_partition_by_column \n" +
+        AnalyzeTestUtil.getStarRocksAssert().withMaterializedView("CREATE MATERIALIZED VIEW mv1_partition_by_column \n" +
                 "PARTITION BY k1 \n" +
                 "distributed by hash(k2) \n" +
                 "refresh async START('2122-12-31') EVERY(INTERVAL 1 HOUR) \n" +
@@ -131,4 +157,26 @@ public class AnalyzeAlterTableStatementTest {
         analyzeSuccess("alter table t0 drop rollup test1");
         analyzeSuccess("alter table t0 drop rollup test1, test2");
     }
+
+    @Test
+    public void testAlterTableComment() {
+        analyzeSuccess("alter table t0 comment = \"new comment\"");
+    }
+
+    @Test
+    public void testAlterWithTimeType() {
+        analyzeFail("alter table t0 add column testcol TIME");
+        analyzeFail("alter table t0 modify column v0 TIME");
+    }
+
+    @Test
+    public void testColumnWithRowUpdate() {
+        String sql = "alter table tmcwr add column testcol TIME";
+        analyzeFail(sql, "row store table tmcwr can't do schema change");
+        sql = "alter table tmcwr drop column name";
+        analyzeFail(sql, "row store table tmcwr can't do schema change");
+        sql = "alter table tmcwr modify column name TIME";
+        analyzeFail(sql, "row store table tmcwr can't do schema change");
+    }
+
 }

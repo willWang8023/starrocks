@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/task/engine_batch_load_task.cpp
 
@@ -206,7 +219,7 @@ Status EngineBatchLoadTask::_push(const TPushReq& request, std::vector<TTabletIn
             return Status::NotFound(fmt::format("Not found tablet: {}", request.tablet_id));
         }
 
-        vectorized::PushHandler push_handler;
+        PushHandler push_handler;
         res = push_handler.process_streaming_ingestion(tablet, request, type, tablet_info_vec);
         if (!res.ok()) {
             LOG(WARNING) << "Fail to load file. res=" << res << ", txn_id=" << request.transaction_id
@@ -247,7 +260,7 @@ Status EngineBatchLoadTask::_delete_data(const TPushReq& request, std::vector<TT
 
     // 2. Process delete data by push interface
     DCHECK(request.__isset.transaction_id);
-    vectorized::PushHandler push_handler;
+    PushHandler push_handler;
     Status res = push_handler.process_streaming_ingestion(tablet, request, PUSH_FOR_DELETE, tablet_info_vec);
     if (!res.ok()) {
         LOG(WARNING) << "Fail to delete data. res: " << res << ", tablet: " << tablet->full_name();

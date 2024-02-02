@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/chunk_helper.h"
 
@@ -6,13 +18,17 @@
 #include "column/chunk.h"
 #include "column/column_helper.h"
 #include "column/column_pool.h"
+#include "column/map_column.h"
 #include "column/schema.h"
+#include "column/struct_column.h"
 #include "column/type_traits.h"
+#include "gutil/strings/fastmem.h"
 #include "runtime/current_thread.h"
 #include "runtime/descriptors.h"
 #include "simd/simd.h"
 #include "storage/olap_type_infra.h"
 #include "storage/tablet_schema.h"
+#include "storage/type_traits.h"
 #include "storage/type_utils.h"
 #include "storage/types.h"
 #include "util/metrics.h"
@@ -23,90 +39,76 @@ namespace starrocks {
 // NOTE(zc): now CppColumnTraits is only used for this class, so I move it here.
 // Someday if it is used by others, please move it into a single file.
 // CppColumnTraits
-// Infer ColumnType from FieldType
-template <FieldType ftype>
+// Infer ColumnType from LogicalType
+template <LogicalType ftype>
 struct CppColumnTraits {
     using CppType = typename CppTypeTraits<ftype>::CppType;
-    using ColumnType = typename vectorized::ColumnTraits<CppType>::ColumnType;
+    using ColumnType = typename ColumnTraits<CppType>::ColumnType;
 };
 
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_BOOL> {
-    using ColumnType = vectorized::UInt8Column;
+struct CppColumnTraits<TYPE_BOOLEAN> {
+    using ColumnType = UInt8Column;
 };
 
 // deprecated
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_DATE> {
-    using ColumnType = vectorized::FixedLengthColumn<uint24_t>;
+struct CppColumnTraits<TYPE_DATE_V1> {
+    using ColumnType = FixedLengthColumn<uint24_t>;
 };
 
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_DATE_V2> {
-    using ColumnType = vectorized::DateColumn;
+struct CppColumnTraits<TYPE_DATE> {
+    using ColumnType = DateColumn;
 };
 
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_TIMESTAMP> {
-    using ColumnType = vectorized::TimestampColumn;
+struct CppColumnTraits<TYPE_DATETIME> {
+    using ColumnType = TimestampColumn;
 };
 
 // deprecated
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_DECIMAL> {
-    using ColumnType = vectorized::FixedLengthColumn<decimal12_t>;
+struct CppColumnTraits<TYPE_DECIMAL> {
+    using ColumnType = FixedLengthColumn<decimal12_t>;
 };
 
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_HLL> {
-    using ColumnType = vectorized::HyperLogLogColumn;
+struct CppColumnTraits<TYPE_HLL> {
+    using ColumnType = HyperLogLogColumn;
 };
 
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_PERCENTILE> {
-    using ColumnType = vectorized::PercentileColumn;
+struct CppColumnTraits<TYPE_PERCENTILE> {
+    using ColumnType = PercentileColumn;
 };
 
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_OBJECT> {
-    using ColumnType = vectorized::BitmapColumn;
+struct CppColumnTraits<TYPE_OBJECT> {
+    using ColumnType = BitmapColumn;
 };
 
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_UNSIGNED_INT> {
-    using ColumnType = vectorized::UInt32Column;
+struct CppColumnTraits<TYPE_UNSIGNED_INT> {
+    using ColumnType = UInt32Column;
 };
 
 template <>
-struct CppColumnTraits<OLAP_FIELD_TYPE_JSON> {
-    using ColumnType = vectorized::JsonColumn;
+struct CppColumnTraits<TYPE_JSON> {
+    using ColumnType = JsonColumn;
 };
 
-vectorized::Field ChunkHelper::convert_field(ColumnId id, const TabletColumn& c) {
-    TypeInfoPtr type_info = get_type_info(c);
-    starrocks::vectorized::Field f(id, std::string(c.name()), type_info, c.is_nullable());
-    f.set_is_key(c.is_key());
-    f.set_short_key_length(c.index_length());
-    f.set_aggregate_method(c.aggregation());
-    f.set_length(c.length());
-    return f;
-}
+template <>
+struct CppColumnTraits<TYPE_VARBINARY> {
+    using ColumnType = BinaryColumn;
+};
 
-vectorized::Schema ChunkHelper::convert_schema(const starrocks::TabletSchema& schema) {
-    starrocks::vectorized::Fields fields;
-    for (ColumnId cid = 0; cid < schema.num_columns(); ++cid) {
-        auto f = convert_field(cid, schema.column(cid));
-        fields.emplace_back(std::make_shared<starrocks::vectorized::Field>(std::move(f)));
-    }
-    return starrocks::vectorized::Schema(std::move(fields), schema.keys_type());
-}
-
-starrocks::vectorized::Field ChunkHelper::convert_field_to_format_v2(ColumnId id, const TabletColumn& c) {
-    FieldType type = TypeUtils::to_storage_format_v2(c.type());
+Field ChunkHelper::convert_field(ColumnId id, const TabletColumn& c) {
+    LogicalType type = c.type();
 
     TypeInfoPtr type_info = nullptr;
-    if (type == OLAP_FIELD_TYPE_ARRAY || type == OLAP_FIELD_TYPE_DECIMAL32 || type == OLAP_FIELD_TYPE_DECIMAL64 ||
-        type == OLAP_FIELD_TYPE_DECIMAL128) {
+    if (type == TYPE_ARRAY || type == TYPE_MAP || type == TYPE_STRUCT || type == TYPE_DECIMAL32 ||
+        type == TYPE_DECIMAL64 || type == TYPE_DECIMAL128) {
         // ARRAY and DECIMAL should be handled specially
         // Array is nested type, the message is stored in TabletColumn
         // Decimal has precision and scale, the message is stored in TabletColumn
@@ -114,47 +116,110 @@ starrocks::vectorized::Field ChunkHelper::convert_field_to_format_v2(ColumnId id
     } else {
         type_info = get_type_info(type);
     }
-    starrocks::vectorized::Field f(id, std::string(c.name()), type_info, c.is_nullable());
+    starrocks::Field f(id, std::string(c.name()), type_info, c.is_nullable());
     f.set_is_key(c.is_key());
     f.set_length(c.length());
+    f.set_uid(c.unique_id());
 
-    if (type == OLAP_FIELD_TYPE_ARRAY) {
+    if (type == TYPE_ARRAY) {
         const TabletColumn& sub_column = c.subcolumn(0);
-        auto sub_field = convert_field_to_format_v2(id, sub_column);
+        auto sub_field = convert_field(id, sub_column);
         f.add_sub_field(sub_field);
+    } else if (type == TYPE_MAP) {
+        for (int i = 0; i < 2; ++i) {
+            const TabletColumn& sub_column = c.subcolumn(i);
+            auto sub_field = convert_field(id, sub_column);
+            f.add_sub_field(sub_field);
+        }
+    } else if (type == TYPE_STRUCT) {
+        for (int i = 0; i < c.subcolumn_count(); ++i) {
+            const TabletColumn& sub_column = c.subcolumn(i);
+            auto sub_field = convert_field(id, sub_column);
+            f.add_sub_field(sub_field);
+        }
     }
 
-    // If origin type needs to be converted format v2, we should change its short key length
-    if (TypeUtils::specific_type_of_format_v1(c.type())) {
-        // Get TypeInfo with new type
-        TypeInfoPtr type_info = get_type_info(type);
-        f.set_short_key_length(type_info->size());
-    } else {
-        f.set_short_key_length(c.index_length());
-    }
-
+    f.set_short_key_length(c.index_length());
     f.set_aggregate_method(c.aggregation());
     return f;
 }
 
-starrocks::vectorized::Schema ChunkHelper::convert_schema_to_format_v2(const starrocks::TabletSchema& schema) {
-    return starrocks::vectorized::Schema(schema.schema());
+starrocks::Schema ChunkHelper::convert_schema(const starrocks::TabletSchemaCSPtr& schema) {
+    return starrocks::Schema(schema->schema());
 }
 
-starrocks::vectorized::Schema ChunkHelper::convert_schema_to_format_v2(const starrocks::TabletSchema& schema,
-                                                                       const std::vector<ColumnId>& cids) {
-    return starrocks::vectorized::Schema(schema.schema(), cids);
+starrocks::Schema ChunkHelper::convert_schema(const starrocks::TabletSchemaCSPtr& schema,
+                                              const std::vector<ColumnId>& cids) {
+    return starrocks::Schema(schema->schema(), cids);
 }
 
-starrocks::vectorized::Schema ChunkHelper::get_short_key_schema_with_format_v2(const starrocks::TabletSchema& schema) {
-    std::vector<ColumnId> short_key_cids;
-    for (ColumnId cid = 0; cid < schema.num_short_key_columns(); ++cid) {
-        short_key_cids.push_back(cid);
+starrocks::SchemaPtr ChunkHelper::convert_schema(const std::vector<TabletColumn*>& columns,
+                                                 const std::vector<std::string_view>& col_names) {
+    SchemaPtr schema = std::make_shared<Schema>();
+    // ordered by col_names
+    int new_column_idx = 0;
+    for (auto s : col_names) {
+        for (int32_t idx = 0; idx < columns.size(); ++idx) {
+            if (!s.compare(columns[idx]->name())) {
+                auto f = std::make_shared<Field>(ChunkHelper::convert_field(new_column_idx++, *columns[idx]));
+                schema->append(f);
+            }
+        }
     }
-    return starrocks::vectorized::Schema(schema.schema(), short_key_cids);
+    return schema->fields().size() != 0 ? schema : nullptr;
 }
 
-ColumnId ChunkHelper::max_column_id(const starrocks::vectorized::Schema& schema) {
+starrocks::Schema ChunkHelper::get_short_key_schema(const starrocks::TabletSchemaCSPtr& schema) {
+    std::vector<ColumnId> short_key_cids;
+    const auto& sort_key_idxes = schema->sort_key_idxes();
+    short_key_cids.reserve(schema->num_short_key_columns());
+    for (auto i = 0; i < schema->num_short_key_columns(); ++i) {
+        short_key_cids.push_back(sort_key_idxes[i]);
+    }
+    return starrocks::Schema(schema->schema(), short_key_cids);
+}
+
+starrocks::Schema ChunkHelper::get_sort_key_schema(const starrocks::TabletSchemaCSPtr& schema) {
+    std::vector<ColumnId> sort_key_iota_idxes(schema->sort_key_idxes().size());
+    std::iota(sort_key_iota_idxes.begin(), sort_key_iota_idxes.end(), 0);
+    return starrocks::Schema(schema->schema(), schema->sort_key_idxes(), sort_key_iota_idxes);
+}
+
+starrocks::Schema ChunkHelper::get_sort_key_schema_by_primary_key(const starrocks::TabletSchemaCSPtr& tablet_schema) {
+    std::vector<ColumnId> primary_key_iota_idxes(tablet_schema->num_key_columns());
+    std::iota(primary_key_iota_idxes.begin(), primary_key_iota_idxes.end(), 0);
+    std::vector<ColumnId> all_keys_iota_idxes(tablet_schema->num_columns());
+    std::iota(all_keys_iota_idxes.begin(), all_keys_iota_idxes.end(), 0);
+    return starrocks::Schema(tablet_schema->schema(), all_keys_iota_idxes, primary_key_iota_idxes);
+}
+
+starrocks::SchemaPtr ChunkHelper::get_non_nullable_schema(const starrocks::SchemaPtr& schema,
+                                                          const std::vector<int>* keys) {
+    const auto& old_fields = schema->fields();
+    Fields new_fields;
+    new_fields.resize(old_fields.size());
+    DCHECK(keys == nullptr || old_fields.size() == keys->size());
+
+    int idx = 0;
+    for (const auto& old_field : old_fields) {
+        ColumnId id = old_field->id();
+        std::string_view name = old_field->name();
+        TypeInfoPtr type = old_field->type();
+        starrocks::StorageAggregateType agg = old_field->aggregate_method();
+        uint8_t short_key_length = old_field->short_key_length();
+        bool is_key = old_field->is_key();
+        bool nullable = false;
+
+        auto new_field = std::make_shared<Field>(id, name, type, agg, short_key_length,
+                                                 keys != nullptr ? static_cast<bool>((*keys)[idx]) : is_key, nullable);
+        new_fields[idx] = new_field;
+        ++idx;
+    }
+
+    return std::make_shared<starrocks::Schema>(new_fields, schema->keys_type(), schema->sort_key_idxes());
+}
+
+ColumnId ChunkHelper::max_column_id(const starrocks::Schema& schema) {
     ColumnId id = 0;
     for (const auto& field : schema.fields()) {
         id = std::max(id, field->id());
@@ -164,17 +229,17 @@ ColumnId ChunkHelper::max_column_id(const starrocks::vectorized::Schema& schema)
 
 template <typename T>
 struct ColumnDeleter {
-    ColumnDeleter(uint32_t chunk_size) : chunk_size(chunk_size) {}
-    void operator()(vectorized::Column* ptr) const { vectorized::return_column<T>(down_cast<T*>(ptr), chunk_size); }
-    uint32_t chunk_size;
+    ColumnDeleter(size_t chunk_size) : chunk_size(chunk_size) {}
+    void operator()(Column* ptr) const { return_column<T>(down_cast<T*>(ptr), chunk_size); }
+    size_t chunk_size;
 };
 
 template <typename T, bool force>
 inline std::shared_ptr<T> get_column_ptr(size_t chunk_size) {
-    if constexpr (std::negation_v<vectorized::HasColumnPool<T>>) {
+    if constexpr (std::negation_v<HasColumnPool<T>>) {
         return std::make_shared<T>();
     } else {
-        T* ptr = vectorized::get_column<T, force>();
+        T* ptr = get_column<T, force>();
         if (LIKELY(ptr != nullptr)) {
             return std::shared_ptr<T>(ptr, ColumnDeleter<T>(chunk_size));
         } else {
@@ -184,8 +249,7 @@ inline std::shared_ptr<T> get_column_ptr(size_t chunk_size) {
 }
 
 template <typename T, bool force>
-inline std::shared_ptr<vectorized::DecimalColumnType<T>> get_decimal_column_ptr(int precision, int scale,
-                                                                                size_t chunk_size) {
+inline std::shared_ptr<DecimalColumnType<T>> get_decimal_column_ptr(int precision, int scale, size_t chunk_size) {
     auto column = get_column_ptr<T, force>(chunk_size);
     column->set_precision(precision);
     column->set_scale(scale);
@@ -194,33 +258,44 @@ inline std::shared_ptr<vectorized::DecimalColumnType<T>> get_decimal_column_ptr(
 
 template <bool force>
 struct ColumnPtrBuilder {
-    template <FieldType ftype>
-    vectorized::ColumnPtr operator()(size_t chunk_size, const vectorized::Field& field, int precision, int scale) {
-        auto nullable = [&](vectorized::ColumnPtr c) -> vectorized::ColumnPtr {
+    template <LogicalType ftype>
+    ColumnPtr operator()(size_t chunk_size, const Field& field, int precision, int scale) {
+        auto NullableIfNeed = [&](ColumnPtr c) -> ColumnPtr {
             return field.is_nullable()
-                           ? vectorized::NullableColumn::create(
-                                     std::move(c), get_column_ptr<vectorized::NullColumn, force>(chunk_size))
+                           ? NullableColumn::create(std::move(c), get_column_ptr<NullColumn, force>(chunk_size))
                            : c;
         };
 
-        if constexpr (ftype == OLAP_FIELD_TYPE_ARRAY) {
-            auto elements = field.sub_field(0).create_column();
-            auto offsets = get_column_ptr<vectorized::UInt32Column, force>(chunk_size);
-            auto array = vectorized::ArrayColumn::create(std::move(elements), offsets);
-            return nullable(array);
+        if constexpr (ftype == TYPE_ARRAY) {
+            auto elements = NullableColumn::wrap_if_necessary(field.sub_field(0).create_column());
+            auto offsets = get_column_ptr<UInt32Column, force>(chunk_size);
+            auto array = ArrayColumn::create(std::move(elements), offsets);
+            return NullableIfNeed(array);
+        } else if constexpr (ftype == TYPE_MAP) {
+            auto keys = NullableColumn::wrap_if_necessary(field.sub_field(0).create_column());
+            auto values = NullableColumn::wrap_if_necessary(field.sub_field(1).create_column());
+            auto offsets = get_column_ptr<UInt32Column, force>(chunk_size);
+            auto map = MapColumn::create(std::move(keys), std::move(values), offsets);
+            return NullableIfNeed(map);
+        } else if constexpr (ftype == TYPE_STRUCT) {
+            std::vector<std::string> names;
+            std::vector<ColumnPtr> fields;
+            for (auto& sub_field : field.sub_fields()) {
+                names.template emplace_back(sub_field.name());
+                fields.template emplace_back(sub_field.create_column());
+            }
+            auto struct_column = StructColumn::create(std::move(fields), std::move(names));
+            return NullableIfNeed(struct_column);
         } else {
             switch (ftype) {
-            case OLAP_FIELD_TYPE_DECIMAL32:
-                return nullable(
-                        get_decimal_column_ptr<vectorized::Decimal32Column, force>(precision, scale, chunk_size));
-            case OLAP_FIELD_TYPE_DECIMAL64:
-                return nullable(
-                        get_decimal_column_ptr<vectorized::Decimal64Column, force>(precision, scale, chunk_size));
-            case OLAP_FIELD_TYPE_DECIMAL128:
-                return nullable(
-                        get_decimal_column_ptr<vectorized::Decimal128Column, force>(precision, scale, chunk_size));
+            case TYPE_DECIMAL32:
+                return NullableIfNeed(get_decimal_column_ptr<Decimal32Column, force>(precision, scale, chunk_size));
+            case TYPE_DECIMAL64:
+                return NullableIfNeed(get_decimal_column_ptr<Decimal64Column, force>(precision, scale, chunk_size));
+            case TYPE_DECIMAL128:
+                return NullableIfNeed(get_decimal_column_ptr<Decimal128Column, force>(precision, scale, chunk_size));
             default: {
-                return nullable(get_column_ptr<typename CppColumnTraits<ftype>::ColumnType, force>(chunk_size));
+                return NullableIfNeed(get_column_ptr<typename CppColumnTraits<ftype>::ColumnType, force>(chunk_size));
             }
             }
         }
@@ -228,56 +303,55 @@ struct ColumnPtrBuilder {
 };
 
 template <bool force>
-vectorized::ColumnPtr column_from_pool(const vectorized::Field& field, size_t chunk_size) {
+ColumnPtr column_from_pool(const Field& field, size_t chunk_size) {
     auto precision = field.type()->precision();
     auto scale = field.type()->scale();
     return field_type_dispatch_column(field.type()->type(), ColumnPtrBuilder<force>(), chunk_size, field, precision,
                                       scale);
 }
 
-vectorized::Chunk* ChunkHelper::new_chunk_pooled(const vectorized::Schema& schema, size_t chunk_size, bool force) {
-    vectorized::Columns columns;
+Chunk* ChunkHelper::new_chunk_pooled(const Schema& schema, size_t chunk_size, bool force) {
+    Columns columns;
     columns.reserve(schema.num_fields());
     for (size_t i = 0; i < schema.num_fields(); i++) {
-        const vectorized::FieldPtr& f = schema.field(i);
-        auto column = (force && !config::disable_column_pool) ? column_from_pool<true>(*f, chunk_size)
-                                                              : column_from_pool<false>(*f, chunk_size);
+        const FieldPtr& f = schema.field(i);
+        auto column = force ? column_from_pool<true>(*f, chunk_size) : column_from_pool<false>(*f, chunk_size);
         column->reserve(chunk_size);
         columns.emplace_back(std::move(column));
     }
-    return new vectorized::Chunk(std::move(columns), std::make_shared<vectorized::Schema>(schema));
+    return new Chunk(std::move(columns), std::make_shared<Schema>(schema));
 }
 
-std::vector<size_t> ChunkHelper::get_char_field_indexes(const vectorized::Schema& schema) {
+std::vector<size_t> ChunkHelper::get_char_field_indexes(const Schema& schema) {
     std::vector<size_t> char_field_indexes;
     for (size_t i = 0; i < schema.num_fields(); ++i) {
         const auto& field = schema.field(i);
-        if (field->type()->type() == OLAP_FIELD_TYPE_CHAR) {
+        if (field->type()->type() == TYPE_CHAR) {
             char_field_indexes.push_back(i);
         }
     }
     return char_field_indexes;
 }
 
-void ChunkHelper::padding_char_columns(const std::vector<size_t>& char_column_indexes, const vectorized::Schema& schema,
-                                       const starrocks::TabletSchema& tschema, vectorized::Chunk* chunk) {
+void ChunkHelper::padding_char_columns(const std::vector<size_t>& char_column_indexes, const Schema& schema,
+                                       const starrocks::TabletSchemaCSPtr& tschema, Chunk* chunk) {
     size_t num_rows = chunk->num_rows();
     for (auto field_index : char_column_indexes) {
-        vectorized::Column* column = chunk->get_column_by_index(field_index).get();
-        vectorized::Column* data_column = vectorized::ColumnHelper::get_data_column(column);
-        vectorized::BinaryColumn* binary = down_cast<vectorized::BinaryColumn*>(data_column);
+        Column* column = chunk->get_column_by_index(field_index).get();
+        Column* data_column = ColumnHelper::get_data_column(column);
+        auto* binary = down_cast<BinaryColumn*>(data_column);
 
-        vectorized::Offsets& offset = binary->get_offset();
-        vectorized::Bytes& bytes = binary->get_bytes();
+        Offsets& offset = binary->get_offset();
+        Bytes& bytes = binary->get_bytes();
 
         // Padding 0 to CHAR field, the storage bitmap index and zone map need it.
         // TODO(kks): we could improve this if there are many null valus
-        auto new_binary = vectorized::BinaryColumn::create();
-        vectorized::Offsets& new_offset = new_binary->get_offset();
-        vectorized::Bytes& new_bytes = new_binary->get_bytes();
+        auto new_binary = BinaryColumn::create();
+        Offsets& new_offset = new_binary->get_offset();
+        Bytes& new_bytes = new_binary->get_bytes();
 
         // |schema| maybe partial columns in vertical compaction, so get char column length by name.
-        uint32_t len = tschema.column(tschema.field_index(schema.field(field_index)->name())).length();
+        uint32_t len = tschema->column(tschema->field_index(schema.field(field_index)->name())).length();
 
         new_offset.resize(num_rows + 1);
         new_bytes.assign(num_rows * len, 0); // padding 0
@@ -290,14 +364,14 @@ void ChunkHelper::padding_char_columns(const std::vector<size_t>& char_column_in
         }
 
         for (size_t j = 1; j <= num_rows; ++j) {
-            new_offset[j] = len * j;
+            new_offset[j] = static_cast<uint32_t>(len * j);
         }
 
         const auto& field = schema.field(field_index);
 
         if (field->is_nullable()) {
-            auto* nullable_column = down_cast<vectorized::NullableColumn*>(column);
-            auto new_column = vectorized::NullableColumn::create(new_binary, nullable_column->null_column());
+            auto* nullable_column = down_cast<NullableColumn*>(column);
+            auto new_column = NullableColumn::create(new_binary, nullable_column->null_column());
             new_column->swap_column(*column);
         } else {
             new_binary->swap_column(*column);
@@ -306,14 +380,17 @@ void ChunkHelper::padding_char_columns(const std::vector<size_t>& char_column_in
 }
 
 struct ColumnBuilder {
-    template <FieldType ftype>
-    vectorized::ColumnPtr operator()(bool nullable) {
-        [[maybe_unused]] auto NullableIfNeed = [&](vectorized::ColumnPtr col) -> vectorized::ColumnPtr {
-            return nullable ? vectorized::NullableColumn::create(std::move(col), vectorized::NullColumn::create())
-                            : col;
+    template <LogicalType ftype>
+    ColumnPtr operator()(bool nullable) {
+        [[maybe_unused]] auto NullableIfNeed = [&](ColumnPtr col) -> ColumnPtr {
+            return nullable ? NullableColumn::create(std::move(col), NullColumn::create()) : col;
         };
 
-        if constexpr (ftype == OLAP_FIELD_TYPE_ARRAY) {
+        if constexpr (ftype == TYPE_ARRAY) {
+            CHECK(false) << "array not supported";
+        } else if constexpr (ftype == TYPE_MAP) {
+            CHECK(false) << "array not supported";
+        } else if constexpr (ftype == TYPE_STRUCT) {
             CHECK(false) << "array not supported";
         } else {
             return NullableIfNeed(CppColumnTraits<ftype>::ColumnType::create());
@@ -321,87 +398,82 @@ struct ColumnBuilder {
     }
 };
 
-vectorized::ColumnPtr ChunkHelper::column_from_field_type(FieldType type, bool nullable) {
+ColumnPtr ChunkHelper::column_from_field_type(LogicalType type, bool nullable) {
     return field_type_dispatch_column(type, ColumnBuilder(), nullable);
 }
 
-vectorized::ColumnPtr ChunkHelper::column_from_field(const vectorized::Field& field) {
-    auto NullableIfNeed = [&](vectorized::ColumnPtr col) -> vectorized::ColumnPtr {
-        return field.is_nullable()
-                       ? vectorized::NullableColumn::create(std::move(col), vectorized::NullColumn::create())
-                       : col;
+ColumnPtr ChunkHelper::column_from_field(const Field& field) {
+    auto NullableIfNeed = [&](ColumnPtr col) -> ColumnPtr {
+        return field.is_nullable() ? NullableColumn::create(std::move(col), NullColumn::create()) : col;
     };
 
     auto type = field.type()->type();
     switch (type) {
-    case OLAP_FIELD_TYPE_DECIMAL32:
-        return NullableIfNeed(vectorized::Decimal32Column::create(field.type()->precision(), field.type()->scale()));
-    case OLAP_FIELD_TYPE_DECIMAL64:
-        return NullableIfNeed(vectorized::Decimal64Column::create(field.type()->precision(), field.type()->scale()));
-    case OLAP_FIELD_TYPE_DECIMAL128:
-        return NullableIfNeed(vectorized::Decimal128Column::create(field.type()->precision(), field.type()->scale()));
-    case OLAP_FIELD_TYPE_ARRAY: {
-        return NullableIfNeed(vectorized::ArrayColumn::create(column_from_field(field.sub_field(0)),
-                                                              vectorized::UInt32Column::create()));
+    case TYPE_DECIMAL32:
+        return NullableIfNeed(Decimal32Column::create(field.type()->precision(), field.type()->scale()));
+    case TYPE_DECIMAL64:
+        return NullableIfNeed(Decimal64Column::create(field.type()->precision(), field.type()->scale()));
+    case TYPE_DECIMAL128:
+        return NullableIfNeed(Decimal128Column::create(field.type()->precision(), field.type()->scale()));
+    case TYPE_ARRAY: {
+        return NullableIfNeed(ArrayColumn::create(column_from_field(field.sub_field(0)), UInt32Column::create()));
+    }
+    case TYPE_MAP:
+        return NullableIfNeed(MapColumn::create(column_from_field(field.sub_field(0)),
+                                                column_from_field(field.sub_field(1)), UInt32Column::create()));
+    case TYPE_STRUCT: {
+        std::vector<std::string> names;
+        std::vector<ColumnPtr> fields;
+        for (auto& sub_field : field.sub_fields()) {
+            names.template emplace_back(sub_field.name());
+            fields.template emplace_back(sub_field.create_column());
+        }
+        auto struct_column = StructColumn::create(std::move(fields), std::move(names));
+        return NullableIfNeed(struct_column);
     }
     default:
         return NullableIfNeed(column_from_field_type(type, false));
     }
 }
 
-vectorized::ChunkPtr ChunkHelper::new_chunk(const vectorized::Schema& schema, size_t n) {
+ChunkUniquePtr ChunkHelper::new_chunk(const Schema& schema, size_t n) {
     size_t fields = schema.num_fields();
-    vectorized::Columns columns;
+    Columns columns;
     columns.reserve(fields);
     for (size_t i = 0; i < fields; i++) {
-        const vectorized::FieldPtr& f = schema.field(i);
+        const FieldPtr& f = schema.field(i);
         columns.emplace_back(column_from_field(*f));
         columns.back()->reserve(n);
     }
-    return std::make_shared<vectorized::Chunk>(std::move(columns), std::make_shared<vectorized::Schema>(schema));
+    return std::make_unique<Chunk>(std::move(columns), std::make_shared<Schema>(schema));
 }
 
-std::shared_ptr<vectorized::Chunk> ChunkHelper::new_chunk(const TupleDescriptor& tuple_desc, size_t n) {
+ChunkUniquePtr ChunkHelper::new_chunk(const TupleDescriptor& tuple_desc, size_t n) {
     return new_chunk(tuple_desc.slots(), n);
 }
 
-std::shared_ptr<vectorized::Chunk> ChunkHelper::new_chunk(const std::vector<SlotDescriptor*>& slots, size_t n) {
-    auto chunk = std::make_shared<vectorized::Chunk>();
+ChunkUniquePtr ChunkHelper::new_chunk(const std::vector<SlotDescriptor*>& slots, size_t n) {
+    auto chunk = std::make_unique<Chunk>();
     for (const auto slot : slots) {
-        auto column = vectorized::ColumnHelper::create_column(slot->type(), slot->is_nullable());
+        auto column = ColumnHelper::create_column(slot->type(), slot->is_nullable());
         column->reserve(n);
         chunk->append_column(column, slot->id());
     }
     return chunk;
 }
 
-void ChunkHelper::reorder_chunk(const TupleDescriptor& tuple_desc, vectorized::Chunk* chunk) {
+void ChunkHelper::reorder_chunk(const TupleDescriptor& tuple_desc, Chunk* chunk) {
     return reorder_chunk(tuple_desc.slots(), chunk);
 }
 
-void ChunkHelper::reorder_chunk(const std::vector<SlotDescriptor*>& slots, vectorized::Chunk* chunk) {
-    DCHECK(chunk->columns().size() == slots.size());
-    auto reordered_chunk = vectorized::Chunk();
+void ChunkHelper::reorder_chunk(const std::vector<SlotDescriptor*>& slots, Chunk* chunk) {
+    auto reordered_chunk = Chunk();
     auto& original_chunk = (*chunk);
-    for (std::size_t idx = 0; idx < slots.size(); idx++) {
-        auto slot_id = slots[idx]->id();
+    for (auto slot : slots) {
+        auto slot_id = slot->id();
         reordered_chunk.append_column(original_chunk.get_column_by_slot_id(slot_id), slot_id);
     }
     original_chunk.swap_chunk(reordered_chunk);
-}
-
-void ChunkHelper::build_selective(const std::vector<uint8_t>& filter, std::vector<uint32_t>& selective) {
-    size_t n = SIMD::count_nonzero(filter);
-    if (n == 0) {
-        return;
-    }
-    selective.resize(0);
-    selective.reserve(n);
-    for (int i = 0; i < filter.size(); i++) {
-        if (filter[i]) {
-            selective.push_back(i);
-        }
-    }
 }
 
 ChunkAccumulator::ChunkAccumulator(size_t desired_size) : _desired_size(desired_size) {}
@@ -413,15 +485,16 @@ void ChunkAccumulator::set_desired_size(size_t desired_size) {
 void ChunkAccumulator::reset() {
     _output.clear();
     _tmp_chunk.reset();
+    _accumulate_count = 0;
 }
 
-Status ChunkAccumulator::push(vectorized::ChunkPtr&& chunk) {
+Status ChunkAccumulator::push(ChunkPtr&& chunk) {
     size_t input_rows = chunk->num_rows();
     // TODO: optimize for zero-copy scenario
     // Cut the input chunk into pieces if larger than desired
     for (size_t start = 0; start < input_rows;) {
         size_t remain_rows = input_rows - start;
-        int need_rows = 0;
+        size_t need_rows = 0;
         if (_tmp_chunk) {
             need_rows = std::min(_desired_size - _tmp_chunk->num_rows(), remain_rows);
             TRY_CATCH_BAD_ALLOC(_tmp_chunk->append(*chunk, start, need_rows));
@@ -436,6 +509,7 @@ Status ChunkAccumulator::push(vectorized::ChunkPtr&& chunk) {
         }
         start += need_rows;
     }
+    _accumulate_count++;
     return Status::OK();
 }
 
@@ -443,10 +517,15 @@ bool ChunkAccumulator::empty() const {
     return _output.empty();
 }
 
-vectorized::ChunkPtr ChunkAccumulator::pull() {
+bool ChunkAccumulator::reach_limit() const {
+    return _accumulate_count >= kAccumulateLimit;
+}
+
+ChunkPtr ChunkAccumulator::pull() {
     if (!_output.empty()) {
         auto res = std::move(_output.front());
         _output.pop_front();
+        _accumulate_count = 0;
         return res;
     }
     return nullptr;
@@ -456,6 +535,65 @@ void ChunkAccumulator::finalize() {
     if (_tmp_chunk) {
         _output.emplace_back(std::move(_tmp_chunk));
     }
+    _accumulate_count = 0;
+}
+
+void ChunkPipelineAccumulator::push(const ChunkPtr& chunk) {
+    chunk->check_or_die();
+    DCHECK(_out_chunk == nullptr);
+    if (_in_chunk == nullptr) {
+        _in_chunk = chunk;
+        _mem_usage = chunk->bytes_usage();
+    } else if (_in_chunk->num_rows() + chunk->num_rows() > _max_size ||
+               _in_chunk->owner_info() != chunk->owner_info()) {
+        _out_chunk = std::move(_in_chunk);
+        _in_chunk = chunk;
+        _mem_usage = chunk->bytes_usage();
+    } else {
+        _in_chunk->append(*chunk);
+        _mem_usage += chunk->bytes_usage();
+    }
+
+    if (_out_chunk == nullptr && (_in_chunk->num_rows() >= _max_size * LOW_WATERMARK_ROWS_RATE ||
+                                  _mem_usage >= LOW_WATERMARK_BYTES || _in_chunk->owner_info().is_last_chunk())) {
+        _out_chunk = std::move(_in_chunk);
+        _mem_usage = 0;
+    }
+}
+
+void ChunkPipelineAccumulator::reset() {
+    _in_chunk.reset();
+    _out_chunk.reset();
+    _mem_usage = 0;
+}
+
+void ChunkPipelineAccumulator::finalize() {
+    _finalized = true;
+    _mem_usage = 0;
+}
+
+void ChunkPipelineAccumulator::reset_state() {
+    reset();
+    _finalized = false;
+}
+
+ChunkPtr& ChunkPipelineAccumulator::pull() {
+    if (_finalized && _out_chunk == nullptr) {
+        return _in_chunk;
+    }
+    return _out_chunk;
+}
+
+bool ChunkPipelineAccumulator::has_output() const {
+    return _out_chunk != nullptr || (_finalized && _in_chunk != nullptr);
+}
+
+bool ChunkPipelineAccumulator::need_input() const {
+    return !_finalized && _out_chunk == nullptr;
+}
+
+bool ChunkPipelineAccumulator::is_finished() const {
+    return _finalized && _out_chunk == nullptr && _in_chunk == nullptr;
 }
 
 } // namespace starrocks

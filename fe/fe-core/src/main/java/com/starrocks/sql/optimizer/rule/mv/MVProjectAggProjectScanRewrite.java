@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.optimizer.rule.mv;
 
@@ -50,6 +62,7 @@ public class MVProjectAggProjectScanRewrite {
 
         if (input.getOp() instanceof LogicalProjectOperator &&
                 input.inputAt(0).getOp() instanceof LogicalAggregationOperator &&
+                input.inputAt(0).inputAt(0).getOp() instanceof LogicalProjectOperator &&
                 input.inputAt(0).inputAt(0).inputAt(0).getOp() instanceof LogicalOlapScanOperator) {
             LogicalProjectOperator topProject = (LogicalProjectOperator) input.getOp();
             LogicalProjectOperator bellowProject = (LogicalProjectOperator) input.inputAt(0).inputAt(0).getOp();
@@ -102,19 +115,9 @@ public class MVProjectAggProjectScanRewrite {
             columnRefOperatorColumnMap.put(rewriteContext.mvColumnRef, rewriteContext.mvColumn);
         }
 
-        LogicalOlapScanOperator newScanOperator = new LogicalOlapScanOperator(
-                olapScanOperator.getTable(),
-                columnRefOperatorColumnMap,
-                olapScanOperator.getColumnMetaToColRefMap(),
-                olapScanOperator.getDistributionSpec(),
-                olapScanOperator.getLimit(),
-                olapScanOperator.getPredicate(),
-                olapScanOperator.getSelectedIndexId(),
-                olapScanOperator.getSelectedPartitionId(),
-                olapScanOperator.getPartitionNames(),
-                olapScanOperator.getSelectedTabletId(),
-                olapScanOperator.getHintsTabletIds());
-
+        LogicalOlapScanOperator.Builder builder = new LogicalOlapScanOperator.Builder();
+        LogicalOlapScanOperator newScanOperator = builder.withOperator(olapScanOperator)
+                .setColRefToColumnMetaMap(columnRefOperatorColumnMap).build();
         optExpression.setChild(0, OptExpression.create(newScanOperator));
     }
 
@@ -125,6 +128,8 @@ public class MVProjectAggProjectScanRewrite {
         for (Map.Entry<ColumnRefOperator, ScalarOperator> kv : projectOperator.getColumnRefMap().entrySet()) {
             if (kv.getValue().getUsedColumns().contains(baseColumnRef)) {
                 kv.setValue(mvColumnRef);
+                kv.getKey().setNullable(mvColumnRef.isNullable());
+                kv.getKey().setType(mvColumnRef.getType());
                 return kv.getKey();
             }
         }
@@ -162,7 +167,6 @@ public class MVProjectAggProjectScanRewrite {
                             aggOperator.getPartitionByColumns(),
                             newAggMap,
                             aggOperator.isSplit(),
-                            aggOperator.getSingleDistinctFunctionPos(),
                             aggOperator.getLimit(),
                             aggOperator.getPredicate()), optExpression.inputAt(0).getInputs()));
                     return new Pair<>(kv.getKey(), aggColumnRef);

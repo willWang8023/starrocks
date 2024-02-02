@@ -1,10 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.optimizer;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
-import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.scalar.ScalarOperator;
 import com.starrocks.sql.optimizer.statistics.Statistics;
 
@@ -35,9 +46,6 @@ public class CTEContext {
     // Num of CTE consume
     private Map<Integer, Integer> consumeNums;
 
-    // Consume required columns
-    private Map<Integer, ColumnRefSet> requiredColumns;
-
     private Map<Integer, List<ScalarOperator>> consumePredicates;
 
     private Map<Integer, List<Long>> consumeLimits;
@@ -50,6 +58,8 @@ public class CTEContext {
 
     private int maxCTELimit = 10;
 
+    private int cteIdSequence = 0;
+
     public CTEContext() {
         forceCTEList = Lists.newArrayList();
     }
@@ -57,11 +67,11 @@ public class CTEContext {
     public void reset() {
         produces = Lists.newArrayList();
         consumeNums = Maps.newHashMap();
-        requiredColumns = Maps.newHashMap();
         consumePredicates = Maps.newHashMap();
         consumeLimits = Maps.newHashMap();
 
         produceStatistics = Maps.newHashMap();
+        cteIdSequence = 0;
     }
 
     public void setEnableCTE(boolean enableCTE) {
@@ -74,6 +84,7 @@ public class CTEContext {
 
     public void addCTEProduce(int cteId) {
         this.produces.add(cteId);
+        cteIdSequence = Math.max(cteId, cteIdSequence);
     }
 
     public void setMaxCTELimit(int maxCTELimit) {
@@ -105,16 +116,6 @@ public class CTEContext {
             return 0;
         }
         return consumeNums.get(cteId);
-    }
-
-    public Map<Integer, ColumnRefSet> getRequiredColumns() {
-        return requiredColumns;
-    }
-
-    public ColumnRefSet getAllRequiredColumns() {
-        ColumnRefSet all = new ColumnRefSet();
-        requiredColumns.values().forEach(all::union);
-        return all;
     }
 
     public Map<Integer, List<ScalarOperator>> getConsumePredicates() {
@@ -236,5 +237,9 @@ public class CTEContext {
         }
 
         return false;
+    }
+
+    public int getNextCteId() {
+        return ++cteIdSequence;
     }
 }

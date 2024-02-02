@@ -1,17 +1,32 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.plan;
 
+import com.google.common.annotations.VisibleForTesting;
 import com.google.common.collect.Maps;
 import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.analysis.Expr;
-import com.starrocks.analysis.StatementBase;
 import com.starrocks.common.IdGenerator;
+import com.starrocks.common.util.ProfilingExecPlan;
 import com.starrocks.planner.PlanFragment;
 import com.starrocks.planner.PlanFragmentId;
 import com.starrocks.planner.PlanNodeId;
 import com.starrocks.planner.ScanNode;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.Explain;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.optimizer.OptExpression;
 import com.starrocks.sql.optimizer.operator.scalar.ColumnRefOperator;
 import com.starrocks.thrift.TExplainLevel;
@@ -20,6 +35,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 
 public class ExecPlan {
     private final ConnectContext connectContext;
@@ -37,6 +53,18 @@ public class ExecPlan {
 
     private final IdGenerator<PlanNodeId> nodeIdGenerator = PlanNodeId.createGenerator();
     private final IdGenerator<PlanFragmentId> fragmentIdGenerator = PlanFragmentId.createGenerator();
+    private final Map<Integer, OptExpression> optExpressions = Maps.newHashMap();
+
+    private volatile ProfilingExecPlan profilingPlan;
+
+    @VisibleForTesting
+    public ExecPlan() {
+        connectContext = new ConnectContext();
+        connectContext.setQueryId(new UUID(1, 2));
+        colNames = new ArrayList<>();
+        physicalPlan = null;
+        outputColumns = new ArrayList<>();
+    }
 
     public ExecPlan(ConnectContext connectContext, List<String> colNames,
                     OptExpression physicalPlan, List<ColumnRefOperator> outputColumns) {
@@ -60,6 +88,10 @@ public class ExecPlan {
 
     public ArrayList<PlanFragment> getFragments() {
         return fragments;
+    }
+
+    public PlanFragment getTopFragment() {
+        return fragments.get(0);
     }
 
     public DescriptorTable getDescTbl() {
@@ -100,6 +132,35 @@ public class ExecPlan {
 
     public List<ColumnRefOperator> getOutputColumns() {
         return outputColumns;
+    }
+
+    public void recordPlanNodeId2OptExpression(int id, OptExpression optExpression) {
+        optExpressions.put(id, optExpression);
+    }
+
+    public OptExpression getOptExpression(int planNodeId) {
+        return optExpressions.get(planNodeId);
+    }
+
+    public ProfilingExecPlan getProfilingPlan() {
+        if (profilingPlan == null) {
+            synchronized (this) {
+                if (profilingPlan == null) {
+                    boolean needSetCtx = ConnectContext.get() == null && this.connectContext != null;
+                    try {
+                        if (needSetCtx) {
+                            this.connectContext.setThreadLocalInfo();
+                        }
+                        profilingPlan = ProfilingExecPlan.buildFrom(this);
+                    } finally {
+                        if (needSetCtx) {
+                            ConnectContext.remove();
+                        }
+                    }
+                }
+            }
+        }
+        return profilingPlan;
     }
 
     public String getExplainString(TExplainLevel level) {

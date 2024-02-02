@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.load;
 
@@ -6,38 +19,48 @@ import com.google.common.collect.Lists;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Table;
+import com.starrocks.common.Config;
 import com.starrocks.common.FeConstants;
-import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.persist.InsertOverwriteStateChangeInfo;
+import com.starrocks.pseudocluster.PseudoCluster;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.InsertStmt;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
-import mockit.Mocked;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
+import java.sql.SQLException;
+
 public class InsertOverwriteJobRunnerTest {
 
     private static ConnectContext connectContext;
-
-    @Mocked
-    private InsertOverwriteJobManager insertOverwriteJobManager;
+    private static StarRocksAssert starRocksAssert;
+    private static PseudoCluster cluster;
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-        FeConstants.default_scheduler_interval_millisecond = 1000;
+        Config.bdbje_heartbeat_timeout_second = 60;
+        Config.bdbje_replica_ack_timeout_second = 60;
+        Config.bdbje_lock_timeout_second = 60;
+        // set some parameters to speedup test
+        Config.tablet_sched_checker_interval_seconds = 1;
+        Config.tablet_sched_repair_delay_factor_second = 1;
+        Config.enable_new_publish_mechanism = true;
+        PseudoCluster.getOrCreateWithRandomPort(true, 1);
+        GlobalStateMgr.getCurrentState().getTabletChecker().setInterval(1000);
+        cluster = PseudoCluster.getInstance();
+
         FeConstants.runningUnitTest = true;
-
-        UtFrameUtils.createMinStarRocksCluster();
-
+        Config.alter_scheduler_interval_millisecond = 100;
+        Config.dynamic_partition_enable = true;
+        Config.dynamic_partition_check_interval_seconds = 1;
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
-        connectContext.setQueryId(UUIDUtil.genUUID());
-        StarRocksAssert starRocksAssert = new StarRocksAssert(connectContext);
+        starRocksAssert = new StarRocksAssert(connectContext);
 
         starRocksAssert.withDatabase("insert_overwrite_test").useDatabase("insert_overwrite_test")
                 .withTable(
@@ -88,10 +111,10 @@ public class InsertOverwriteJobRunnerTest {
 
     @Test
     public void testInsertOverwriteFromStmtExecutor() throws Exception {
+        connectContext.getSessionVariable().setOptimizerExecuteTimeout(300000000);
         String sql = "insert overwrite t1 select * from t2";
-        InsertStmt insertStmt = (InsertStmt) UtFrameUtils.parseStmtWithNewParser(sql, connectContext);
-        StmtExecutor executor = new StmtExecutor(connectContext, insertStmt);
-        executor.handleInsertOverwrite(insertStmt);
+        cluster.runSql("insert_overwrite_test", sql);
+        Assert.assertFalse(GlobalStateMgr.getCurrentState().getTabletInvertedIndex().getForceDeleteTablets().isEmpty());
     }
 
     @Test
@@ -106,5 +129,12 @@ public class InsertOverwriteJobRunnerTest {
         InsertOverwriteJob insertOverwriteJob = new InsertOverwriteJob(100L, insertStmt, database.getId(), olapTable.getId());
         InsertOverwriteJobRunner runner = new InsertOverwriteJobRunner(insertOverwriteJob, connectContext, executor);
         Assert.assertFalse(runner.isFinished());
+    }
+
+    @Test
+    public void testInsertOverwriteWithDuplicatePartitions() throws SQLException {
+        connectContext.getSessionVariable().setOptimizerExecuteTimeout(300000000);
+        String sql = "insert overwrite t3 partitions(p1, p1) select * from t4";
+        cluster.runSql("insert_overwrite_test", sql);
     }
 }

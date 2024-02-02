@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/http/meta/ColocateMetaService.java
 
@@ -22,12 +35,17 @@
 package com.starrocks.http.meta;
 
 import com.google.common.base.Preconditions;
+import com.google.common.base.Strings;
 import com.google.gson.Gson;
 import com.google.gson.reflect.TypeToken;
 import com.starrocks.catalog.ColocateGroupSchema;
 import com.starrocks.catalog.ColocateTableIndex;
 import com.starrocks.catalog.ColocateTableIndex.GroupId;
+import com.starrocks.catalog.Database;
+import com.starrocks.catalog.OlapTable;
 import com.starrocks.common.DdlException;
+import com.starrocks.common.util.concurrent.lock.LockType;
+import com.starrocks.common.util.concurrent.lock.Locker;
 import com.starrocks.http.ActionController;
 import com.starrocks.http.BaseRequest;
 import com.starrocks.http.BaseResponse;
@@ -35,10 +53,11 @@ import com.starrocks.http.IllegalArgException;
 import com.starrocks.http.rest.RestBaseAction;
 import com.starrocks.http.rest.RestBaseResult;
 import com.starrocks.http.rest.RestResult;
-import com.starrocks.mysql.privilege.PrivPredicate;
 import com.starrocks.persist.ColocatePersistInfo;
+import com.starrocks.privilege.AccessDeniedException;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.ast.UserIdentity;
 import io.netty.handler.codec.http.HttpMethod;
 import io.netty.handler.codec.http.HttpResponseStatus;
 import org.apache.logging.log4j.LogManager;
@@ -71,7 +90,7 @@ public class ColocateMetaService {
     private static final String GROUP_ID = "group_id";
     private static final String DB_ID = "db_id";
 
-    private static ColocateTableIndex colocateIndex = GlobalStateMgr.getCurrentColocateIndex();
+    private static ColocateTableIndex colocateIndex = GlobalStateMgr.getCurrentState().getColocateTableIndex();
 
     private static GroupId checkAndGetGroupId(BaseRequest request) throws DdlException {
         long grpId = Long.valueOf(request.getSingleParameter(GROUP_ID).trim());
@@ -91,11 +110,12 @@ public class ColocateMetaService {
 
         @Override
         public void executeWithoutPassword(BaseRequest request, BaseResponse response)
-                throws DdlException {
+                throws DdlException, AccessDeniedException {
             if (redirectToLeader(request, response)) {
                 return;
             }
-            checkGlobalAuth(ConnectContext.get().getCurrentUserIdentity(), PrivPredicate.ADMIN);
+            UserIdentity currentUser = ConnectContext.get().getCurrentUserIdentity();
+            checkUserOwnsAdminRole(currentUser);
             executeInLeaderWithAdmin(request, response);
         }
 
@@ -122,7 +142,7 @@ public class ColocateMetaService {
                 throws DdlException {
             response.setContentType("application/json");
             RestResult result = new RestResult();
-            result.addResultEntry("colocate_meta", GlobalStateMgr.getCurrentColocateIndex());
+            result.addResultEntry("colocate_meta", GlobalStateMgr.getCurrentState().getColocateTableIndex());
             sendResult(request, response, result);
         }
     }
@@ -183,6 +203,94 @@ public class ColocateMetaService {
         }
     }
 
+    // only applies to lake table
+    public static class UpdateGroupAction extends ColocateMetaBaseAction {
+        private static final String TABLE_ID = "table_id";
+        private static final String IS_JOIN = "is_join";
+
+        UpdateGroupAction(ActionController controller) {
+            super(controller);
+        }
+
+        public static void registerAction(ActionController controller) throws IllegalArgException {
+            UpdateGroupAction action = new UpdateGroupAction(controller);
+            controller.registerHandler(HttpMethod.POST, "/api/colocate/update_group", action);
+        }
+
+        @Override
+        public void executeInLeaderWithAdmin(BaseRequest request, BaseResponse response)
+                throws DdlException {
+            HttpMethod method = request.getRequest().method();
+            if (!method.equals(HttpMethod.POST)) {
+                response.appendContent(new RestBaseResult("HTTP method is not allowed.").toJson());
+                writeResponse(request, response, HttpResponseStatus.METHOD_NOT_ALLOWED);
+            }
+            long dbId = Long.valueOf(request.getSingleParameter(DB_ID).trim());
+            if (dbId <= 0) {
+                response.appendContent("Bad db_id parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            long grpId = Long.valueOf(request.getSingleParameter(GROUP_ID).trim());
+            if (grpId <= 0) {
+                response.appendContent("Bad group_id parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            GroupId groupId = new GroupId(dbId, grpId);
+            long tableId = Long.valueOf(request.getSingleParameter(TABLE_ID).trim());
+            if (tableId <= 0) {
+                response.appendContent("Bad table_id parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            String isJoinStr = request.getSingleParameter(IS_JOIN);
+            boolean isJoin = true;
+            if (Strings.isNullOrEmpty(isJoinStr)) {
+                response.appendContent("Missing is_join parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            if (!isJoinStr.equalsIgnoreCase("true") && !isJoinStr.equalsIgnoreCase("false")) {
+                response.appendContent("Invalid is_join parameter");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            if (isJoinStr.equalsIgnoreCase("true")) {
+                isJoin = true;
+            } else {
+                isJoin = false;
+            }
+
+            Database db = GlobalStateMgr.getCurrentState().getLocalMetastore().getDbIncludeRecycleBin(groupId.dbId);
+            if (db == null) {
+                response.appendContent("Non-exist db");
+                writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                return;
+            }
+            Locker locker = new Locker();
+            locker.lockDatabase(db, LockType.WRITE);
+            try {
+                OlapTable table = (OlapTable) globalStateMgr.getLocalMetastore().getTableIncludeRecycleBin(db, tableId);
+                if (table == null) {
+                    response.appendContent("Non-exist table");
+                    writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                    return;
+                }
+                if (!table.isCloudNativeTable()) {
+                    response.appendContent("Not-supported table type");
+                    writeResponse(request, response, HttpResponseStatus.BAD_REQUEST);
+                    return;
+                }
+                colocateIndex.updateLakeTableColocationInfo(table, isJoin, groupId);
+                response.appendContent("update succeed");
+                sendResult(request, response);
+            } finally {
+                locker.unLockDatabase(db, LockType.WRITE);
+            }
+        }
+    }
+
     // update a backendsPerBucketSeq meta for a colocate group
     public static class BucketSeqAction extends ColocateMetaBaseAction {
         private static final Logger LOG = LogManager.getLogger(BucketSeqAction.class);
@@ -207,14 +315,14 @@ public class ColocateMetaService {
             List<List<Long>> backendsPerBucketSeq = new Gson().fromJson(meta, type);
             LOG.info("get buckets sequence: {}", backendsPerBucketSeq);
 
-            ColocateGroupSchema groupSchema = GlobalStateMgr.getCurrentColocateIndex().getGroupSchema(groupId);
+            ColocateGroupSchema groupSchema = GlobalStateMgr.getCurrentState().getColocateTableIndex().getGroupSchema(groupId);
             if (backendsPerBucketSeq.size() != groupSchema.getBucketsNum()) {
                 throw new DdlException("Invalid bucket num. expected: " + groupSchema.getBucketsNum() + ", actual: "
                         + backendsPerBucketSeq.size());
             }
 
             List<Long> clusterBackendIds =
-                    GlobalStateMgr.getCurrentSystemInfo().getBackendIds(true);
+                    GlobalStateMgr.getCurrentState().getNodeMgr().getClusterInfo().getBackendIds(true);
             //check the Backend id
             for (List<Long> backendIds : backendsPerBucketSeq) {
                 if (backendIds.size() != groupSchema.getReplicationNum()) {
@@ -233,6 +341,14 @@ public class ColocateMetaService {
                     backendsPerBucketSeq.size() + " vs. " + bucketsNum);
             updateBackendPerBucketSeq(groupId, backendsPerBucketSeq);
             LOG.info("the group {} backendsPerBucketSeq meta has been changed to {}", groupId, backendsPerBucketSeq);
+
+            List<ColocateTableIndex.GroupId> colocateWithGroupsInOtherDb =
+                    colocateIndex.getColocateWithGroupsInOtherDb(groupId);
+            for (GroupId gid : colocateWithGroupsInOtherDb) {
+                updateBackendPerBucketSeq(gid, backendsPerBucketSeq);
+                LOG.info("the group {} backendsPerBucketSeq meta has been changed to {}",
+                        gid, backendsPerBucketSeq);
+            }
 
             sendResult(request, response);
         }

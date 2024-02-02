@@ -1,6 +1,18 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
-#include "exec/vectorized/schema_scanner/schema_columns_scanner.h"
+#include "exec/schema_scanner/schema_columns_scanner.h"
 
 #include <gtest/gtest.h>
 
@@ -8,7 +20,7 @@
 #include <tuple>
 #include <vector>
 
-namespace starrocks::vectorized {
+namespace starrocks {
 class SchemaColumnsScannerTest : public ::testing::Test {};
 
 TEST_F(SchemaColumnsScannerTest, test_to_decimal_to_type_string) {
@@ -22,9 +34,9 @@ TEST_F(SchemaColumnsScannerTest, test_to_decimal_to_type_string) {
             {TPrimitiveType::DECIMAL128, 27, 9, false, std::string("decimal"), std::string("decimal(-1,-1)")},
     };
     for (auto& tc : test_cases) {
-        auto [ptype, precision, scale, is_set, mysql_type_string, type_string] = tc;
+        auto [ltype, precision, scale, is_set, mysql_type_string, type_string] = tc;
         TColumnDesc columnDesc;
-        columnDesc.columnType = ptype;
+        columnDesc.columnType = ltype;
         if (is_set) {
             columnDesc.__set_columnPrecision(precision);
             columnDesc.__set_columnScale(scale);
@@ -35,4 +47,4 @@ TEST_F(SchemaColumnsScannerTest, test_to_decimal_to_type_string) {
         ASSERT_EQ(actual_type_string, type_string);
     }
 }
-} // namespace starrocks::vectorized
+} // namespace starrocks

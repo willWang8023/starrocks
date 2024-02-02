@@ -1,32 +1,3 @@
-[sql]
-select
-    l_shipmode,
-    sum(case
-            when o_orderpriority = '1-URGENT'
-                or o_orderpriority = '2-HIGH'
-                then cast (1 as bigint)
-            else cast(0 as bigint)
-        end) as high_line_count,
-    sum(case
-            when o_orderpriority <> '1-URGENT'
-                and o_orderpriority <> '2-HIGH'
-                then cast (1 as bigint)
-            else cast(0 as bigint)
-        end) as low_line_count
-from
-    orders,
-    lineitem
-where
-        o_orderkey = l_orderkey
-  and l_shipmode in ('REG AIR', 'MAIL')
-  and l_commitdate < l_receiptdate
-  and l_shipdate < l_commitdate
-  and l_receiptdate >= date '1997-01-01'
-  and l_receiptdate < date '1998-01-01'
-group by
-    l_shipmode
-order by
-    l_shipmode ;
 [fragment statistics]
 PLAN FRAGMENT 0(F04)
 Output Exprs:25: L_SHIPMODE | 30: sum | 31: sum
@@ -34,6 +5,7 @@ Input Partition: UNPARTITIONED
 RESULT SINK
 
 10:MERGING-EXCHANGE
+distribution type: GATHER
 cardinality: 2
 column statistics:
 * L_SHIPMODE-->[-Infinity, Infinity, 0.0, 10.0, 2.0] ESTIMATE
@@ -65,6 +37,8 @@ OutPut Exchange Id: 10
 |  * sum-->[-Infinity, Infinity, 0.0, 8.0, 2.0] ESTIMATE
 |
 7:EXCHANGE
+distribution type: SHUFFLE
+partition exprs: [25: L_SHIPMODE, VARCHAR, false]
 cardinality: 2
 
 PLAN FRAGMENT 2(F00)
@@ -110,6 +84,8 @@ OutPut Exchange Id: 07
 |  * case-->[-Infinity, Infinity, 0.0, 8.0, 2.0] ESTIMATE
 |
 |----3:EXCHANGE
+|       distribution type: SHUFFLE
+|       partition exprs: [11: L_ORDERKEY, INT, false]
 |       cardinality: 6508504
 |
 0:OlapScanNode

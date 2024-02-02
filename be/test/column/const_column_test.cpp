@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "column/const_column.h"
 
@@ -6,9 +18,10 @@
 
 #include "column/binary_column.h"
 #include "column/fixed_length_column.h"
+#include "column/json_column.h"
 #include "testutil/parallel_test.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // NOLINTNEXTLINE
 PARALLEL_TEST(ConstColumnTest, test_const_column_upgrade_if_overflow) {
@@ -318,4 +331,51 @@ PARALLEL_TEST(ConstColumnTest, test_clone_empty) {
     ASSERT_TRUE(c2->data_column().unique());
 }
 
-} // namespace starrocks::vectorized
+// NOLINTNEXTLINE
+PARALLEL_TEST(ConstColumnTest, test_replicate) {
+    auto create_const_column = [](int32_t value, size_t size) {
+        auto c = Int32Column::create();
+        c->append_numbers(&value, sizeof(value));
+        return ConstColumn::create(c, size);
+    };
+
+    auto c1 = create_const_column(1, 3);
+
+    ASSERT_EQ(3, c1->size());
+
+    Offsets offsets;
+    offsets.push_back(0);
+    offsets.push_back(2);
+    offsets.push_back(5);
+    offsets.push_back(7);
+
+    auto c2 = c1->replicate(offsets);
+
+    ASSERT_EQ(7, c2->size());
+    ASSERT_EQ(1, c2->get(6).get_int32());
+}
+
+PARALLEL_TEST(ConstColumnTest, test_reference_memory_usage) {
+    {
+        auto create_int_const_column = [](int32_t value, size_t size) {
+            auto c = Int32Column::create();
+            c->append_numbers(&value, sizeof(value));
+            return ConstColumn::create(c, size);
+        };
+
+        auto column = create_int_const_column(1, 10);
+        ASSERT_EQ(0, column->reference_memory_usage());
+    }
+    {
+        auto create_json_const_column = [](const std::string& json_str, size_t size) {
+            auto c = JsonColumn::create();
+            auto json_value = JsonValue::parse(json_str).value();
+            c->append_datum(&json_value);
+            return ConstColumn::create(c, size);
+        };
+        auto column = create_json_const_column("1", 10);
+        ASSERT_EQ(2, column->reference_memory_usage());
+    }
+}
+
+} // namespace starrocks

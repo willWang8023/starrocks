@@ -1,41 +1,3 @@
-[sql]
-select
-    s_suppkey,
-    s_name,
-    s_address,
-    s_phone,
-    total_revenue
-from
-    supplier,
-    (	select
-             l_suppkey as supplier_no,
-             sum(l_extendedprice * (1 - l_discount)) as total_revenue
-         from
-             lineitem
-         where
-                 l_shipdate >= date '1995-07-01'
-           and l_shipdate < date '1995-10-01'
-         group by
-             l_suppkey) a
-where
-        s_suppkey = supplier_no
-  and total_revenue = (
-    select
-        max(total_revenue)
-    from
-        (	select
-                 l_suppkey as supplier_no,
-                 sum(l_extendedprice * (1 - l_discount)) as total_revenue
-             from
-                 lineitem
-             where
-                     l_shipdate >= date '1995-07-01'
-               and l_shipdate < date '1995-10-01'
-             group by
-                 l_suppkey) b
-)
-order by
-    s_suppkey;
 [fragment statistics]
 PLAN FRAGMENT 0(F08)
 Output Exprs:1: s_suppkey | 2: s_name | 3: s_address | 5: s_phone | 25: sum
@@ -43,6 +5,7 @@ Input Partition: UNPARTITIONED
 RESULT SINK
 
 24:MERGING-EXCHANGE
+distribution type: GATHER
 cardinality: 1
 column statistics:
 * s_suppkey-->[1.0, 1000000.0, 0.0, 4.0, 1.0] ESTIMATE
@@ -101,6 +64,7 @@ OutPut Exchange Id: 24
 |  * sum-->[810.9, 104949.5, 0.0, 16.0, 1.0] ESTIMATE
 |
 |----20:EXCHANGE
+|       distribution type: BROADCAST
 |       cardinality: 1
 |
 0:HdfsScanNode
@@ -108,7 +72,6 @@ TABLE: supplier
 NON-PARTITION PREDICATES: 1: s_suppkey IS NOT NULL
 partitions=1/1
 avgRowSize=84.0
-numNodes=0
 cardinality: 1000000
 probe runtime filters:
 - filter_id = 1, probe_expr = (1: s_suppkey)
@@ -146,6 +109,7 @@ OutPut Exchange Id: 20
 |  * max-->[810.9, 104949.5, 0.0, 16.0, 1.0] ESTIMATE
 |
 |----17:EXCHANGE
+|       distribution type: BROADCAST
 |       cardinality: 1
 |
 5:AGGREGATE (merge finalize)
@@ -160,6 +124,8 @@ OutPut Exchange Id: 20
 |  * sum-->[810.9, 104949.5, 0.0, 16.0, 1000000.0] ESTIMATE
 |
 4:EXCHANGE
+distribution type: SHUFFLE
+partition exprs: [10: l_suppkey, INT, true]
 cardinality: 1000000
 
 PLAN FRAGMENT 3(F05)
@@ -187,6 +153,7 @@ OutPut Exchange Id: 17
 |  * max-->[810.9, 104949.5, 0.0, 16.0, 1.0] ESTIMATE
 |
 13:EXCHANGE
+distribution type: GATHER
 cardinality: 1
 
 PLAN FRAGMENT 4(F04)
@@ -217,6 +184,8 @@ OutPut Exchange Id: 13
 |  * sum-->[810.9, 104949.5, 0.0, 16.0, 1000000.0] ESTIMATE
 |
 9:EXCHANGE
+distribution type: SHUFFLE
+partition exprs: [28: l_suppkey, INT, true]
 cardinality: 1000000
 
 PLAN FRAGMENT 5(F03)
@@ -246,10 +215,9 @@ OutPut Exchange Id: 09
 6:HdfsScanNode
 TABLE: lineitem
 NON-PARTITION PREDICATES: 36: l_shipdate >= '1995-07-01', 36: l_shipdate < '1995-10-01'
-MIN/MAX PREDICATES: 46: l_shipdate >= '1995-07-01', 47: l_shipdate < '1995-10-01'
+MIN/MAX PREDICATES: 36: l_shipdate >= '1995-07-01', 36: l_shipdate < '1995-10-01'
 partitions=1/1
 avgRowSize=40.0
-numNodes=0
 cardinality: 21862767
 column statistics:
 * l_suppkey-->[1.0, 1000000.0, 0.0, 4.0, 1000000.0] ESTIMATE
@@ -285,10 +253,9 @@ OutPut Exchange Id: 04
 1:HdfsScanNode
 TABLE: lineitem
 NON-PARTITION PREDICATES: 18: l_shipdate >= '1995-07-01', 18: l_shipdate < '1995-10-01'
-MIN/MAX PREDICATES: 48: l_shipdate >= '1995-07-01', 49: l_shipdate < '1995-10-01'
+MIN/MAX PREDICATES: 18: l_shipdate >= '1995-07-01', 18: l_shipdate < '1995-10-01'
 partitions=1/1
 avgRowSize=40.0
-numNodes=0
 cardinality: 21862767
 column statistics:
 * l_suppkey-->[1.0, 1000000.0, 0.0, 4.0, 1000000.0] ESTIMATE

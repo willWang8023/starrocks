@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/ClientPool.java
 
@@ -34,6 +47,9 @@ public class ClientPool {
     static GenericKeyedObjectPoolConfig backendConfig = new GenericKeyedObjectPoolConfig();
     static int backendTimeoutMs = 60000; // 1min
 
+    static GenericKeyedObjectPoolConfig brokerPoolConfig = new GenericKeyedObjectPoolConfig();
+    public static int brokerTimeoutMs = Config.broker_client_timeout_ms;
+
     static {
         heartbeatConfig.setLifo(true);            // set Last In First Out strategy
         heartbeatConfig.setMaxIdlePerKey(2);      // (default 2)
@@ -52,9 +68,6 @@ public class ClientPool {
         backendConfig.setMaxWaitMillis(500);    //  wait for the connection
     }
 
-    static GenericKeyedObjectPoolConfig brokerPoolConfig = new GenericKeyedObjectPoolConfig();
-    public static int brokerTimeoutMs = Config.broker_client_timeout_ms;
-
     static {
         brokerPoolConfig.setLifo(true);            // set Last In First Out strategy
         brokerPoolConfig.setMaxIdlePerKey(128);    // (default 128)
@@ -64,8 +77,10 @@ public class ClientPool {
         brokerPoolConfig.setMaxWaitMillis(500);    //  wait for the connection
     }
 
-    public static GenericPool<HeartbeatService.Client> heartbeatPool =
+    public static GenericPool<HeartbeatService.Client> beHeartbeatPool =
             new GenericPool("HeartbeatService", heartbeatConfig, heartbeatTimeoutMs);
+    public static GenericPool<TFileBrokerService.Client> brokerHeartbeatPool =
+            new GenericPool("TFileBrokerService", heartbeatConfig, heartbeatTimeoutMs);
     public static GenericPool<FrontendService.Client> frontendPool =
             new GenericPool("FrontendService", backendConfig, backendTimeoutMs);
     public static GenericPool<BackendService.Client> backendPool =

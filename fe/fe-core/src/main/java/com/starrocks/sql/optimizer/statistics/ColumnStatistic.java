@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.sql.optimizer.statistics;
 
@@ -9,7 +21,7 @@ import static java.lang.Double.NaN;
 import static java.lang.Double.POSITIVE_INFINITY;
 
 public class ColumnStatistic {
-    private enum StatisticType {
+    public enum StatisticType {
         UNKNOWN,
         ESTIMATE
     }
@@ -28,6 +40,11 @@ public class ColumnStatistic {
     private final double distinctValuesCount;
     private final Histogram histogram;
     private final StatisticType type;
+
+    // for iceberg test
+    // @todo refactor this!
+    private String minString = null;
+    private String maxString = null;
 
     // TODO deal with string max, min
     public ColumnStatistic(
@@ -53,6 +70,22 @@ public class ColumnStatistic {
                            double averageRowSize,
                            double distinctValuesCount) {
         this(minValue, maxValue, nullsFraction, averageRowSize, distinctValuesCount, null, StatisticType.ESTIMATE);
+    }
+
+    public String getMinString() {
+        return minString;
+    }
+
+    public void setMinString(String minString) {
+        this.minString = minString;
+    }
+
+    public String getMaxString() {
+        return maxString;
+    }
+
+    public void setMaxString(String maxString) {
+        this.maxString = maxString;
     }
 
     public double getMinValue() {
@@ -117,8 +150,8 @@ public class ColumnStatistic {
     }
 
     public static Builder buildFrom(ColumnStatistic other) {
-        return new Builder(other.minValue, other.maxValue, other.nullsFraction, other.averageRowSize,
-                other.distinctValuesCount, other.histogram, other.type);
+        return new Builder(other.minString, other.maxString, other.minValue, other.maxValue,
+                other.nullsFraction, other.averageRowSize, other.distinctValuesCount, other.histogram, other.type);
     }
 
     public static Builder buildFrom(String columnStatistic) {
@@ -127,11 +160,25 @@ public class ColumnStatistic {
         String typeString = endIndex == columnStatistic.length() - 1 ? "" : columnStatistic.substring(endIndex + 2);
 
         String[] valueArray = valueString.split(",");
-        Preconditions.checkState(valueArray.length == 5);
+        Preconditions.checkState(valueArray.length == 5,
+                "statistic value: %s is illegal", valueString);
 
-        Builder builder = new Builder(Double.parseDouble(valueArray[0]), Double.parseDouble(valueArray[1]),
+        double minValue = Double.parseDouble(valueArray[0]);
+        double maxValue = Double.parseDouble(valueArray[1]);
+        double distinctValues = Double.parseDouble(valueArray[4]);
+
+        if (minValue > maxValue) {
+            minValue = Double.NEGATIVE_INFINITY;
+            maxValue = Double.POSITIVE_INFINITY;
+        }
+
+        if (distinctValues <= 0) {
+            distinctValues = 1;
+        }
+
+        Builder builder = new Builder(minValue, maxValue,
                 Double.parseDouble(valueArray[2]), Double.parseDouble(valueArray[3]),
-                Double.parseDouble(valueArray[4]));
+                distinctValues);
         if (!typeString.isEmpty()) {
             builder.setType(StatisticType.valueOf(typeString));
         } else if (builder.build().isUnknownValue()) {
@@ -152,6 +199,8 @@ public class ColumnStatistic {
         private double distinctValuesCount = NaN;
         private Histogram histogram;
         private StatisticType type = StatisticType.ESTIMATE;
+        private String minString = null;
+        private String maxString = null;
 
         private Builder() {
         }
@@ -159,6 +208,16 @@ public class ColumnStatistic {
         private Builder(double minValue, double maxValue, double nullsFraction, double averageRowSize,
                         double distinctValuesCount, Histogram histogram,
                         StatisticType type) {
+            this(null, null, minValue, maxValue, nullsFraction,
+                    averageRowSize, distinctValuesCount, histogram, type);
+        }
+
+        private Builder(String maxString, String minString, double minValue, double maxValue,
+                        double nullsFraction, double averageRowSize,
+                        double distinctValuesCount, Histogram histogram,
+                        StatisticType type) {
+            this.maxString = maxString;
+            this.minString = minString;
             this.minValue = minValue;
             this.maxValue = maxValue;
             this.nullsFraction = nullsFraction;
@@ -208,8 +267,22 @@ public class ColumnStatistic {
             return this;
         }
 
+        public Builder setMinString(String minString) {
+            this.minString = minString;
+            return this;
+        }
+
+        public Builder setMaxString(String maxString) {
+            this.maxString = maxString;
+            return this;
+        }
+
         public ColumnStatistic build() {
-            return new ColumnStatistic(minValue, maxValue, nullsFraction, averageRowSize, distinctValuesCount, histogram, type);
+            ColumnStatistic columnStatistic = new ColumnStatistic(
+                    minValue, maxValue, nullsFraction, averageRowSize, distinctValuesCount, histogram, type);
+            columnStatistic.setMaxString(maxString);
+            columnStatistic.setMinString(minString);
+            return columnStatistic;
         }
     }
 }

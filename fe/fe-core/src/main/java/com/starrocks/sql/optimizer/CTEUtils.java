@@ -1,10 +1,21 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer;
 
 import com.google.common.base.Preconditions;
-import com.google.common.collect.Lists;
-import com.starrocks.sql.optimizer.base.ColumnRefSet;
 import com.starrocks.sql.optimizer.operator.OperatorType;
 import com.starrocks.sql.optimizer.operator.logical.LogicalCTEAnchorOperator;
 import com.starrocks.sql.optimizer.operator.logical.LogicalCTEConsumeOperator;
@@ -13,77 +24,50 @@ import com.starrocks.sql.optimizer.statistics.ColumnStatistic;
 import com.starrocks.sql.optimizer.statistics.Statistics;
 import com.starrocks.sql.optimizer.statistics.StatisticsCalculator;
 
-import java.util.LinkedList;
+import java.util.BitSet;
 
 public class CTEUtils {
-
     public static void collectCteOperators(OptExpression anchor, OptimizerContext context) {
         context.getCteContext().reset();
-        collectCteProduce(anchor, context);
-        collectCteConsume(anchor, context);
+        collectCteOperatorsImpl(anchor, context, new BitSet());
     }
 
-    /*
-     * Estimate the complexity of the produce plan
-     * */
-    private static void collectCteProduce(OptExpression root, OptimizerContext context) {
-        for (OptExpression child : root.getInputs()) {
-            collectCteProduce(child, context);
-        }
-
-        if (OperatorType.LOGICAL_CTE_PRODUCE.equals(root.getOp().getOpType())) {
+    public static void collectCteOperatorsImpl(OptExpression root, OptimizerContext context, BitSet searchConsume) {
+        if (OperatorType.LOGICAL_CTE_ANCHOR.equals(root.getOp().getOpType())) {
             // produce
-            LogicalCTEProduceOperator produce = (LogicalCTEProduceOperator) root.getOp();
-            context.getCteContext().addCTEProduce(produce.getCteId());
+            LogicalCTEAnchorOperator anchor = (LogicalCTEAnchorOperator) root.getOp();
+            context.getCteContext().addCTEProduce(anchor.getCteId());
+
+            Preconditions.checkState(root.getInputs().get(0).getOp() instanceof LogicalCTEProduceOperator);
+            LogicalCTEProduceOperator produce = (LogicalCTEProduceOperator) root.getInputs().get(0).getOp();
+            Preconditions.checkState(produce.getCteId() == anchor.getCteId());
+
+            BitSet left = (BitSet) searchConsume.clone();
+            collectCteOperatorsImpl(root.inputAt(0), context, left);
+
+            BitSet right = (BitSet) searchConsume.clone();
+            right.set(anchor.getCteId());
+            collectCteOperatorsImpl(root.inputAt(1), context, right);
+            return;
         }
-    }
 
-    private static void collectCteConsume(OptExpression root, OptimizerContext context) {
-        for (Integer cteId : context.getCteContext().getAllCTEProduce()) {
-            OptExpression anchor = findCteAnchor(root, cteId);
-            Preconditions.checkNotNull(anchor);
-            collectCteConsumeImpl(anchor, cteId, context);
-        }
-    }
-
-    private static OptExpression findCteAnchor(OptExpression root, Integer cteId) {
-        LinkedList<OptExpression> queue = Lists.newLinkedList();
-        queue.addLast(root);
-
-        while (!queue.isEmpty()) {
-            OptExpression expression = queue.pollFirst();
-            if (OperatorType.LOGICAL_CTE_ANCHOR.equals(expression.getOp().getOpType()) &&
-                    ((LogicalCTEAnchorOperator) expression.getOp()).getCteId() == cteId) {
-                return expression.getInputs().get(1);
-            }
-
-            expression.getInputs().forEach(queue::addLast);
-        }
-        return null;
-    }
-
-    private static void collectCteConsumeImpl(OptExpression root, Integer cteId, OptimizerContext context) {
         if (OperatorType.LOGICAL_CTE_CONSUME.equals(root.getOp().getOpType())) {
-            if (((LogicalCTEConsumeOperator) root.getOp()).getCteId() != cteId) {
-                // not ask children
-                return;
-            }
             // consumer
             LogicalCTEConsumeOperator consume = (LogicalCTEConsumeOperator) root.getOp();
-            context.getCteContext().addCTEConsume(consume.getCteId());
 
-            // required columns
-            ColumnRefSet requiredColumnRef =
-                    context.getCteContext().getRequiredColumns().getOrDefault(consume.getCteId(), new ColumnRefSet());
-            consume.getCteOutputColumnRefMap().values().forEach(requiredColumnRef::union);
-            context.getCteContext().getRequiredColumns().put(consume.getCteId(), requiredColumnRef);
+            if (searchConsume.get(consume.getCteId())) {
+                context.getCteContext().addCTEConsume(consume.getCteId());
+                searchConsume = new BitSet();
+            }
 
-            // not ask children
+            if (root.arity() > 0) {
+                collectCteOperatorsImpl(root.inputAt(0), context, searchConsume);
+            }
             return;
         }
 
         for (OptExpression child : root.getInputs()) {
-            collectCteConsumeImpl(child, cteId, context);
+            collectCteOperatorsImpl(child, context, searchConsume);
         }
     }
 
@@ -104,14 +88,22 @@ public class CTEUtils {
             LogicalCTEProduceOperator produce = (LogicalCTEProduceOperator) expression.getOp();
 
             // costs
-            if (context.getCteContext().isForceCTE(produce.getCteId())) {
-                OptExpression opt = root.extractLogicalTree();
-                calculateStatistics(opt, context);
-                context.getCteContext().addCTEStatistics(produce.getCteId(), opt.getStatistics());
-            }
+            OptExpression opt = root.extractLogicalTree();
+            calculateStatistics(opt, context);
+            context.getCteContext().addCTEStatistics(produce.getCteId(), opt.getStatistics());
         }
     }
 
+    // Collect statistics of CTEProduceOperator outside of memo, used by only by table pruning features.
+    public static void collectForceCteStatisticsOutsideMemo(OptExpression root, OptimizerContext context) {
+        root.getInputs().forEach(input -> collectForceCteStatisticsOutsideMemo(input, context));
+        if (OperatorType.LOGICAL_CTE_ANCHOR.equals(root.getOp().getOpType())) {
+            Preconditions.checkState(root.getInputs().get(0).getOp() instanceof LogicalCTEProduceOperator);
+            LogicalCTEProduceOperator produce = (LogicalCTEProduceOperator) root.getInputs().get(0).getOp();
+            calculateStatistics(root.inputAt(0), context);
+            context.getCteContext().addCTEStatistics(produce.getCteId(), root.inputAt(0).getStatistics());
+        }
+    }
     private static void calculateStatistics(OptExpression expr, OptimizerContext context) {
         // don't ask cte consume children
         if (expr.getOp().getOpType() != OperatorType.LOGICAL_CTE_CONSUME) {

@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.google.common.collect.ImmutableList;
@@ -6,6 +19,7 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Sets;
 import com.google.common.collect.Streams;
 import com.starrocks.analysis.AnalyticExpr;
+import com.starrocks.analysis.CastExpr;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.FunctionCallExpr;
 import com.starrocks.analysis.GroupByClause;
@@ -28,6 +42,7 @@ import com.starrocks.sql.ast.SelectListItem;
 import com.starrocks.sql.common.StarRocksPlannerException;
 
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
@@ -71,10 +86,11 @@ public class SelectAnalyzer {
         analyzeHaving(havingClause, analyzeState, sourceScope, outputScope, outputExpressions);
 
         // Construct sourceAndOutputScope with sourceScope and outputScope
-        Scope sourceAndOutputScope = computeAndAssignOrderScope(analyzeState, sourceScope, outputScope);
+        Scope sourceAndOutputScope = computeAndAssignOrderScope(analyzeState, sourceScope, outputScope,
+                selectList.isDistinct());
 
         List<OrderByElement> orderByElements =
-                analyzeOrderBy(sortClause, analyzeState, sourceAndOutputScope, outputExpressions);
+                analyzeOrderBy(sortClause, analyzeState, sourceAndOutputScope, outputExpressions, selectList.isDistinct());
         List<Expr> orderByExpressions =
                 orderByElements.stream().map(OrderByElement::getExpr).collect(Collectors.toList());
 
@@ -92,6 +108,10 @@ public class SelectAnalyzer {
                     selectList.getItems().stream().anyMatch(SelectListItem::isStar) &&
                     !selectList.isDistinct()) {
                 throw new SemanticException("cannot combine '*' in select list with GROUP BY: *");
+            }
+
+            if (!aggregates.isEmpty() && selectList.isDistinct()) {
+                throw new SemanticException("cannot combine SELECT DISTINCT with aggregate functions or GROUP BY");
             }
 
             new AggregationAnalyzer(session, analyzeState, groupByExpressions, sourceScope, null)
@@ -156,8 +176,7 @@ public class SelectAnalyzer {
             }
 
             List<Expr> orderSourceExpressions = Streams.concat(
-                    aggregationsInOrderBy.stream(),
-                    groupByExpressions.stream()).collect(Collectors.toList());
+                    aggregationsInOrderBy.stream(), groupByExpressions.stream()).collect(Collectors.toList());
 
             List<Field> sourceForOrderFields = orderSourceExpressions.stream()
                     .map(expression ->
@@ -165,20 +184,12 @@ public class SelectAnalyzer {
                     .collect(Collectors.toList());
 
             Scope sourceScopeForOrder = new Scope(RelationId.anonymous(), new RelationFields(sourceForOrderFields));
-            sourceAndOutputScope = new Scope(outputScope.getRelationId(), outputScope.getRelationFields());
-            sourceAndOutputScope.setParent(sourceScopeForOrder);
-            analyzeState.setOrderScope(sourceAndOutputScope);
+            computeAndAssignOrderScope(analyzeState, sourceScopeForOrder, outputScope, selectList.isDistinct());
             analyzeState.setOrderSourceExpressions(orderSourceExpressions);
         }
 
         if (limitElement != null && limitElement.hasLimit()) {
-            if (limitElement.getOffset() > 0 && orderByElements.isEmpty()) {
-                // The offset can only be processed in sort,
-                // so when there is no order by, we manually set offset to 0
-                analyzeState.setLimit(new LimitElement(0, limitElement.getLimit()));
-            } else {
-                analyzeState.setLimit(new LimitElement(limitElement.getOffset(), limitElement.getLimit()));
-            }
+            analyzeState.setLimit(new LimitElement(limitElement.getOffset(), limitElement.getLimit()));
         }
     }
 
@@ -186,6 +197,7 @@ public class SelectAnalyzer {
                                      AnalyzeState analyzeState, Scope scope) {
         ImmutableList.Builder<Expr> outputExpressionBuilder = ImmutableList.builder();
         ImmutableList.Builder<Field> outputFields = ImmutableList.builder();
+        List<Integer> outputExprInOrderByScope = new ArrayList<>();
 
         for (SelectListItem item : selectList.getItems()) {
             if (item.isStar()) {
@@ -201,9 +213,9 @@ public class SelectAnalyzer {
                 }
                 if (fields.isEmpty()) {
                     if (item.getTblName() != null) {
-                        throw new SemanticException("Table %s not found", item.getTblName());
+                        throw new SemanticException("Unknown table '%s'", item.getTblName());
                     }
-                    if (fromRelation != null) {
+                    if (fromRelation == null) {
                         throw new SemanticException("SELECT * not allowed in queries without FROM clause");
                     }
                     throw new StarRocksPlannerException("SELECT * not allowed from relation that has no columns",
@@ -225,17 +237,51 @@ public class SelectAnalyzer {
                 outputFields.addAll(fields);
 
             } else {
-                // The name here only refer to column name.
-                String name = item.getAlias() == null ? AST2SQL.toString(item.getExpr()) : item.getAlias();
+                String name;
+                if (item.getExpr() instanceof SlotRef) {
+                    name = item.getAlias() == null ? ((SlotRef) item.getExpr()).getColumnName() : item.getAlias();
+                } else {
+                    name = item.getAlias() == null ?
+                            AstToStringBuilder.getAliasName(item.getExpr(), false, false) : item.getAlias();
+                }
 
                 analyzeExpression(item.getExpr(), analyzeState, scope);
                 outputExpressionBuilder.add(item.getExpr());
 
                 if (item.getExpr() instanceof SlotRef) {
                     outputFields.add(new Field(name, item.getExpr().getType(),
-                            ((SlotRef) item.getExpr()).getTblNameWithoutAnalyzed(), item.getExpr()));
+                            ((SlotRef) item.getExpr()).getTblNameWithoutAnalyzed(), item.getExpr(),
+                            true, item.getExpr().isNullable()));
                 } else {
-                    outputFields.add(new Field(name, item.getExpr().getType(), null, item.getExpr()));
+                    outputFields.add(new Field(name, item.getExpr().getType(), null, item.getExpr(),
+                            true, item.getExpr().isNullable()));
+                }
+
+                // outputExprInOrderByScope is used to record which expressions in outputExpression are to be
+                // recorded in the first level of OrderByScope (order by expressions can refer to columns in output)
+                // Which columns satisfy the condition?
+                // 1. An expression of type SlotRef.
+                //    When both tables t0 and t1 contain the v1 column, select t0.v1 from t0, t1 order by v1 will
+                //    refer to v1 in outputExpr instead of reporting an error.
+                // 2. There is an aliased output expression
+
+                // Why can't use all output expression?
+                // Because output expression and outputScope do not correspond one-to-one,
+                // you can refer to computeAndAssignOrderScope.
+                // Therefore, the first level Scope in orderByScope must be able to be resolved according to
+                // Expr in the projectForOrder function. If all Expr in outputExpression are used,
+                // FieldReference will fail to resolve.
+                // For example, "select *, v1 from t0 order by v2". star will be parsed into multiple FieldReferences.
+                // FieldReference cannot directly resolve the corresponding position in Scope according to resolve
+                // in Scope. Because Field records the location of sourceScope, and in projectForOrder,
+                // it needs to be resolved in orderScope.
+                // Summary: The output expression that can be resolved with a resolve name is meaningful
+                // for the analysis of the order by position, because this is an external legal Scope.
+                // And because in Transform, it is also necessary to parse the name according to the Scope
+                // to correspond to the corresponding ColumnRefOperator, so only the parsed Expr can find
+                // the corresponding fieldMappings in the Scope position according to the analysis.
+                if (item.getAlias() != null || item.getExpr() instanceof SlotRef) {
+                    outputExprInOrderByScope.add(outputFields.build().size() - 1);
                 }
             }
 
@@ -260,13 +306,15 @@ public class SelectAnalyzer {
 
         List<Expr> outputExpressions = outputExpressionBuilder.build();
         analyzeState.setOutputExpression(outputExpressions);
+        analyzeState.setOutputExprInOrderByScope(outputExprInOrderByScope);
         analyzeState.setOutputScope(new Scope(RelationId.anonymous(), new RelationFields(outputFields.build())));
         return outputExpressions;
     }
 
     private List<OrderByElement> analyzeOrderBy(List<OrderByElement> orderByElements, AnalyzeState analyzeState,
                                                 Scope orderByScope,
-                                                List<Expr> outputExpressions) {
+                                                List<Expr> outputExpressions,
+                                                boolean isDistinct) {
         if (orderByElements == null) {
             analyzeState.setOrderBy(Collections.emptyList());
             return Collections.emptyList();
@@ -282,13 +330,36 @@ public class SelectAnalyzer {
                 if (ordinal < 1 || ordinal > outputExpressions.size()) {
                     throw new SemanticException("ORDER BY position %s is not in select list", ordinal);
                 }
+                // index can ensure no ambiguous, we don't need to re-analyze this output expression
                 expression = outputExpressions.get((int) ordinal - 1);
+            } else if (expression instanceof FieldReference) {
+                // If the expression of order by is a FieldReference, and it's not a distinct select,
+                // it means that the type of sql is
+                // "select * from t order by 1", then this FieldReference cannot be parsed in OrderByScope,
+                // but should be parsed in sourceScope
+                if (isDistinct) {
+                    analyzeExpression(expression, analyzeState, orderByScope);
+                } else {
+                    analyzeExpression(expression, analyzeState, orderByScope.getParent());
+                }
+            } else {
+                ExpressionAnalyzer expressionAnalyzer = new ExpressionAnalyzer(session);
+                expressionAnalyzer.analyzeWithoutUpdateState(expression, analyzeState, orderByScope);
+                List<Expr> aggregations = Lists.newArrayList();
+                expression.collectAll(e -> e.isAggregate(), aggregations);
+                if (isDistinct && !aggregations.isEmpty()) {
+                    throw new SemanticException("for SELECT DISTINCT, ORDER BY expressions must appear in select list",
+                            expression.getPos());
+                }
+
+                if (!aggregations.isEmpty()) {
+                    aggregations.forEach(e -> analyzeExpression(e, analyzeState, orderByScope.getParent()));
+                }
+                analyzeExpression(expression, analyzeState, orderByScope);
             }
 
-            analyzeExpression(expression, analyzeState, orderByScope);
-
             if (!expression.getType().canOrderBy()) {
-                throw new SemanticException(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+                throw new SemanticException(Type.NOT_SUPPORT_ORDER_ERROR_MSG);
             }
 
             orderByElement.setExpr(expression);
@@ -337,8 +408,12 @@ public class SelectAnalyzer {
         AnalyzerUtils.verifyNoWindowFunctions(predicate, "WHERE");
         AnalyzerUtils.verifyNoGroupingFunctions(predicate, "WHERE");
 
-        if (!predicate.getType().matchesType(Type.BOOLEAN) && !predicate.getType().matchesType(Type.NULL)) {
-            throw new SemanticException("WHERE clause must evaluate to a boolean: actual type %s", predicate.getType());
+        if (predicate.getType().isBoolean() || predicate.getType().isNull()) {
+            // do nothing
+        } else if (!session.getSessionVariable().isEnableStrictType() && Type.canCastTo(predicate.getType(), Type.BOOLEAN)) {
+            predicate = new CastExpr(Type.BOOLEAN, predicate);
+        } else {
+            throw new SemanticException("WHERE clause %s can not be converted to boolean type", predicate.toSql());
         }
 
         analyzeState.setPredicate(predicate);
@@ -361,15 +436,17 @@ public class SelectAnalyzer {
     }
 
     private List<FunctionCallExpr> analyzeAggregations(AnalyzeState analyzeState, Scope sourceScope,
-                                                       List<Expr> outputAndOrderByExpressions) {
+                                                          List<Expr> outputAndOrderByExpressions) {
         List<FunctionCallExpr> aggregations = Lists.newArrayList();
         TreeNode.collect(outputAndOrderByExpressions, Expr.isAggregatePredicate()::apply, aggregations);
         aggregations.forEach(e -> analyzeExpression(e, analyzeState, sourceScope));
 
-        if (aggregations.stream().filter(FunctionCallExpr::isDistinct).count() > 1) {
-            for (FunctionCallExpr agg : aggregations) {
-                if (agg.isDistinct() && agg.getChildren().size() > 0 && agg.getChild(0).getType().isArrayType()) {
-                    throw new SemanticException("No matching function with signature: multi_distinct_count(ARRAY)");
+        for (FunctionCallExpr agg : aggregations) {
+            if (agg.isDistinct() && agg.getChildren().size() > 0) {
+                Type[] args = agg.getChildren().stream().map(Expr::getType).toArray(Type[]::new);
+                if (Arrays.stream(args).anyMatch(t -> (t.isJsonType() || t.isComplexType()) && !t.canGroupBy())) {
+                    throw new SemanticException(agg.toSql() + " can't rewrite distinct to group by on (" +
+                            Arrays.stream(args).map(Type::toSql).collect(Collectors.joining(",")) + ")");
                 }
             }
         }
@@ -400,7 +477,7 @@ public class SelectAnalyzer {
                     }
 
                     if (!groupingExpr.getType().canGroupBy()) {
-                        throw new SemanticException(Type.ONLY_METRIC_TYPE_ERROR_MSG);
+                        throw new SemanticException(Type.NOT_SUPPORT_GROUP_BY_ERROR_MSG);
                     }
 
                     if (analyzeState.getColumnReferences().get(groupingExpr) == null) {
@@ -478,11 +555,12 @@ public class SelectAnalyzer {
         if (havingClause != null) {
             Expr predicate = pushNegationToOperands(havingClause);
 
+            RewriteAliasVisitor visitor = new RewriteAliasVisitor(sourceScope, outputScope, outputExprs, session);
+            predicate = predicate.accept(visitor, null);
+
             AnalyzerUtils.verifyNoWindowFunctions(predicate, "HAVING");
             AnalyzerUtils.verifyNoGroupingFunctions(predicate, "HAVING");
 
-            RewriteAliasVisitor visitor = new RewriteAliasVisitor(sourceScope, outputScope, outputExprs, session);
-            predicate = predicate.accept(visitor, null);
             analyzeExpression(predicate, analyzeState, sourceScope);
 
             if (!predicate.getType().matchesType(Type.BOOLEAN) && !predicate.getType().matchesType(Type.NULL)) {
@@ -495,7 +573,7 @@ public class SelectAnalyzer {
 
     // If alias is same with table column name, we directly use table name.
     // otherwise, we use output expression according to the alias
-    private static class RewriteAliasVisitor extends AstVisitor<Expr, Void> {
+    public static class RewriteAliasVisitor extends AstVisitor<Expr, Void> {
         private final Scope sourceScope;
         private final Scope outputScope;
         private final List<Expr> outputExprs;
@@ -591,24 +669,27 @@ public class SelectAnalyzer {
         }
     }
 
-    private Scope computeAndAssignOrderScope(AnalyzeState analyzeState, Scope sourceScope, Scope outputScope) {
-        // The Scope used by order by allows parsing of the same column,
-        // such as 'select v1 as v, v1 as v from t0 order by v'
-        // but normal parsing does not allow it. So add a de-duplication operation here.
-        List<Field> allFields = new ArrayList<>();
-        for (Field field : outputScope.getRelationFields().getAllFields()) {
-            if (field.getName() != null && field.getOriginExpression() != null &&
-                    allFields.stream().anyMatch(f ->
-                            f.getOriginExpression() != null &&
-                                    f.getName() != null &&
-                                    field.getName().equals(f.getName()) &&
-                                    field.getOriginExpression().equals(f.getOriginExpression()))) {
-                continue;
-            }
-            allFields.add(field);
+    private Scope computeAndAssignOrderScope(AnalyzeState analyzeState, Scope sourceScope, Scope outputScope,
+                                             boolean isDistinct) {
+
+        List<Field> allFields = Lists.newArrayList();
+        if (isDistinct) {
+            allFields = removeDuplicateField(outputScope.getRelationFields().getAllFields());
+            Scope orderScope = new Scope(outputScope.getRelationId(), new RelationFields(allFields));
+            orderScope.setParent(sourceScope);
+            analyzeState.setOrderScope(orderScope);
+            return orderScope;
         }
 
+        for (int i = 0; i < analyzeState.getOutputExprInOrderByScope().size(); ++i) {
+            Field field = outputScope.getRelationFields()
+                    .getFieldByIndex(analyzeState.getOutputExprInOrderByScope().get(i));
+            allFields.add(field);
+        }
+        allFields = removeDuplicateField(allFields);
+
         Scope orderScope = new Scope(outputScope.getRelationId(), new RelationFields(allFields));
+
         /*
          * ORDER BY or HAVING should "see" both output and FROM fields
          * Because output scope and source scope may contain the same columns,
@@ -621,5 +702,30 @@ public class SelectAnalyzer {
 
     private void analyzeExpression(Expr expr, AnalyzeState analyzeState, Scope scope) {
         ExpressionAnalyzer.analyzeExpression(expr, analyzeState, scope, session);
+    }
+
+
+    // The Scope used by order by allows parsing of the same column,
+    // such as 'select v1 as v, v1 as v from t0 order by v'
+    // but normal parsing does not allow it. So add a de-duplication operation here.
+    private List<Field> removeDuplicateField(List<Field> originalFields) {
+        List<Field> allFields = Lists.newArrayList();
+        for (Field field : originalFields) {
+            if (session.getSessionVariable().isEnableStrictOrderBy()) {
+                if (field.getName() != null && field.getOriginExpression() != null &&
+                        allFields.stream().anyMatch(f -> f.getOriginExpression() != null
+                                && f.getName() != null && field.getName().equals(f.getName())
+                                && field.getOriginExpression().equals(f.getOriginExpression()))) {
+                    continue;
+                }
+            } else {
+                if (field.getName() != null &&
+                        allFields.stream().anyMatch(f -> f.getName() != null && field.getName().equals(f.getName()))) {
+                    continue;
+                }
+            }
+            allFields.add(field);
+        }
+        return allFields;
     }
 }

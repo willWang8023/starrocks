@@ -1,31 +1,3 @@
-[sql]
-select
-    ps_partkey,
-    sum(ps_supplycost * ps_availqty) as value
-from
-    partsupp,
-    supplier,
-    nation
-where
-    ps_suppkey = s_suppkey
-  and s_nationkey = n_nationkey
-  and n_name = 'PERU'
-group by
-    ps_partkey having
-    sum(ps_supplycost * ps_availqty) > (
-    select
-    sum(ps_supplycost * ps_availqty) * 0.0001000000
-    from
-    partsupp,
-    supplier,
-    nation
-    where
-    ps_suppkey = s_suppkey
-                  and s_nationkey = n_nationkey
-                  and n_name = 'PERU'
-    )
-order by
-    value desc ;
 [fragment]
 PLAN FRAGMENT 0
 OUTPUT EXPRS:1: PS_PARTKEY | 21: sum
@@ -52,7 +24,7 @@ UNPARTITIONED
 |  <slot 21> : 21: sum
 |
 27:NESTLOOP JOIN
-|  join op: CROSS JOIN
+|  join op: INNER JOIN
 |  colocate: false, reason:
 |  other join predicates: 21: sum > 43: expr
 |
@@ -81,7 +53,6 @@ rollup: partsupp
 tabletRatio=10/10
 cardinality=80000000
 avgRowSize=28.0
-numNodes=0
 
 PLAN FRAGMENT 2
 OUTPUT EXPRS:
@@ -112,11 +83,12 @@ EXCHANGE ID: 22
 UNPARTITIONED
 
 21:AGGREGATE (update serialize)
-|  output: sum(41: expr)
+|  output: sum(25: PS_SUPPLYCOST * CAST(24: PS_AVAILQTY AS DOUBLE))
 |  group by:
 |
 20:Project
-|  <slot 41> : 25: PS_SUPPLYCOST * CAST(24: PS_AVAILQTY AS DOUBLE)
+|  <slot 24> : 24: PS_AVAILQTY
+|  <slot 25> : 25: PS_SUPPLYCOST
 |
 19:HASH JOIN
 |  join op: INNER JOIN (BROADCAST)
@@ -133,7 +105,6 @@ rollup: partsupp
 tabletRatio=10/10
 cardinality=80000000
 avgRowSize=20.0
-numNodes=0
 
 PLAN FRAGMENT 4
 OUTPUT EXPRS:
@@ -161,7 +132,6 @@ rollup: supplier
 tabletRatio=1/1
 cardinality=1000000
 avgRowSize=8.0
-numNodes=0
 
 PLAN FRAGMENT 5
 OUTPUT EXPRS:
@@ -183,7 +153,6 @@ rollup: nation
 tabletRatio=1/1
 cardinality=1
 avgRowSize=29.0
-numNodes=0
 
 PLAN FRAGMENT 6
 OUTPUT EXPRS:
@@ -211,7 +180,6 @@ rollup: supplier
 tabletRatio=1/1
 cardinality=1000000
 avgRowSize=8.0
-numNodes=0
 
 PLAN FRAGMENT 7
 OUTPUT EXPRS:
@@ -233,6 +201,5 @@ rollup: nation
 tabletRatio=1/1
 cardinality=1
 avgRowSize=29.0
-numNodes=0
 [end]
 

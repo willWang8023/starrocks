@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.plan;
 
@@ -23,8 +36,7 @@ public class FilterUnusedColumnTest extends PlanTestBase {
                 "DISTRIBUTED BY HASH(`d_dow`) BUCKETS 1\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
         // for agg table
         starRocksAssert.withTable("CREATE TABLE `metrics_detail` ( \n" +
@@ -40,7 +52,6 @@ public class FilterUnusedColumnTest extends PlanTestBase {
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
                 "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\",\n" +
                 "\"enable_persistent_index\" = \"false\"\n" +
                 ");");
         // for primary key table
@@ -54,9 +65,9 @@ public class FilterUnusedColumnTest extends PlanTestBase {
                 "DISTRIBUTED BY HASH(`tags_id`) BUCKETS 1\n" +
                 "PROPERTIES (\n" +
                 "\"replication_num\" = \"1\",\n" +
-                "\"in_memory\" = \"false\",\n" +
-                "\"storage_format\" = \"DEFAULT\"\n" +
+                "\"in_memory\" = \"false\"\n" +
                 ");");
+
         FeConstants.USE_MOCK_DICT_MANAGER = true;
         connectContext.getSessionVariable().setSqlMode(2);
         connectContext.getSessionVariable().enableTrimOnlyFilteredColumnsInScanStage();
@@ -99,7 +110,7 @@ public class FilterUnusedColumnTest extends PlanTestBase {
 
     @Test
     public void testFilterAggTable() throws Exception {
-        boolean prevEnable = connectContext.getSessionVariable().isAbleFilterUnusedColumnsInScanStage();
+        boolean prevEnable = connectContext.getSessionVariable().isEnableFilterUnusedColumnsInScanStage();
 
         try {
             connectContext.getSessionVariable().setEnableGlobalRuntimeFilter(true);
@@ -107,7 +118,6 @@ public class FilterUnusedColumnTest extends PlanTestBase {
             // Key columns cannot be pruned in the non-skip-aggr scan stage.
             String sql = "select timestamp from metrics_detail where tags_id > 1";
             String plan = getThriftPlan(sql);
-            System.out.println(plan);
             Assert.assertTrue(plan.contains("unused_output_column_name:[]"));
 
             sql = "select max(value) from metrics_detail where tags_id > 1";
@@ -125,6 +135,49 @@ public class FilterUnusedColumnTest extends PlanTestBase {
             Assert.assertTrue(plan.contains("unused_output_column_name:[]"));
         } finally {
             connectContext.getSessionVariable().setEnableGlobalRuntimeFilter(prevEnable);
+        }
+    }
+
+    @Test
+    public void testFilterAggMV() throws Exception {
+        boolean prevEnable = connectContext.getSessionVariable().isEnableFilterUnusedColumnsInScanStage();
+
+        try {
+            connectContext.getSessionVariable().setEnableGlobalRuntimeFilter(true);
+            starRocksAssert.withMaterializedView("CREATE MATERIALIZED VIEW tpcds_100g_date_dim_mv as \n" +
+                    "SELECT d_dow, d_day_name, max(d_date) \n" +
+                    "FROM tpcds_100g_date_dim\n" +
+                    "GROUP BY d_dow, d_day_name");
+
+            String sql;
+            String plan;
+
+            // Key columns cannot be pruned in the non-skip-aggr scan stage of MV.
+            sql = "select d_day_name from tpcds_100g_date_dim where d_dow > 1";
+            plan = getThriftPlan(sql);
+            assertContains(plan, "unused_output_column_name:[d_dow]");
+            assertContains(plan, "rollup_name:tpcds_100g_date_dim");
+
+            // Columns can pruned when using MV.
+            sql = "select distinct d_day_name from tpcds_100g_date_dim where d_dow > 1";
+            plan = getThriftPlan(sql);
+            assertContains(plan, "unused_output_column_name:[d_dow]");
+            assertContains(plan, "is_preaggregation:true");
+            assertContains(plan, "rollup_name:tpcds_100g_date_dim_mv");
+
+            // Columns can be pruned when not using MV.
+            sql = "select d_day_name from tpcds_100g_date_dim where d_dow > 1";
+            plan = getThriftPlan(sql);
+            assertContains(plan, "unused_output_column_name:[d_dow]");
+            assertContains(plan, "rollup_name:tpcds_100g_date_dim");
+
+        } finally {
+            connectContext.getSessionVariable().setEnableGlobalRuntimeFilter(prevEnable);
+            try {
+                starRocksAssert.dropMaterializedView("tpcds_100g_date_dim_mv");
+            } catch (Exception e) {
+                //
+            }
         }
     }
 

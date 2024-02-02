@@ -1,5 +1,17 @@
-# This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
-
+# Copyright 2021-present StarRocks, Inc. All rights reserved.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     https://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
 from pyarrow import json
 import pyarrow as pa
 import pyarrow.parquet as pq
@@ -23,6 +35,7 @@ data = [
     pa.array([1, 2, 3], type=pa.uint64()),
     
     pa.array([1659962123000, 1659962124000, 1659962125000], type=pa.timestamp('ms', tz='America/New_York')),
+    pa.array([1659962123000, 1659962124000, 1659962125000], type=pa.timestamp('ms')),
 
     pa.array([1.1, 2.1, 3.1], type=pa.float32()),
     pa.array([1.1, 2.1, 3.1], type=pa.float64()),
@@ -114,6 +127,7 @@ columns = [
     "col_json_uint64",
     
     "col_json_timestamp",
+    "col_json_timestamp_not_normalized",
 
     "col_json_float32",
     "col_json_float64",

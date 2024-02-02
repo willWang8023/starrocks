@@ -1,27 +1,40 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exec/pipeline/exchange/sink_buffer.h"
 
-#include <chrono>
-
-DIAGNOSTIC_PUSH
-DIAGNOSTIC_IGNORE("-Wclass-memaccess")
 #include <bthread/bthread.h>
-DIAGNOSTIC_POP
+
+#include <chrono>
+#include <string_view>
 
 #include "fmt/core.h"
+#include "util/defer_op.h"
 #include "util/time.h"
 #include "util/uid_util.h"
 
 namespace starrocks::pipeline {
 
 SinkBuffer::SinkBuffer(FragmentContext* fragment_ctx, const std::vector<TPlanFragmentDestination>& destinations,
-                       bool is_dest_merge, size_t num_sinkers)
+                       bool is_dest_merge)
         : _fragment_ctx(fragment_ctx),
           _mem_tracker(fragment_ctx->runtime_state()->instance_mem_tracker()),
-          _brpc_timeout_ms(std::min(3600, fragment_ctx->runtime_state()->query_options().query_timeout) * 1000),
+          _brpc_timeout_ms(fragment_ctx->runtime_state()->query_options().query_timeout * 1000),
           _is_dest_merge(is_dest_merge),
-          _num_uncancelled_sinkers(num_sinkers) {
+          _rpc_http_min_size(fragment_ctx->runtime_state()->get_rpc_http_min_size()),
+          _sent_audit_stats_frequency_upper_limit(
+                  std::max((int64_t)64, BitUtil::RoundUpToPowerOfTwo(fragment_ctx->num_drivers() * 4))) {
     for (const auto& dest : destinations) {
         const auto& instance_id = dest.fragment_instance_id;
         // instance_id.lo == -1 indicates that the destination is pseudo for bucket shuffle join.
@@ -31,8 +44,7 @@ SinkBuffer::SinkBuffer(FragmentContext* fragment_ctx, const std::vector<TPlanFra
 
         auto it = _num_sinkers.find(instance_id.lo);
         if (it == _num_sinkers.end()) {
-            _num_sinkers[instance_id.lo] = num_sinkers;
-
+            _num_sinkers[instance_id.lo] = 0;
             _request_seqs[instance_id.lo] = -1;
             _max_continuous_acked_seqs[instance_id.lo] = -1;
             _discontinuous_acked_seqs[instance_id.lo] = std::unordered_set<int64_t>();
@@ -41,6 +53,7 @@ SinkBuffer::SinkBuffer(FragmentContext* fragment_ctx, const std::vector<TPlanFra
             _num_in_flight_rpcs[instance_id.lo] = 0;
             _network_times[instance_id.lo] = TimeTrace{};
             _mutexes[instance_id.lo] = std::make_unique<Mutex>();
+            _dest_addrs[instance_id.lo] = dest.brpc_server;
 
             PUniqueId finst_id;
             finst_id.set_hi(instance_id.hi);
@@ -48,8 +61,6 @@ SinkBuffer::SinkBuffer(FragmentContext* fragment_ctx, const std::vector<TPlanFra
             _instance_id2finst_id[instance_id.lo] = std::move(finst_id);
         }
     }
-
-    _num_remaining_eos = _num_sinkers.size() * num_sinkers;
 }
 
 SinkBuffer::~SinkBuffer() {
@@ -62,19 +73,42 @@ SinkBuffer::~SinkBuffer() {
     _buffers.clear();
 }
 
-void SinkBuffer::add_request(TransmitChunkInfo& request) {
+void SinkBuffer::incr_sinker(RuntimeState* state) {
+    _num_uncancelled_sinkers++;
+    for (auto& [_, num_sinkers_per_instance] : _num_sinkers) {
+        num_sinkers_per_instance++;
+    }
+    _num_remaining_eos += _num_sinkers.size();
+}
+
+Status SinkBuffer::add_request(TransmitChunkInfo& request) {
     DCHECK(_num_remaining_eos > 0);
     if (_is_finishing) {
-        return;
+        return Status::OK();
     }
     if (!request.attachment.empty()) {
         _bytes_enqueued += request.attachment.size();
         _request_enqueued++;
     }
     {
+        // set stats every _sent_audit_stats_frequency, so FE can get approximate stats even missing eos chunks.
+        // _sent_audit_stats_frequency grows exponentially to reduce the costs of collecting stats but
+        // let the first (limited) chunks' stats approach truth。
+        auto request_sequence = _request_sequence++;
+        if (!request.params->eos() && (request_sequence & (_sent_audit_stats_frequency - 1)) == 0) {
+            if (_sent_audit_stats_frequency < _sent_audit_stats_frequency_upper_limit) {
+                _sent_audit_stats_frequency = _sent_audit_stats_frequency << 1;
+            }
+            if (auto part_stats = _fragment_ctx->runtime_state()->query_ctx()->intermediate_query_statistic()) {
+                part_stats->to_pb(request.params->mutable_query_statistics());
+            }
+        }
+
         auto& instance_id = request.fragment_instance_id;
-        _try_to_send_rpc(instance_id, [&]() { _buffers[instance_id.lo].push(request); });
+        RETURN_IF_ERROR(_try_to_send_rpc(instance_id, [&]() { _buffers[instance_id.lo].push(request); }));
     }
+
+    return Status::OK();
 }
 
 bool SinkBuffer::is_full() const {
@@ -117,21 +151,22 @@ bool SinkBuffer::is_finished() const {
 }
 
 void SinkBuffer::update_profile(RuntimeProfile* profile) {
-    bool flag = false;
-    if (!_is_profile_updated.compare_exchange_strong(flag, true)) {
-        return;
-    }
-
+    auto* rpc_count = ADD_COUNTER(profile, "RpcCount", TUnit::UNIT);
+    auto* rpc_avg_timer = ADD_TIMER(profile, "RpcAvgTime");
     auto* network_timer = ADD_TIMER(profile, "NetworkTime");
     auto* wait_timer = ADD_TIMER(profile, "WaitTime");
     auto* overall_timer = ADD_TIMER(profile, "OverallTime");
+
+    COUNTER_SET(rpc_count, _rpc_count);
+    COUNTER_SET(rpc_avg_timer, _rpc_cumulative_time / std::max(_rpc_count.load(), static_cast<int64_t>(1)));
+
     COUNTER_SET(network_timer, _network_time());
     COUNTER_SET(overall_timer, _last_receive_time - _first_send_time);
 
     // WaitTime consists two parts
     // 1. buffer full time
     // 2. pending finish time
-    COUNTER_UPDATE(wait_timer, _full_time);
+    COUNTER_SET(wait_timer, _full_time);
     COUNTER_UPDATE(wait_timer, MonotonicNanos() - _pending_timestamp);
 
     auto* bytes_sent_counter = ADD_COUNTER(profile, "BytesSent", TUnit::BYTES);
@@ -139,12 +174,10 @@ void SinkBuffer::update_profile(RuntimeProfile* profile) {
     COUNTER_SET(bytes_sent_counter, _bytes_sent);
     COUNTER_SET(request_sent_counter, _request_sent);
 
-    if (_bytes_enqueued - _bytes_sent > 0) {
-        auto* bytes_unsent_counter = ADD_COUNTER(profile, "BytesUnsent", TUnit::BYTES);
-        auto* request_unsent_counter = ADD_COUNTER(profile, "RequestUnsent", TUnit::UNIT);
-        COUNTER_SET(bytes_unsent_counter, _bytes_enqueued - _bytes_sent);
-        COUNTER_SET(request_unsent_counter, _request_enqueued - _request_sent);
-    }
+    auto* bytes_unsent_counter = ADD_COUNTER(profile, "BytesUnsent", TUnit::BYTES);
+    auto* request_unsent_counter = ADD_COUNTER(profile, "RequestUnsent", TUnit::UNIT);
+    COUNTER_SET(bytes_unsent_counter, _bytes_enqueued - _bytes_sent);
+    COUNTER_SET(request_unsent_counter, _request_enqueued - _request_sent);
 
     profile->add_derived_counter(
             "NetworkBandwidth", TUnit::BYTES_PER_SECOND,
@@ -174,17 +207,54 @@ int64_t SinkBuffer::_network_time() {
     return max;
 }
 
-void SinkBuffer::cancel_one_sinker() {
+void SinkBuffer::cancel_one_sinker(RuntimeState* const state) {
     if (--_num_uncancelled_sinkers == 0) {
         _is_finishing = true;
+        if (state != nullptr && state->query_ctx() && state->query_ctx()->is_query_expired()) {
+            // how many in-flight rpcs and what exchange receivers are.
+            if (_total_in_flight_rpc > 0) {
+                std::stringstream ss;
+                auto remain_rpc_num = 0;
+                for (auto& remain_rpc : _num_in_flight_rpcs) {
+                    std::lock_guard<Mutex> l(*_mutexes[remain_rpc.first]);
+                    if (remain_rpc.second > 0) {
+                        ss << (remain_rpc_num > 0 ? ", " : "") << print_id(_instance_id2finst_id[remain_rpc.first]);
+                        remain_rpc_num++;
+                    }
+                }
+                LOG(WARNING) << "Fragment " << print_id(_fragment_ctx->fragment_instance_id()) << " SinkBuffer remains "
+                             << remain_rpc_num << " rpcs, dest are " << ss.str();
+            }
+            // how many alive drivers left and what they are.
+            if (_num_remaining_eos > 0) {
+                std::stringstream ss;
+                for (auto& remain_eos : _num_sinkers) {
+                    ss << print_id(_instance_id2finst_id[remain_eos.first]) << "(" << remain_eos.second << "),";
+                }
+                LOG(WARNING) << "Fragment " << print_id(_fragment_ctx->fragment_instance_id())
+                             << " remains EOS : " << ss.str();
+            }
+        }
+    }
+    if (state != nullptr && state->query_ctx() && state->query_ctx()->is_query_expired()) {
+        // check how many cancel operations are issued, and show the state of that time.
+        LOG(INFO) << fmt::format(
+                "fragment_instance_id {}, _num_uncancelled_sinkers {}, _is_finishing {}, _num_remaining_eos {}, "
+                "_num_sending_rpc {}, chunk is full {}",
+                print_id(_fragment_ctx->fragment_instance_id()), _num_uncancelled_sinkers, _is_finishing,
+                _num_remaining_eos, _num_sending_rpc, is_full());
     }
 }
 
 void SinkBuffer::_update_network_time(const TUniqueId& instance_id, const int64_t send_timestamp,
-                                      const int64_t receive_timestamp) {
-    _last_receive_time = MonotonicNanos();
+                                      const int64_t receiver_post_process_time) {
+    const int64_t get_response_timestamp = MonotonicNanos();
+    _last_receive_time = get_response_timestamp;
     int32_t concurrency = _num_in_flight_rpcs[instance_id.lo];
-    _network_times[instance_id.lo].update(receive_timestamp - send_timestamp, concurrency);
+    int64_t time_usage = get_response_timestamp - send_timestamp - receiver_post_process_time;
+    _network_times[instance_id.lo].update(time_usage, concurrency);
+    _rpc_cumulative_time += time_usage;
+    _rpc_count++;
 }
 
 void SinkBuffer::_process_send_window(const TUniqueId& instance_id, const int64_t sequence) {
@@ -203,7 +273,7 @@ void SinkBuffer::_process_send_window(const TUniqueId& instance_id, const int64_
     }
 }
 
-void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, std::function<void()> pre_works) {
+Status SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, const std::function<void()>& pre_works) {
     std::lock_guard<Mutex> l(*_mutexes[instance_id.lo]);
     pre_works();
 
@@ -212,7 +282,7 @@ void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, std::function<vo
 
     for (;;) {
         if (_is_finishing) {
-            return;
+            return Status::OK();
         }
 
         auto& buffer = _buffers[instance_id.lo];
@@ -229,7 +299,7 @@ void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, std::function<vo
             too_much_brpc_process = _num_in_flight_rpcs[instance_id.lo] >= config::pipeline_sink_brpc_dop;
         }
         if (buffer.empty() || too_much_brpc_process) {
-            return;
+            return Status::OK();
         }
 
         TransmitChunkInfo& request = buffer.front();
@@ -251,7 +321,7 @@ void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, std::function<vo
         // But we must guarantee that first packet must be received first
         if (_num_finished_rpcs[instance_id.lo] == 0 && _num_in_flight_rpcs[instance_id.lo] > 0) {
             need_wait = true;
-            return;
+            return Status::OK();
         }
         if (request.params->eos()) {
             DeferOp eos_defer([this, &instance_id, &need_wait]() {
@@ -278,7 +348,11 @@ void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, std::function<vo
                 // But we must guarantee that eos packent must be the last packet
                 if (_num_in_flight_rpcs[instance_id.lo] > 0) {
                     need_wait = true;
-                    return;
+                    return Status::OK();
+                }
+                // this is the last eos query, set query stats
+                if (auto final_stats = _fragment_ctx->runtime_state()->query_ctx()->intermediate_query_statistic()) {
+                    final_stats->to_pb(request.params->mutable_query_statistics());
                 }
             }
         }
@@ -292,24 +366,31 @@ void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, std::function<vo
         }
 
         auto* closure = new DisposableClosure<PTransmitChunkResult, ClosureContext>(
-                {instance_id, request.params->sequence(), GetCurrentTimeNanos()});
+                {instance_id, request.params->sequence(), MonotonicNanos()});
         if (_first_send_time == -1) {
             _first_send_time = MonotonicNanos();
         }
 
-        closure->addFailedHandler([this](const ClosureContext& ctx) noexcept {
+        closure->addFailedHandler([this](const ClosureContext& ctx, std::string_view rpc_error_msg) noexcept {
+            auto defer = DeferOp([this]() { --_total_in_flight_rpc; });
             _is_finishing = true;
             {
                 std::lock_guard<Mutex> l(*_mutexes[ctx.instance_id.lo]);
                 ++_num_finished_rpcs[ctx.instance_id.lo];
                 --_num_in_flight_rpcs[ctx.instance_id.lo];
             }
-            --_total_in_flight_rpc;
-            std::string err_msg = fmt::format("transmit chunk rpc failed:{}", print_id(ctx.instance_id));
-            _fragment_ctx->cancel(Status::InternalError(err_msg));
+
+            const auto& dest_addr = _dest_addrs[ctx.instance_id.lo];
+            std::string err_msg =
+                    fmt::format("transmit chunk rpc failed [dest_instance_id={}] [dest={}:{}] detail:{}",
+                                print_id(ctx.instance_id), dest_addr.hostname, dest_addr.port, rpc_error_msg);
+
+            _fragment_ctx->cancel(Status::ThriftRpcError(err_msg));
             LOG(WARNING) << err_msg;
         });
         closure->addSuccessHandler([this](const ClosureContext& ctx, const PTransmitChunkResult& result) noexcept {
+            // when _total_in_flight_rpc desc to 0, _fragment_ctx may be destructed
+            auto defer = DeferOp([this]() { --_total_in_flight_rpc; });
             Status status(result.status());
             {
                 std::lock_guard<Mutex> l(*_mutexes[ctx.instance_id.lo]);
@@ -319,15 +400,17 @@ void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, std::function<vo
             if (!status.ok()) {
                 _is_finishing = true;
                 _fragment_ctx->cancel(status);
-                LOG(WARNING) << fmt::format("transmit chunk rpc failed:{}, msg:{}", print_id(ctx.instance_id),
+
+                const auto& dest_addr = _dest_addrs[ctx.instance_id.lo];
+                LOG(WARNING) << fmt::format("transmit chunk rpc failed [dest_instance_id={}] [dest={}:{}] [msg={}]",
+                                            print_id(ctx.instance_id), dest_addr.hostname, dest_addr.port,
                                             status.message());
             } else {
-                _try_to_send_rpc(ctx.instance_id, [&]() {
+                static_cast<void>(_try_to_send_rpc(ctx.instance_id, [&]() {
+                    _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receiver_post_process_time());
                     _process_send_window(ctx.instance_id, ctx.sequence);
-                    _update_network_time(ctx.instance_id, ctx.send_timestamp, result.receive_timestamp());
-                });
+                }));
             }
-            --_total_in_flight_rpc;
         });
 
         ++_total_in_flight_rpc;
@@ -336,22 +419,60 @@ void SinkBuffer::_try_to_send_rpc(const TUniqueId& instance_id, std::function<vo
         // Attachment will be released by process_mem_tracker in closure->Run() in bthread, when receiving the response,
         // so decrease the memory usage of attachment from instance_mem_tracker immediately before sending the request.
         _mem_tracker->release(request.attachment_physical_bytes);
-        ExecEnv::GetInstance()->process_mem_tracker()->consume(request.attachment_physical_bytes);
+        GlobalEnv::GetInstance()->process_mem_tracker()->consume(request.attachment_physical_bytes);
 
         closure->cntl.Reset();
         closure->cntl.set_timeout_ms(_brpc_timeout_ms);
-        closure->cntl.request_attachment().append(request.attachment);
 
+        Status st;
         if (bthread_self()) {
-            request.brpc_stub->transmit_chunk(&closure->cntl, request.params.get(), &closure->result, closure);
+            st = _send_rpc(closure, request);
         } else {
             // When the driver worker thread sends request and creates the protobuf request,
             // also use process_mem_tracker to record the memory of the protobuf request.
             SCOPED_THREAD_LOCAL_MEM_TRACKER_SETTER(nullptr);
-            request.brpc_stub->transmit_chunk(&closure->cntl, request.params.get(), &closure->result, closure);
+            // must in the same scope following the above
+            st = _send_rpc(closure, request);
         }
-
-        return;
+        return st;
     }
+    return Status::OK();
 }
+
+Status SinkBuffer::_send_rpc(DisposableClosure<PTransmitChunkResult, ClosureContext>* closure,
+                             const TransmitChunkInfo& request) {
+    auto expected_iobuf_size = request.attachment.size() + request.params->ByteSizeLong() + sizeof(size_t) * 2;
+    if (UNLIKELY(expected_iobuf_size > _rpc_http_min_size)) {
+        butil::IOBuf iobuf;
+        butil::IOBufAsZeroCopyOutputStream wrapper(&iobuf);
+        request.params->SerializeToZeroCopyStream(&wrapper);
+        // append params to iobuf
+        size_t params_size = iobuf.size();
+        closure->cntl.request_attachment().append(&params_size, sizeof(params_size));
+        closure->cntl.request_attachment().append(iobuf);
+        // append attachment
+        size_t attachment_size = request.attachment.size();
+        closure->cntl.request_attachment().append(&attachment_size, sizeof(attachment_size));
+        closure->cntl.request_attachment().append(request.attachment);
+        VLOG_ROW << "issue a http rpc, attachment's size = " << attachment_size
+                 << " , total size = " << closure->cntl.request_attachment().size();
+
+        if (UNLIKELY(expected_iobuf_size != closure->cntl.request_attachment().size())) {
+            LOG(WARNING) << "http rpc expected iobuf size " << expected_iobuf_size << " != "
+                         << " real iobuf size " << closure->cntl.request_attachment().size();
+        }
+        closure->cntl.http_request().set_content_type("application/proto");
+        // create http_stub as needed
+        auto res = HttpBrpcStubCache::getInstance()->get_http_stub(request.brpc_addr);
+        if (!res.ok()) {
+            return res.status();
+        }
+        res.value()->transmit_chunk_via_http(&closure->cntl, nullptr, &closure->result, closure);
+    } else {
+        closure->cntl.request_attachment().append(request.attachment);
+        request.brpc_stub->transmit_chunk(&closure->cntl, request.params.get(), &closure->result, closure);
+    }
+    return Status::OK();
+}
+
 } // namespace starrocks::pipeline

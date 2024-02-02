@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/agent/heartbeat_server.cpp
 
@@ -46,6 +59,7 @@ using apache::thrift::transport::TProcessor;
 
 namespace starrocks {
 extern std::atomic<bool> k_starrocks_exit;
+extern std::atomic<bool> k_starrocks_exit_quick;
 
 static int64_t reboot_time = 0;
 
@@ -63,7 +77,7 @@ void HeartbeatServer::heartbeat(THeartbeatResult& heartbeat_result, const TMaste
     LOG_EVERY_N(INFO, 12) << "get heartbeat from FE."
                           << "host:" << master_info.network_address.hostname
                           << ", port:" << master_info.network_address.port << ", cluster id:" << master_info.cluster_id
-                          << ", counter:" << google::COUNTER;
+                          << ", run_mode:" << master_info.run_mode << ", counter:" << google::COUNTER;
 
     // do heartbeat
     StatusOr<CmpResult> res = compare_master_info(master_info);
@@ -95,19 +109,32 @@ void HeartbeatServer::heartbeat(THeartbeatResult& heartbeat_result, const TMaste
         // nothing to do
     }
 
-    static auto num_hardware_cores = (int32_t)std::thread::hardware_concurrency();
+    if (master_info.__isset.disabled_disks) {
+        _olap_engine->disable_disks(master_info.disabled_disks);
+    }
+
+    if (master_info.__isset.decommissioned_disks) {
+        _olap_engine->decommission_disks(master_info.decommissioned_disks);
+    }
+
+    static auto num_hardware_cores = static_cast<int32_t>(CpuInfo::num_cores());
     if (res.ok()) {
         heartbeat_result.backend_info.__set_be_port(config::be_port);
-        heartbeat_result.backend_info.__set_http_port(config::webserver_port);
+        heartbeat_result.backend_info.__set_http_port(config::be_http_port);
         heartbeat_result.backend_info.__set_be_rpc_port(-1);
         heartbeat_result.backend_info.__set_brpc_port(config::brpc_port);
 #ifdef USE_STAROS
         heartbeat_result.backend_info.__set_starlet_port(config::starlet_port);
+        if (StorageEngine::instance()->get_store_num() != 0) {
+            heartbeat_result.backend_info.__set_is_set_storage_path(true);
+        } else {
+            heartbeat_result.backend_info.__set_is_set_storage_path(false);
+        }
 #endif
         heartbeat_result.backend_info.__set_version(get_short_version());
         heartbeat_result.backend_info.__set_num_hardware_cores(num_hardware_cores);
         if (reboot_time == 0) {
-            std::time_t currTime = std::time(0);
+            std::time_t currTime = std::time(nullptr);
             reboot_time = static_cast<int64_t>(currTime);
         }
         heartbeat_result.backend_info.__set_reboot_time(reboot_time);
@@ -118,7 +145,7 @@ StatusOr<HeartbeatServer::CmpResult> HeartbeatServer::compare_master_info(const 
     static const char* LOCALHOST = "127.0.0.1";
 
     // reject master's heartbeat when exit
-    if (k_starrocks_exit.load(std::memory_order_relaxed)) {
+    if (k_starrocks_exit.load(std::memory_order_relaxed) || k_starrocks_exit_quick.load(std::memory_order_relaxed)) {
         return Status::InternalError("BE is shutting down");
     }
 
@@ -143,10 +170,18 @@ StatusOr<HeartbeatServer::CmpResult> HeartbeatServer::compare_master_info(const 
         return Status::InternalError("FE heartbeat with localhost ip but BE is not deployed on the same machine");
     }
 
+#ifndef USE_STAROS
+    if (master_info.run_mode == TRunMode::SHARED_DATA) {
+        LOG_EVERY_N(ERROR, 12)
+                << "This program is not compiled with SHARED_DATA support, but FE is running in SHARED_DATA mode!";
+        return Status::InternalError("Backend service binary was not compiled with SHARED_DATA support!");
+    }
+#endif
+
     if (master_info.__isset.backend_ip) {
         if (master_info.backend_ip != BackendOptions::get_localhost()) {
-            LOG(INFO) << master_info.backend_ip << " not equal to to backend localhost "
-                      << BackendOptions::get_localhost();
+            LOG(WARNING) << master_info.backend_ip << " not equal to to backend localhost "
+                         << BackendOptions::get_localhost();
             bool fe_saved_is_valid_ip = is_valid_ip(master_info.backend_ip);
             if (fe_saved_is_valid_ip && is_valid_ip(BackendOptions::get_localhost())) {
                 return Status::InternalError("FE saved address not match backend address");
@@ -191,9 +226,11 @@ StatusOr<HeartbeatServer::CmpResult> HeartbeatServer::compare_master_info(const 
 
     // Check cluster id
     if (curr_master_info->cluster_id == -1) {
-        LOG(INFO) << "Received first heartbeat. updating cluster id";
         // write and update cluster id
-        RETURN_IF_ERROR(_olap_engine->set_cluster_id(master_info.cluster_id));
+        if (_olap_engine->get_need_write_cluster_id()) {
+            LOG(INFO) << "Received first heartbeat. updating cluster id";
+            RETURN_IF_ERROR(_olap_engine->set_cluster_id(master_info.cluster_id));
+        }
     }
 
     if (master_info.__isset.heartbeat_flags) {

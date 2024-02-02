@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/alter/AlterHandler.java
 
@@ -22,20 +35,19 @@
 package com.starrocks.alter;
 
 import com.google.common.collect.Maps;
-import com.starrocks.analysis.CancelStmt;
 import com.starrocks.catalog.Database;
 import com.starrocks.catalog.OlapTable;
 import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.FeConstants;
 import com.starrocks.common.ThreadPoolManager;
 import com.starrocks.common.UserException;
-import com.starrocks.common.util.LeaderDaemon;
+import com.starrocks.common.util.FrontendDaemon;
 import com.starrocks.common.util.TimeUtils;
 import com.starrocks.persist.RemoveAlterJobV2OperationLog;
 import com.starrocks.qe.ShowResultSet;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.AlterClause;
+import com.starrocks.sql.ast.CancelStmt;
 import com.starrocks.task.AlterReplicaTask;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
@@ -49,10 +61,8 @@ import java.util.concurrent.RejectedExecutionException;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.locks.ReentrantLock;
 
-public abstract class AlterHandler extends LeaderDaemon {
+public abstract class AlterHandler extends FrontendDaemon {
     private static final Logger LOG = LogManager.getLogger(AlterHandler.class);
-
-    // queue of alter job v2
     protected ConcurrentMap<Long, AlterJobV2> alterJobsV2 = Maps.newConcurrentMap();
 
     /**
@@ -75,7 +85,7 @@ public abstract class AlterHandler extends LeaderDaemon {
     }
 
     public AlterHandler(String name) {
-        super(name, FeConstants.default_scheduler_interval_millisecond);
+        super(name, Config.alter_scheduler_interval_millisecond);
         executor = ThreadPoolManager
                 .newDaemonCacheThreadPool(Config.alter_max_worker_threads, Config.alter_max_worker_queue_size,
                         name + "_pool", true);
@@ -152,6 +162,7 @@ public abstract class AlterHandler extends LeaderDaemon {
     @Override
     protected void runAfterCatalogReady() {
         clearExpireFinishedOrCancelledAlterJobsV2();
+        setInterval(Config.alter_scheduler_interval_millisecond);
     }
 
     @Override

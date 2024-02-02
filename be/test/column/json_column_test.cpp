@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "column/json_column.h"
 
@@ -19,7 +31,7 @@
 #include "testutil/parallel_test.h"
 #include "util/json.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // NOLINTNEXTLINE
 PARALLEL_TEST(JsonColumnTest, test_parse) {
@@ -260,7 +272,7 @@ PARALLEL_TEST(JsonColumnTest, test_filter) {
         json_column->append(JsonValue::parse(json_str).value());
     }
 
-    Column::Filter filter(N, 1);
+    Filter filter(N, 1);
     json_column->filter_range(filter, 0, N);
     ASSERT_EQ(N, json_column->size());
 }
@@ -282,7 +294,7 @@ PARALLEL_TEST(JsonColumnTest, test_fmt) {
     std::cerr << json;
 
     std::string str = fmt::format("{}", json);
-    ASSERT_EQ("1", str);
+    ASSERT_EQ("\"1\"", str);
 }
 
 // NOLINTNEXTLINE
@@ -330,7 +342,7 @@ PARALLEL_TEST(JsonColumnTest, test_column_builder) {
             // unwrap nullable column
             Column* unwrapped = ColumnHelper::get_data_column(copy.get());
 
-            JsonColumn* json_column_ptr = down_cast<JsonColumn*>(unwrapped);
+            auto* json_column_ptr = down_cast<JsonColumn*>(unwrapped);
             ASSERT_EQ(1, json_column_ptr->size());
             ASSERT_EQ(0, json_column_ptr->compare_at(0, 0, *column, 0));
         }
@@ -371,4 +383,53 @@ PARALLEL_TEST(JsonColumnTest, test_assign) {
     }
 }
 
-} // namespace starrocks::vectorized
+PARALLEL_TEST(JsonColumnTest, test_serialize) {
+    auto column = RunTimeColumnType<TYPE_JSON>::create();
+    JsonValue json = JsonValue::parse("1").value();
+    column->append(&json);
+
+    EXPECT_EQ(json.serialize_size(), column->serialize_size(0));
+    std::vector<uint8_t> buffer;
+    buffer.resize(json.serialize_size());
+    column->serialize(0, buffer.data());
+
+    // deserialize
+    auto new_column = column->clone_empty();
+    new_column->deserialize_and_append(buffer.data());
+    EXPECT_EQ(0, column->compare_at(0, 0, *new_column, 1));
+}
+
+class JsonConvertTestFixture : public ::testing::TestWithParam<std::tuple<std::string>> {
+public:
+};
+
+TEST_P(JsonConvertTestFixture, convert_from_simdjson) {
+    using namespace simdjson;
+    std::string param_0 = std::get<0>(GetParam());
+    ondemand::parser parser;
+    padded_string json_str(param_0);
+    ondemand::document doc = parser.iterate(json_str);
+    ondemand::object obj = doc.get_object();
+    auto maybe_json = JsonValue::from_simdjson(&obj);
+    ASSERT_TRUE(maybe_json.ok());
+    ASSERT_EQ(json_str.data(), maybe_json.value().to_string_uncheck());
+}
+
+INSTANTIATE_TEST_SUITE_P(JsonConvertTest, JsonConvertTestFixture,
+                         ::testing::Values(
+                                 // clang-format off
+                                    std::make_tuple(R"({"a": 1})"),
+                                    std::make_tuple(R"({"a": null})"),
+                                    std::make_tuple(R"({"a": ""})"),
+                                    std::make_tuple(R"({"a": [1, 2, 3]})"),
+                                    std::make_tuple(R"({"a": {"b": 1}})"),
+
+                                    // empty key
+                                    std::make_tuple(R"({"a": {"": ""}})"),
+                                    // empty array
+                                    std::make_tuple(R"({"a": []})")
+
+                                 // clang-format on
+                                 ));
+
+} // namespace starrocks

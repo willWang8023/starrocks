@@ -1,10 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.planner;
 
-import com.clearspring.analytics.util.Lists;
 import com.google.common.base.Joiner;
 import com.google.common.base.MoreObjects;
+import com.google.common.collect.Lists;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.ExprSubstitutionMap;
@@ -37,8 +50,9 @@ public class JDBCScanNode extends ScanNode {
 
     public JDBCScanNode(PlanNodeId id, TupleDescriptor desc, JDBCTable tbl) {
         super(id, desc, "SCAN JDBC");
-        tableName = "`" + tbl.getJdbcTable() + "`";
         table = tbl;
+        String objectIdentifier = getIdentifierSymbol();
+        tableName = objectIdentifier + tbl.getJdbcTable() + objectIdentifier;
     }
 
     @Override
@@ -81,17 +95,31 @@ public class JDBCScanNode extends ScanNode {
     }
 
     private void createJDBCTableColumns() {
+        String objectIdentifier = getIdentifierSymbol();
         for (SlotDescriptor slot : desc.getSlots()) {
             if (!slot.isMaterialized()) {
                 continue;
             }
             Column col = slot.getColumn();
-            columns.add(col.getName());
+            columns.add(objectIdentifier + col.getName() + objectIdentifier);
         }
         // this happends when count(*)
         if (0 == columns.size()) {
             columns.add("*");
         }
+    }
+
+    private boolean isMysql() {
+        JDBCResource resource = (JDBCResource) GlobalStateMgr.getCurrentState().getResourceMgr()
+                .getResource(table.getResourceName());
+        // Compatible with jdbc catalog
+        String jdbcURI = resource != null ? resource.getProperty(JDBCResource.URI) : table.getProperty(JDBCResource.URI);
+        return jdbcURI.startsWith("jdbc:mysql");
+    }
+
+    private String getIdentifierSymbol() {
+        //TODO: for other jdbc table we need different objectIdentifier to support reserved key words
+        return isMysql() ? "`" : "";
     }
 
     private void createJDBCTableFilters() {
@@ -101,24 +129,22 @@ public class JDBCScanNode extends ScanNode {
         List<SlotRef> slotRefs = Lists.newArrayList();
         Expr.collectList(conjuncts, SlotRef.class, slotRefs);
         ExprSubstitutionMap sMap = new ExprSubstitutionMap();
+        String identifier = getIdentifierSymbol();
         for (SlotRef slotRef : slotRefs) {
             SlotRef tmpRef = (SlotRef) slotRef.clone();
             tmpRef.setTblName(null);
-
+            tmpRef.setLabel(identifier + tmpRef.getLabel() + identifier);
             sMap.put(slotRef, tmpRef);
         }
-        JDBCResource resource = (JDBCResource) GlobalStateMgr.getCurrentState().getResourceMgr()
-                .getResource(table.getResourceName());
-        String jdbcURI = resource.getProperty(JDBCResource.URI);
-        boolean isMySQL = jdbcURI.startsWith("jdbc:mysql");
-        ArrayList<Expr> mysqlConjuncts = Expr.cloneList(conjuncts, sMap);
-        for (Expr p : mysqlConjuncts) {
-            filters.add(p.toJDBCSQL(isMySQL));
+
+        ArrayList<Expr> jdbcConjuncts = Expr.cloneList(conjuncts, sMap);
+        for (Expr p : jdbcConjuncts) {
+            filters.add(p.toJDBCSQL());
         }
     }
 
     @Override
-    public boolean canUsePipeLine() {
+    public boolean canUseRuntimeAdaptiveDop() {
         return true;
     }
 

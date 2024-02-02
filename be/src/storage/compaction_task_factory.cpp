@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/compaction_task_factory.h"
 
@@ -24,7 +36,8 @@ std::shared_ptr<CompactionTask> CompactionTaskFactory::create_compaction_task() 
         return nullptr;
     }
     size_t segment_iterator_num = iterator_num_res.value();
-    size_t num_columns = _tablet->num_columns();
+    auto tablet_schema = CompactionUtils::rowset_with_max_schema_version(_input_rowsets)->schema();
+    size_t num_columns = tablet_schema->num_columns();
     CompactionAlgorithm algorithm = CompactionUtils::choose_compaction_algorithm(
             num_columns, config::vertical_compaction_max_columns_per_group, segment_iterator_num);
     std::shared_ptr<CompactionTask> compaction_task;
@@ -55,9 +68,10 @@ std::shared_ptr<CompactionTask> CompactionTaskFactory::create_compaction_task() 
     compaction_task->set_output_version(_output_version);
     compaction_task->set_tablet(_tablet);
     compaction_task->set_segment_iterator_num(segment_iterator_num);
+    compaction_task->set_tablet_schema(tablet_schema);
     std::unique_ptr<MemTracker> mem_tracker = std::make_unique<MemTracker>(
             MemTracker::COMPACTION, -1, "Compaction-" + std::to_string(compaction_task->task_id()),
-            ExecEnv::GetInstance()->compaction_mem_tracker());
+            GlobalEnv::GetInstance()->compaction_mem_tracker());
     compaction_task->set_mem_tracker(mem_tracker.release());
     return compaction_task;
 }

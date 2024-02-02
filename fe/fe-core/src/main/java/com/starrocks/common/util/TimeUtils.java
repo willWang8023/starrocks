@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/common/util/TimeUtils.java
 
@@ -34,12 +47,15 @@ import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.VariableMgr;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.threeten.extra.PeriodDuration;
 
 import java.text.ParseException;
 import java.text.ParsePosition;
 import java.text.SimpleDateFormat;
+import java.time.Clock;
 import java.time.DateTimeException;
 import java.time.ZoneId;
+import java.time.format.DateTimeParseException;
 import java.util.Date;
 import java.util.SimpleTimeZone;
 import java.util.TimeZone;
@@ -81,6 +97,10 @@ public class TimeUtils {
 
     public static Date MIN_DATETIME = null;
     public static Date MAX_DATETIME = null;
+
+    // It's really hard to define max unix timestamp because of timezone.
+    // so this value is 253402329599(UTC 9999-12-31 23:59:59) - 24 * 3600(for all timezones)
+    public static Long MAX_UNIX_TIMESTAMP = 253402243199L;
 
     static {
         TIME_ZONE = new SimpleTimeZone(8 * 3600 * 1000, "");
@@ -142,9 +162,16 @@ public class TimeUtils {
         return TimeZone.getTimeZone(ZoneId.of(timeZone, TIME_ZONE_ALIAS_MAP));
     }
 
+    /**
+     * Get UNIX timestamp/Epoch second at system timezone
+     */
+    public static long getEpochSeconds() {
+        return Clock.systemDefaultZone().instant().getEpochSecond();
+    }
+
     public static String longToTimeString(long timeStamp, SimpleDateFormat dateFormat) {
         if (timeStamp <= 0L) {
-            return FeConstants.null_string;
+            return FeConstants.NULL_STRING;
         }
         return dateFormat.format(new Date(timeStamp));
     }
@@ -271,23 +298,63 @@ public class TimeUtils {
     }
 
     public static long convertTimeUnitValueToSecond(long value, TimeUnit unit) {
-        switch (unit) {
-            case DAYS:
-                return value * 60 * 60 * 24;
-            case HOURS:
-                return value * 60 * 60;
-            case MINUTES:
-                return value * 60;
-            case SECONDS:
-                return value;
-            case MILLISECONDS:
-                return value / 1000;
-            case MICROSECONDS:
-                return value / 1000 / 1000;
-            case NANOSECONDS:
-                return value / 1000 / 1000 / 1000;
-            default:
-                return 0;
+        return TimeUnit.SECONDS.convert(value, unit);
+    }
+
+    /**
+     * Based on the start seconds, get the seconds closest and greater than the target second by interval,
+     * the interval use period and time unit to calculate.
+     *
+     * @param startTimeSecond  start time second
+     * @param targetTimeSecond target time second
+     * @param period           period
+     * @param timeUnit         time unit
+     * @return next valid time second
+     * @throws DdlException
+     */
+    public static long getNextValidTimeSecond(long startTimeSecond, long targetTimeSecond,
+                                              long period, TimeUnit timeUnit) throws DdlException {
+        if (startTimeSecond > targetTimeSecond) {
+            return startTimeSecond;
         }
+        long intervalSecond = convertTimeUnitValueToSecond(period, timeUnit);
+        if (intervalSecond < 1) {
+            throw new DdlException("Can not get next valid time second," +
+                    "startTimeSecond:" + startTimeSecond +
+                    " period:" + period +
+                    " timeUnit:" + timeUnit);
+        }
+        long difference = targetTimeSecond - startTimeSecond;
+        long step = difference / intervalSecond + 1;
+        return startTimeSecond + step * intervalSecond;
+    }
+
+    public static PeriodDuration parseHumanReadablePeriodOrDuration(String text) {
+        try {
+            return PeriodDuration.of(PeriodStyle.LONG.parse(text));
+        } catch (DateTimeParseException ignored) {
+            return PeriodDuration.of(DurationStyle.LONG.parse(text));
+        }
+    }
+
+    public static String toHumanReadableString(PeriodDuration periodDuration) {
+        if (periodDuration.getPeriod().isZero()) {
+            return DurationStyle.LONG.toString(periodDuration.getDuration());
+        } else if (periodDuration.getDuration().isZero()) {
+            return PeriodStyle.LONG.toString(periodDuration.getPeriod());
+        } else {
+            return PeriodStyle.LONG.toString(periodDuration.getPeriod()) + " "
+                    + DurationStyle.LONG.toString(periodDuration.getDuration());
+        }
+    }
+
+    public static String getSessionTimeZone() {
+        String timezone;
+        if (ConnectContext.get() != null) {
+            timezone = ConnectContext.get().getSessionVariable().getTimeZone();
+        } else {
+            timezone = VariableMgr.getDefaultSessionVariable().getTimeZone();
+        }
+        return timezone;
     }
 }

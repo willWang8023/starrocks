@@ -42,7 +42,7 @@ bool BackendOptions::init() {
     Status status = get_hosts_v4(&hosts);
 
     if (!status.ok()) {
-        LOG(FATAL) << status.get_error_msg();
+        LOG(FATAL) << status.message();
         return false;
     }
 
@@ -52,7 +52,7 @@ bool BackendOptions::init() {
     }
 
     std::string loopback;
-    std::vector<InetAddress>::iterator addr_it = hosts.begin();
+    auto addr_it = hosts.begin();
     for (; addr_it != hosts.end(); ++addr_it) {
         if ((*addr_it).is_address_v4()) {
             VLOG(2) << "check ip=" << addr_it->get_host_address_v4();
@@ -74,7 +74,7 @@ bool BackendOptions::init() {
         LOG(INFO) << "fail to find one valid non-loopback address, use loopback address.";
         _s_localhost = loopback;
     }
-    LOG(INFO) << "local host" << _s_localhost;
+    LOG(INFO) << "localhost " << _s_localhost;
     return true;
 }
 
@@ -85,7 +85,7 @@ std::string BackendOptions::get_localhost() {
 TBackend BackendOptions::get_localBackend() {
     _backend.__set_host(_s_localhost);
     _backend.__set_be_port(config::be_port);
-    _backend.__set_http_port(config::webserver_port);
+    _backend.__set_http_port(config::be_http_port);
     return _backend;
 }
 

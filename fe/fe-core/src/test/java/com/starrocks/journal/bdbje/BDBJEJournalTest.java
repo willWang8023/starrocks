@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.journal.bdbje;
 
@@ -124,29 +137,29 @@ public class BDBJEJournalTest {
         writable.write(buffer);
 
         // 1. initial check
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
 
         // 2. begin
         journal.batchWriteBegin();
-        Assert.assertNotNull(journal.currentTrasaction);
+        Assert.assertNotNull(journal.currentTransaction);
 
         // 3. write 1
         journal.batchWriteAppend(1, buffer);
 
         // 4. commit 1
         journal.batchWriteCommit();
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
 
         // 3. write 2 logs & commit
         journal.batchWriteBegin();
-        Assert.assertNotNull(journal.currentTrasaction);
+        Assert.assertNotNull(journal.currentTransaction);
         journal.batchWriteAppend(2, buffer);
         journal.batchWriteAppend(3, buffer);
-        Assert.assertNotNull(journal.currentTrasaction);
+        Assert.assertNotNull(journal.currentTransaction);
 
         // 4. commmit
         journal.batchWriteCommit();
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
 
         // 5. check by read
         for (int i = 1; i != 4; i++) {
@@ -156,12 +169,12 @@ public class BDBJEJournalTest {
 
         // 6. abort
         journal.batchWriteAbort();
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
 
         // 7. begin -> abort
         journal.batchWriteBegin();
         journal.batchWriteAbort();
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
 
         // 8. write log -> abort
         journal.batchWriteBegin();
@@ -256,7 +269,7 @@ public class BDBJEJournalTest {
         };
 
         journal.batchWriteBegin();
-        Assert.assertNotNull(journal.currentTrasaction);
+        Assert.assertNotNull(journal.currentTransaction);
         journal.batchWriteAppend(1, buffer);
     }
 
@@ -429,7 +442,7 @@ public class BDBJEJournalTest {
             @Mocked BDBEnvironment environment) throws Exception {
         BDBJEJournal journal = new BDBJEJournal(environment, database);
         journal.batchWriteBegin();
-        Assert.assertNotNull(journal.currentTrasaction);
+        Assert.assertNotNull(journal.currentTransaction);
         journal.batchWriteBegin();
         Assert.fail();
     }
@@ -444,28 +457,28 @@ public class BDBJEJournalTest {
         DataOutputBuffer buffer = new DataOutputBuffer();
         Text.writeString(buffer, data);
 
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
         journal.batchWriteAbort();
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
 
         journal.batchWriteBegin();
-        Assert.assertNotNull(journal.currentTrasaction);
+        Assert.assertNotNull(journal.currentTransaction);
         journal.batchWriteAbort();
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
 
         journal.batchWriteBegin();
-        Assert.assertNotNull(journal.currentTrasaction);
+        Assert.assertNotNull(journal.currentTransaction);
         journal.batchWriteAppend(1, buffer);
         journal.batchWriteAbort();
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
 
         journal.batchWriteBegin();
-        Assert.assertNotNull(journal.currentTrasaction);
+        Assert.assertNotNull(journal.currentTransaction);
         journal.batchWriteAppend(2, buffer);
         journal.batchWriteCommit();
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
         journal.batchWriteAbort();
-        Assert.assertNull(journal.currentTrasaction);
+        Assert.assertNull(journal.currentTransaction);
     }
 
 

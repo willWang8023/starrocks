@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/test/olap/rowset/segment_v2/ordinal_page_index_test.cpp
 
@@ -40,16 +53,13 @@ public:
     const std::string kTestDir = "/ordinal_page_index_test";
 
     void SetUp() override {
-        _mem_tracker = std::make_unique<MemTracker>();
-        StoragePageCache::create_global_cache(_mem_tracker.get(), 1000000000);
         _fs = std::make_shared<MemoryFileSystem>();
         ASSERT_TRUE(_fs->create_dir(kTestDir).ok());
     }
 
-    void TearDown() override { StoragePageCache::release_global_cache(); }
+    void TearDown() override { StoragePageCache::instance()->prune(); }
 
 protected:
-    std::unique_ptr<MemTracker> _mem_tracker = nullptr;
     std::shared_ptr<MemoryFileSystem> _fs = nullptr;
 };
 
@@ -74,9 +84,15 @@ TEST_F(OrdinalPageIndexTest, normal) {
         LOG(INFO) << "index page size=" << index_meta.ordinal_index().root_page().root_page().size();
     }
 
+    IndexReadOptions opts;
+    ASSIGN_OR_ABORT(auto rfile, _fs->new_random_access_file(filename))
+    opts.read_file = rfile.get();
+    opts.use_page_cache = true;
+    opts.kept_in_memory = false;
+    OlapReaderStatistics stats;
+    opts.stats = &stats;
     OrdinalIndexReader index;
-    ASSIGN_OR_ABORT(auto r,
-                    index.load(_fs.get(), filename, index_meta.ordinal_index(), 16 * 1024 * 4096 + 1, true, false));
+    ASSIGN_OR_ABORT(auto r, index.load(opts, index_meta.ordinal_index(), 16 * 1024 * 4096 + 1));
     ASSERT_TRUE(r);
     ASSERT_EQ(16 * 1024, index.num_data_pages());
     ASSERT_EQ(1, index.get_first_ordinal(0));
@@ -130,8 +146,14 @@ TEST_F(OrdinalPageIndexTest, one_data_page) {
         ASSERT_EQ(data_page_pointer, root_page_pointer);
     }
 
+    IndexReadOptions opts;
+    opts.read_file = nullptr;
+    opts.use_page_cache = true;
+    opts.kept_in_memory = false;
+    OlapReaderStatistics stats;
+    opts.stats = &stats;
     OrdinalIndexReader index;
-    ASSIGN_OR_ABORT(auto r, index.load(_fs.get(), "", index_meta.ordinal_index(), num_values, true, false));
+    ASSIGN_OR_ABORT(auto r, index.load(opts, index_meta.ordinal_index(), num_values));
     ASSERT_TRUE(r);
     ASSERT_EQ(1, index.num_data_pages());
     ASSERT_EQ(0, index.get_first_ordinal(0));

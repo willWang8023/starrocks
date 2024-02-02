@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/hash_util.hpp
 
@@ -118,6 +131,7 @@ public:
 
     // refer to https://github.com/apache/commons-codec/blob/master/src/main/java/org/apache/commons/codec/digest/MurmurHash3.java
     static const uint32_t MURMUR3_32_SEED = 104729;
+    static const uint64_t XXHASH3_64_SEED = 0;
 
     ALWAYS_INLINE static uint32_t rotl32(uint32_t x, int8_t r) { return (x << r) | (x >> (32 - r)); }
 
@@ -173,54 +187,11 @@ public:
         return h1;
     }
 
-    static const int MURMUR_R = 47;
-
-    // Murmur2 hash implementation returning 64-bit hashes.
-    static uint64_t murmur_hash2_64(const void* input, int len, uint64_t seed) {
-        uint64_t h = seed ^ (len * MURMUR_PRIME);
-
-        const uint64_t* data = reinterpret_cast<const uint64_t*>(input);
-        const uint64_t* end = data + (len / sizeof(uint64_t));
-
-        while (data != end) {
-            uint64_t k = *data++;
-            k *= MURMUR_PRIME;
-            k ^= k >> MURMUR_R;
-            k *= MURMUR_PRIME;
-            h ^= k;
-            h *= MURMUR_PRIME;
-        }
-
-        const uint8_t* data2 = reinterpret_cast<const uint8_t*>(data);
-        switch (len & 7) {
-        case 7:
-            h ^= uint64_t(data2[6]) << 48;
-        case 6:
-            h ^= uint64_t(data2[5]) << 40;
-        case 5:
-            h ^= uint64_t(data2[4]) << 32;
-        case 4:
-            h ^= uint64_t(data2[3]) << 24;
-        case 3:
-            h ^= uint64_t(data2[2]) << 16;
-        case 2:
-            h ^= uint64_t(data2[1]) << 8;
-        case 1:
-            h ^= uint64_t(data2[0]);
-            h *= MURMUR_PRIME;
-        }
-
-        h ^= h >> MURMUR_R;
-        h *= MURMUR_PRIME;
-        h ^= h >> MURMUR_R;
-        return h;
-    }
+    static uint64_t xx_hash3_64(const void* key, int32_t len, uint64_t seed);
 
     // default values recommended by http://isthe.com/chongo/tech/comp/fnv/
     static const uint32_t FNV_PRIME = 0x01000193;    //   16777619
     static constexpr uint32_t FNV_SEED = 0x811C9DC5; // 2166136261
-    static const uint64_t FNV64_PRIME = 1099511628211UL;
-    static const uint64_t FNV64_SEED = 14695981039346656037UL;
     static const uint64_t MURMUR_PRIME = 0xc6a4a7935bd1e995ULL;
     static const uint32_t MURMUR_SEED = 0xadc83b19ULL;
     // Implementation of the Fowler-Noll-Vo hash function.  This is not as performant
@@ -234,17 +205,6 @@ public:
 
         while (bytes--) {
             hash = (*ptr ^ hash) * FNV_PRIME;
-            ++ptr;
-        }
-
-        return hash;
-    }
-
-    static uint64_t fnv_hash64(const void* data, int32_t bytes, uint64_t hash) {
-        const uint8_t* ptr = reinterpret_cast<const uint8_t*>(data);
-
-        while (bytes--) {
-            hash = (*ptr ^ hash) * FNV64_PRIME;
             ++ptr;
         }
 
@@ -355,63 +315,6 @@ public:
         T t;
         memcpy(&t, ptr, sizeof(T));
         return t;
-    }
-
-    // Modify from https://github.com/martinus/robin-hood-hashing/blob/master/src/include/robin_hood.h
-    // Hash an arbitrary amount of bytes. This is basically Murmur2 hash without caring about big
-    // endianness. TODO(martinus) add a fallback for very large strings?
-    static size_t hash_bytes(void const* ptr, size_t const len) noexcept {
-        static constexpr uint64_t m = UINT64_C(0xc6a4a7935bd1e995);
-        static constexpr uint64_t seed = UINT64_C(0xe17a1465);
-        static constexpr unsigned int r = 47;
-
-        auto const data64 = static_cast<uint64_t const*>(ptr);
-        uint64_t h = seed ^ (len * m);
-
-        size_t const n_blocks = len / 8;
-        for (size_t i = 0; i < n_blocks; ++i) {
-            auto k = unaligned_load<uint64_t>(data64 + i);
-
-            k *= m;
-            k ^= k >> r;
-            k *= m;
-
-            h ^= k;
-            h *= m;
-        }
-
-        auto const data8 = reinterpret_cast<uint8_t const*>(data64 + n_blocks);
-        switch (len & 7U) {
-        case 7:
-            h ^= static_cast<uint64_t>(data8[6]) << 48U;
-            break;
-        case 6:
-            h ^= static_cast<uint64_t>(data8[5]) << 40U;
-            break;
-        case 5:
-            h ^= static_cast<uint64_t>(data8[4]) << 32U;
-            break;
-        case 4:
-            h ^= static_cast<uint64_t>(data8[3]) << 24U;
-            break;
-        case 3:
-            h ^= static_cast<uint64_t>(data8[2]) << 16U;
-            break;
-        case 2:
-            h ^= static_cast<uint64_t>(data8[1]) << 8U;
-            break;
-        case 1:
-            h ^= static_cast<uint64_t>(data8[0]);
-            h *= m;
-            break;
-        default:
-            break;
-        }
-
-        h ^= h >> r;
-        h *= m;
-        h ^= h >> r;
-        return static_cast<size_t>(h);
     }
 
     // Xorshift is a pseudorandom number generator, which is an implementation of

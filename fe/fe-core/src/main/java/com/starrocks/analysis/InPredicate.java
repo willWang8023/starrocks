@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/InPredicate.java
 
@@ -21,9 +34,11 @@
 
 package com.starrocks.analysis;
 
+import com.google.common.base.Objects;
 import com.google.common.base.Preconditions;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
 import com.starrocks.thrift.TExprOpcode;
@@ -43,14 +58,21 @@ public class InPredicate extends Predicate {
     // First child is the comparison expr for which we
     // should check membership in the inList (the remaining children).
     public InPredicate(Expr compareExpr, List<Expr> inList, boolean isNotIn) {
+        this(compareExpr, inList, isNotIn, NodePosition.ZERO);
+    }
+
+    public InPredicate(Expr compareExpr, List<Expr> inList, boolean isNotIn, NodePosition pos) {
+        super(pos);
         children.add(compareExpr);
         children.addAll(inList);
         this.isNotIn = isNotIn;
+        this.opcode = isNotIn ? TExprOpcode.FILTER_NOT_IN : TExprOpcode.FILTER_IN;
     }
 
     protected InPredicate(InPredicate other) {
         super(other);
         isNotIn = other.isNotIn();
+        this.opcode = isNotIn ? TExprOpcode.FILTER_NOT_IN : TExprOpcode.FILTER_IN;
     }
 
     public int getInElementNum() {
@@ -65,11 +87,17 @@ public class InPredicate extends Predicate {
 
     // C'tor for initializing an [NOT] IN predicate with a subquery child.
     public InPredicate(Expr compareExpr, Expr subquery, boolean isNotIn) {
+        this(compareExpr, subquery, isNotIn, NodePosition.ZERO);
+    }
+
+    public InPredicate(Expr compareExpr, Expr subquery, boolean isNotIn, NodePosition pos) {
+        super(pos);
         Preconditions.checkNotNull(compareExpr);
         Preconditions.checkNotNull(subquery);
         children.add(compareExpr);
         children.add(subquery);
         this.isNotIn = isNotIn;
+        this.opcode = isNotIn ? TExprOpcode.FILTER_NOT_IN : TExprOpcode.FILTER_IN;
     }
 
     /**
@@ -106,7 +134,11 @@ public class InPredicate extends Predicate {
         msg.node_type = TExprNodeType.IN_PRED;
         msg.setOpcode(opcode);
         msg.setVector_opcode(vectorOpcode);
-        msg.setChild_type(getChild(0).getType().getPrimitiveType().toThrift());
+        if (getChild(0).getType().isComplexType()) {
+            msg.setChild_type_desc(getChild(0).getType().toThrift());
+        } else {
+            msg.setChild_type(getChild(0).getType().getPrimitiveType().toThrift());
+        }
     }
 
     @Override
@@ -125,6 +157,11 @@ public class InPredicate extends Predicate {
     @Override
     public String toString() {
         return toSql();
+    }
+
+    @Override
+    public int hashCode() {
+        return Objects.hashCode(super.hashCode(), isNotIn);
     }
 
     @Override

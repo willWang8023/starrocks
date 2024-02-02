@@ -1,10 +1,22 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/column_or_predicate.h"
 
 #include "common/object_pool.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 Status ColumnOrPredicate::evaluate(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const {
     return _evaluate(column, selection, from, to);
@@ -36,7 +48,7 @@ bool ColumnOrPredicate::zone_map_filter(const ZoneMapDetail& detail) const {
 }
 
 Status ColumnOrPredicate::_evaluate(const Column* column, uint8_t* selection, uint16_t from, uint16_t to) const {
-    _child[0]->evaluate(column, selection, from, to);
+    RETURN_IF_ERROR(_child[0]->evaluate(column, selection, from, to));
     for (size_t i = 1; i < _child.size(); i++) {
         RETURN_IF_ERROR(_child[i]->evaluate_or(column, selection, from, to));
     }
@@ -56,4 +68,4 @@ Status ColumnOrPredicate::convert_to(const ColumnPredicate** output, const TypeI
     return Status::OK();
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

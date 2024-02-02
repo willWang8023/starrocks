@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "http/action/transaction_stream_load.h"
 
@@ -77,10 +89,13 @@ TransactionManagerAction::TransactionManagerAction(ExecEnv* exec_env) : _exec_en
 TransactionManagerAction::~TransactionManagerAction() = default;
 
 static void _send_reply(HttpRequest* req, const std::string& str) {
+    if (config::enable_stream_load_verbose_log) {
+        LOG(INFO) << "transaction streaming load response: " << str;
+    }
     HttpChannel::send_reply(req, str);
 }
 
-void TransactionManagerAction::_send_error_reply(HttpRequest* req, Status st) {
+void TransactionManagerAction::_send_error_reply(HttpRequest* req, const Status& st) {
     auto ctx = std::make_unique<StreamLoadContext>(_exec_env);
     ctx->label = req->header(HTTP_LABEL_KEY);
 
@@ -120,7 +135,7 @@ TransactionStreamLoadAction::TransactionStreamLoadAction(ExecEnv* exec_env) : _e
 
 TransactionStreamLoadAction::~TransactionStreamLoadAction() = default;
 
-void TransactionStreamLoadAction::_send_error_reply(HttpRequest* req, Status st) {
+void TransactionStreamLoadAction::_send_error_reply(HttpRequest* req, const Status& st) {
     auto ctx = std::make_unique<StreamLoadContext>(_exec_env);
     ctx->label = req->header(HTTP_LABEL_KEY);
 
@@ -129,7 +144,14 @@ void TransactionStreamLoadAction::_send_error_reply(HttpRequest* req, Status st)
 }
 
 void TransactionStreamLoadAction::handle(HttpRequest* req) {
-    auto ctx = _exec_env->stream_context_mgr()->get(req->header(HTTP_LABEL_KEY));
+    StreamLoadContext* ctx = nullptr;
+    const auto& label = req->header(HTTP_LABEL_KEY);
+    if (!req->header(HTTP_CHANNEL_ID).empty()) {
+        int channel_id = std::stoi(req->header(HTTP_CHANNEL_ID));
+        ctx = _exec_env->stream_context_mgr()->get_channel_context(label, channel_id);
+    } else {
+        ctx = _exec_env->stream_context_mgr()->get(label);
+    }
     if (ctx == nullptr) {
         return;
     }
@@ -142,7 +164,7 @@ void TransactionStreamLoadAction::handle(HttpRequest* req) {
 
     if (!ctx->status.ok()) {
         if (ctx->need_rollback) {
-            _exec_env->transaction_mgr()->_rollback_transaction(ctx);
+            (void)_exec_env->transaction_mgr()->_rollback_transaction(ctx);
         }
     }
 
@@ -151,23 +173,35 @@ void TransactionStreamLoadAction::handle(HttpRequest* req) {
     // For JSON, now the buffer contains a complete json.
     if (ctx->buffer != nullptr && ctx->buffer->pos > 0) {
         ctx->buffer->flip();
-        ctx->body_sink->append(std::move(ctx->buffer));
+        WARN_IF_ERROR(ctx->body_sink->append(std::move(ctx->buffer)),
+                      "append MessageBodySink failed when handle TransactionStreamLoad");
         ctx->buffer = nullptr;
     }
 
     auto resp = _exec_env->transaction_mgr()->_build_reply(TXN_LOAD, ctx);
     ctx->lock.unlock();
+
     _send_reply(req, resp);
 }
 
 int TransactionStreamLoadAction::on_header(HttpRequest* req) {
-    auto label = req->header(HTTP_LABEL_KEY);
+    if (config::enable_stream_load_verbose_log) {
+        LOG(INFO) << "transaction streaming load request: " << req->debug_string();
+    }
+
+    const auto& label = req->header(HTTP_LABEL_KEY);
     if (label.empty()) {
         _send_error_reply(req, Status::InvalidArgument(fmt::format("Invalid label {}", req->header(HTTP_LABEL_KEY))));
         return -1;
     }
 
-    auto ctx = _exec_env->stream_context_mgr()->get(label);
+    StreamLoadContext* ctx = nullptr;
+    if (!req->header(HTTP_CHANNEL_ID).empty()) {
+        int channel_id = std::stoi(req->header(HTTP_CHANNEL_ID));
+        ctx = _exec_env->stream_context_mgr()->get_channel_context(label, channel_id);
+    } else {
+        ctx = _exec_env->stream_context_mgr()->get(label);
+    }
     if (ctx == nullptr) {
         _send_error_reply(req, Status::TransactionNotExists(fmt::format("Transaction with label {} not exists",
                                                                         req->header(HTTP_LABEL_KEY))));
@@ -206,7 +240,7 @@ int TransactionStreamLoadAction::on_header(HttpRequest* req) {
     if (!st.ok()) {
         ctx->status = st;
         if (ctx->need_rollback) {
-            _exec_env->transaction_mgr()->_rollback_transaction(ctx);
+            (void)_exec_env->transaction_mgr()->_rollback_transaction(ctx);
         }
         auto resp = _exec_env->transaction_mgr()->_build_reply(TXN_LOAD, ctx);
         ctx->lock.unlock();
@@ -225,10 +259,10 @@ Status TransactionStreamLoadAction::_on_header(HttpRequest* http_req, StreamLoad
     if (!http_req->header(HttpHeaders::CONTENT_LENGTH).empty()) {
         ctx->body_bytes += std::stol(http_req->header(HttpHeaders::CONTENT_LENGTH));
         if (ctx->body_bytes > max_body_bytes) {
-            LOG(WARNING) << "body exceed max size." << ctx->brief();
-
             std::stringstream ss;
-            ss << "body exceed max size: " << max_body_bytes << ", limit: " << max_body_bytes;
+            ss << "body size " << ctx->body_bytes << " exceed limit: " << max_body_bytes << ", " << ctx->brief()
+               << ". You can increase the limit by setting streaming_load_max_mb in be.conf.";
+            LOG(WARNING) << ss.str();
             return Status::InternalError(ss.str());
         }
     } else {
@@ -239,8 +273,22 @@ Status TransactionStreamLoadAction::_on_header(HttpRequest* http_req, StreamLoad
     }
     // get format of this put
     if (http_req->header(HTTP_FORMAT_KEY).empty()) {
-        ctx->format = TFileFormatType::FORMAT_CSV_PLAIN;
+        if (ctx->is_channel_stream_load_context()) {
+            if (ctx->format != TFileFormatType::FORMAT_CSV_PLAIN) {
+                std::string err_msg =
+                        "stream load context's format is not default format TFileFormatType::FORMAT_CSV_PLAIN";
+                return Status::InternalError(err_msg);
+            }
+        } else {
+            ctx->format = TFileFormatType::FORMAT_CSV_PLAIN;
+        }
     } else {
+        if (ctx->is_channel_stream_load_context() &&
+            ctx->format != parse_stream_load_format(http_req->header(HTTP_FORMAT_KEY))) {
+            std::string err_msg = "stream load context's format is not same as format from cur http header";
+            return Status::InternalError(err_msg);
+        }
+
         ctx->format = parse_stream_load_format(http_req->header(HTTP_FORMAT_KEY));
         if (ctx->format == TFileFormatType::FORMAT_UNKNOWN) {
             std::stringstream ss;
@@ -348,6 +396,18 @@ Status TransactionStreamLoadAction::_parse_request(HttpRequest* http_req, Stream
     } else {
         request.__set_partial_update(false);
     }
+    if (!http_req->header(HTTP_MERGE_CONDITION).empty()) {
+        request.__set_merge_condition(http_req->header(HTTP_MERGE_CONDITION));
+    }
+    if (!http_req->header(HTTP_PARTIAL_UPDATE_MODE).empty()) {
+        if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "row") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::ROW_MODE);
+        } else if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "auto") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::AUTO_MODE);
+        } else if (http_req->header(HTTP_PARTIAL_UPDATE_MODE) == "column") {
+            request.__set_partial_update_mode(TPartialUpdateMode::type::COLUMN_UPSERT_MODE);
+        }
+    }
     if (!http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE).empty()) {
         request.__set_transmission_compression_type(http_req->header(HTTP_TRANSMISSION_COMPRESSION_TYPE));
     }
@@ -367,6 +427,9 @@ Status TransactionStreamLoadAction::_parse_request(HttpRequest* http_req, Stream
 }
 
 Status TransactionStreamLoadAction::_exec_plan_fragment(HttpRequest* http_req, StreamLoadContext* ctx) {
+    if (ctx->is_channel_stream_load_context()) {
+        return Status::OK();
+    }
     TStreamLoadPutRequest request;
     RETURN_IF_ERROR(_parse_request(http_req, ctx, request));
     if (ctx->request.db != "") {
@@ -399,12 +462,14 @@ Status TransactionStreamLoadAction::_exec_plan_fragment(HttpRequest* http_req, S
             master_addr.hostname, master_addr.port,
             [&request, ctx](FrontendServiceConnection& client) { client->streamLoadPut(ctx->put_result, request); }));
     ctx->stream_load_put_cost_nanos = MonotonicNanos() - stream_load_put_start_time;
+    ctx->timeout_second = ctx->put_result.params.query_options.query_timeout;
+    ctx->request.__set_timeout(ctx->timeout_second);
 #else
     ctx->put_result = k_stream_load_put_result;
 #endif
     Status plan_status(ctx->put_result.status);
     if (!plan_status.ok()) {
-        LOG(WARNING) << "plan streaming load failed. errmsg=" << plan_status.get_error_msg() << " " << ctx->brief();
+        LOG(WARNING) << "plan streaming load failed. errmsg=" << plan_status.message() << " " << ctx->brief();
         return plan_status;
     }
     VLOG(3) << "params is " << apache::thrift::ThriftDebugString(ctx->put_result.params);
@@ -422,7 +487,14 @@ Status TransactionStreamLoadAction::_exec_plan_fragment(HttpRequest* http_req, S
 }
 
 void TransactionStreamLoadAction::on_chunk_data(HttpRequest* req) {
-    auto ctx = _exec_env->stream_context_mgr()->get(req->header(HTTP_LABEL_KEY));
+    StreamLoadContext* ctx = nullptr;
+    const string& label = req->header(HTTP_LABEL_KEY);
+    if (!req->header(HTTP_CHANNEL_ID).empty()) {
+        int channel_id = std::stoi(req->header(HTTP_CHANNEL_ID));
+        ctx = _exec_env->stream_context_mgr()->get_channel_context(label, channel_id);
+    } else {
+        ctx = _exec_env->stream_context_mgr()->get(label);
+    }
     if (ctx == nullptr) {
         return;
     }

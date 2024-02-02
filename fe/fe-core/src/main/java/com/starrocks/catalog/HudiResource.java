@@ -1,9 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.catalog;
 
 import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
+import com.google.common.collect.Maps;
 import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.DdlException;
 import com.starrocks.common.proc.BaseProcResult;
@@ -32,6 +46,9 @@ public class HudiResource extends Resource {
     @SerializedName(value = "metastoreURIs")
     private String metastoreURIs;
 
+    @SerializedName(value = "properties")
+    private Map<String, String> properties;
+
     public HudiResource(String name) {
         super(name, ResourceType.HUDI);
     }
@@ -39,7 +56,7 @@ public class HudiResource extends Resource {
     @Override
     protected void setProperties(Map<String, String> properties) throws DdlException {
         Preconditions.checkState(properties != null);
-
+        this.properties = Maps.newHashMap(properties);
         metastoreURIs = properties.get(HIVE_METASTORE_URIS);
         if (StringUtils.isBlank(metastoreURIs)) {
             throw new DdlException(HIVE_METASTORE_URIS + " must be set in properties");
@@ -55,6 +72,10 @@ public class HudiResource extends Resource {
 
     public String getHiveMetastoreURIs() {
         return metastoreURIs;
+    }
+
+    public Map<String, String> getProperties() {
+        return properties == null ? Maps.newHashMap() : properties;
     }
 
     /**

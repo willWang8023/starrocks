@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/data_stream_mgr.h
 
@@ -21,17 +34,15 @@
 
 #pragma once
 
+#include <bthread/mutex.h>
+
 #include <list>
 #include <mutex>
 #include <set>
-
-#include "common/compiler_util.h"
-DIAGNOSTIC_PUSH
-DIAGNOSTIC_IGNORE("-Wclass-memaccess")
-#include <bthread/mutex.h>
-DIAGNOSTIC_POP
+#include <shared_mutex>
 
 #include "column/vectorized_fwd.h"
+#include "common/compiler_util.h"
 #include "common/object_pool.h"
 #include "common/status.h"
 #include "gen_cpp/Types_types.h" // for TUniqueId
@@ -43,18 +54,15 @@ DIAGNOSTIC_POP
 #include "util/phmap/phmap.h"
 #include "util/runtime_profile.h"
 
-namespace google {
-namespace protobuf {
+namespace google::protobuf {
 class Closure;
-}
-} // namespace google
+} // namespace google::protobuf
 
 namespace starrocks {
 
 class DescriptorTbl;
 class DataStreamRecvr;
 class RuntimeState;
-class PRowBatch;
 class PUniqueId;
 class PTransmitChunkParams;
 
@@ -76,6 +84,7 @@ class PTransmitChunkParams;
 class DataStreamMgr {
 public:
     DataStreamMgr();
+    ~DataStreamMgr();
 
     // Create a receiver for a specific fragment_instance_id/node_id destination;
     // If is_merging is true, the receiver maintains a separate queue of incoming row
@@ -85,16 +94,14 @@ public:
     // caller.
     std::shared_ptr<DataStreamRecvr> create_recvr(RuntimeState* state, const RowDescriptor& row_desc,
                                                   const TUniqueId& fragment_instance_id, PlanNodeId dest_node_id,
-                                                  int num_senders, int buffer_size,
-                                                  const std::shared_ptr<RuntimeProfile>& profile, bool is_merging,
+                                                  int num_senders, int buffer_size, bool is_merging,
                                                   std::shared_ptr<QueryStatisticsRecvr> sub_plan_query_statistics_recvr,
                                                   bool is_pipeline, int32_t degree_of_parallelism, bool keep_order);
-
-    Status transmit_data(const PTransmitDataParams* request, ::google::protobuf::Closure** done);
 
     Status transmit_chunk(const PTransmitChunkParams& request, ::google::protobuf::Closure** done);
     // Closes all receivers registered for fragment_instance_id immediately.
     void cancel(const TUniqueId& fragment_instance_id);
+    void close();
 
     void prepare_pass_through_chunk_buffer(const TUniqueId& query_id);
     void destroy_pass_through_chunk_buffer(const TUniqueId& query_id);
@@ -105,7 +112,7 @@ private:
     static const uint32_t BUCKET_NUM = 127;
 
     // protects all fields below
-    typedef bthread::Mutex Mutex;
+    typedef std::shared_mutex Mutex;
     Mutex _lock[BUCKET_NUM];
 
     // map from hash value of fragment instance id/node id pair to stream receivers;
@@ -122,7 +129,7 @@ private:
     std::shared_ptr<DataStreamRecvr> find_recvr(const TUniqueId& fragment_instance_id, PlanNodeId node_id);
 
     // Remove receiver block for fragment_instance_id/node_id from the map.
-    Status deregister_recvr(const TUniqueId& fragment_instance_id, PlanNodeId node_id);
+    void deregister_recvr(const TUniqueId& fragment_instance_id, PlanNodeId node_id);
 
     inline uint32_t get_bucket(const TUniqueId& fragment_instance_id);
 

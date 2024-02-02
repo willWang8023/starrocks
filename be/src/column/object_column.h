@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -6,22 +18,13 @@
 
 #include "column/column.h"
 #include "column/datum.h"
+#include "column/vectorized_fwd.h"
 #include "common/object_pool.h"
 #include "types/bitmap_value.h"
 #include "types/hll.h"
+#include "util/percentile_value.h"
 
-namespace starrocks::vectorized {
-
-//class Object {
-//    Object();
-//
-//    Object(const Slice& s);
-//
-//    void clear();
-//
-//    size_t serialize_size() const;
-//    size_t serialize(uint8_t* dst) const;
-//};
+namespace starrocks {
 
 template <typename T>
 class ObjectColumn : public ColumnFactory<Column, ObjectColumn<T>> {
@@ -29,6 +32,7 @@ class ObjectColumn : public ColumnFactory<Column, ObjectColumn<T>> {
 
 public:
     using ValueType = T;
+    using Container = Buffer<ValueType*>;
 
     ObjectColumn() = default;
 
@@ -81,6 +85,8 @@ public:
 
     void append(T&& object);
 
+    void append(const T& object);
+
     void append_datum(const Datum& datum) override { append(datum.get<T*>()); }
 
     void remove_first_n_values(size_t count) override;
@@ -106,7 +112,7 @@ public:
 
     void fill_default(const Filter& filter) override;
 
-    Status update_rows(const Column& src, const uint32_t* indexes) override;
+    void update_rows(const Column& src, const uint32_t* indexes) override;
 
     uint32_t serialize(size_t idx, uint8_t* pos) override;
     uint32_t serialize_default(uint8_t* pos) override;
@@ -126,7 +132,7 @@ public:
 
     ColumnPtr clone_shared() const override;
 
-    size_t filter_range(const Column::Filter& filter, size_t from, size_t to) override;
+    size_t filter_range(const Filter& filter, size_t from, size_t to) override;
 
     int compare_at(size_t left, size_t right, const Column& rhs, int nan_direction_hint) const override;
 
@@ -156,9 +162,9 @@ public:
 
     size_t container_memory_usage() const override { return _pool.capacity() * type_size(); }
 
-    size_t element_memory_usage() const override { return byte_size(); }
+    size_t reference_memory_usage() const override { return byte_size(); }
 
-    size_t element_memory_usage(size_t from, size_t size) const override { return byte_size(from, size); }
+    size_t reference_memory_usage(size_t from, size_t size) const override { return byte_size(from, size); }
 
     void swap_column(Column& rhs) override {
         auto& r = down_cast<ObjectColumn&>(rhs);
@@ -179,17 +185,22 @@ public:
         _buffer.clear();
     }
 
+    void reset_cache() {
+        _cache_ok = false;
+        _cache.clear();
+    }
+
     Buffer<T>& get_pool() { return _pool; }
 
     const Buffer<T>& get_pool() const { return _pool; }
 
-    std::string debug_item(uint32_t idx) const override;
+    std::string debug_item(size_t idx) const override;
 
     std::string debug_string() const override {
         std::stringstream ss;
         ss << "[";
         size_t size = this->size();
-        for (int i = 0; i < size - 1; ++i) {
+        for (size_t i = 0; i < size - 1; ++i) {
             ss << debug_item(i) << ", ";
         }
         if (size > 0) {
@@ -216,7 +227,12 @@ public:
 
     bool has_large_column() const override { return false; }
 
+    void check_or_die() const {}
+
 private:
+    // add this to avoid warning clang-diagnostic-overloaded-virtual
+    using Column::append;
+
     void _build_cache() const {
         if (_cache_ok) {
             return;
@@ -234,8 +250,6 @@ private:
     // Currently, only for data loading
     void _build_slices() const;
 
-    void check_or_die() const override {}
-
 private:
     Buffer<T> _pool;
     mutable bool _cache_ok = false;
@@ -245,4 +259,4 @@ private:
     mutable Buffer<Slice> _slices;
     mutable Buffer<uint8_t> _buffer;
 };
-} // namespace starrocks::vectorized
+} // namespace starrocks

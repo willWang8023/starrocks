@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
 import com.starrocks.sql.ast.QueryRelation;
@@ -38,18 +51,40 @@ public class AnalyzeSubqueryTest {
         analyzeSuccess(
                 "select v1 from t0 where v2 in (select v4 from t1 where v3 = v5) or v2 = (select v4 from t1 where v3 = v5)");
         analyzeFail("select v1 from t0 order by (select v4 from t1)", "ORDER BY clause cannot contain subquery");
+
+        analyzeSuccess("(((select * from t0)))");
+        analyzeSuccess("(select * from t0) limit 1");
+        analyzeSuccess("(select v1 from t0) order by v1 desc limit 1");
+        analyzeSuccess("((select v1 from t0) order by v1 desc limit 1) order by v1");
+        analyzeSuccess("((select v1 from t0) order by v1 desc limit 1) limit 2");
+        analyzeFail("(select v1 from t0) order by err desc limit 1", "Column 'err' cannot be resolved");
     }
 
     @Test
     public void testInPredicate() {
         analyzeSuccess("select v1 from t0 where v2 in (select v3 from t1)");
         analyzeSuccess("select v1 from t0 where v2 in (select v4 from t1 where v3 = v5)");
+        analyzeSuccess("select v1 from t0 where v2 in ((select v4 from t1 where v3 = v5))");
+        analyzeSuccess("select v1 from t0 where v2 in (((select v4 from t1 where v3 = v5)))");
+
+        analyzeSuccess("select v1 from t0 where v2 in (1, 2)");
+        analyzeFail("select v1 from t0 where v2 in ((select v4 from t1 where v3 = v5), 2)",
+                "In Predicate only support literal expression list");
+        analyzeFail("select v1 from t0 where v2 in ((select v4 from t1 where v3 = v5), (select v4 from t1 where v3 = v5))",
+                "In Predicate only support literal expression list");
+
+        analyzeFail("SELECT * FROM T WHERE A IN 1, 2", "Getting syntax error at line 1, column 24." +
+                " Detail message: Unexpected input 'IN', the most similar input is {<EOF>, ';'}.");
+        analyzeFail("SELECT * FROM T WHERE A IN 1", "Getting syntax error at line 1, column 24." +
+                " Detail message: Unexpected input 'IN', the most similar input is {<EOF>, ';'}.");
     }
 
     @Test
     public void testExistsSubquery() {
         analyzeSuccess("select v1 from t0 where exists (select v3 from t1)");
         analyzeSuccess("select v1 from t0 where exists (select v4 from t1 where v3 = v5)");
+        analyzeSuccess("select v1 from t0 where exists ((select v4 from t1 where v3 = v5))");
+        analyzeSuccess("select v1 from t0 where exists (((select v4 from t1 where v3 = v5)))");
     }
 
     @Test

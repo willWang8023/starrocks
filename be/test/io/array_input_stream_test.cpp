@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "io/array_input_stream.h"
 
@@ -91,8 +103,6 @@ PARALLEL_TEST(ArrayInputStreamTest, test_seek_and_peek) {
     std::string s("0123456789");
     ArrayInputStream in(s.data(), static_cast<int64_t>(s.size()));
 
-    ASSERT_TRUE(in.allows_peek());
-
     ASSERT_OK(in.seek(5));
     ASSERT_EQ(5, *in.position());
     ASSERT_EQ("56789", *in.peek(10));
@@ -107,6 +117,20 @@ PARALLEL_TEST(ArrayInputStreamTest, test_seek_and_peek) {
 
     ASSERT_OK(in.seek(11));
     ASSERT_EQ("", *in.peek(10));
+}
+
+// NOLINTNEXTLINE
+PARALLEL_TEST(ArrayInputStreamTest, test_read_all) {
+    std::string s("0123456789");
+    ArrayInputStream in(s.data(), static_cast<int64_t>(s.size()));
+
+    ASSIGN_OR_ABORT(auto content, in.read_all());
+    EXPECT_EQ(s, content);
+
+    ASSERT_OK(in.seek(5));
+
+    ASSIGN_OR_ABORT(content, in.read_all());
+    EXPECT_EQ(s, content);
 }
 
 } // namespace starrocks::io

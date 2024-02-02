@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/olap/options.cpp
 
@@ -22,6 +35,7 @@
 #include "storage/options.h"
 
 #include <algorithm>
+#include <filesystem>
 
 #include "common/config.h"
 #include "common/logging.h"
@@ -62,8 +76,14 @@ Status parse_root_path(const string& root_path, StorePath* path) {
         return Status::InvalidArgument("Invalid store path");
     }
 
+    Status status = FileSystem::Default()->create_dir_if_missing(tmp_vec[0]);
+    if (!status.ok()) {
+        LOG(WARNING) << "path can not be created. path=" << tmp_vec[0];
+        return status;
+    }
+
     string canonicalized_path;
-    Status status = FileSystem::Default()->canonicalize(tmp_vec[0], &canonicalized_path);
+    status = FileSystem::Default()->canonicalize(tmp_vec[0], &canonicalized_path);
     if (!status.ok()) {
         LOG(WARNING) << "path can not be canonicalized. may be not exist. path=" << tmp_vec[0];
         return status;
@@ -136,6 +156,35 @@ Status parse_conf_store_paths(const string& config_path, std::vector<StorePath>*
     if (paths->empty() || (path_vec.size() != paths->size() && !config::ignore_broken_disk)) {
         LOG(WARNING) << "fail to parse storage_root_path config. value=[" << config_path << "]";
         return Status::InvalidArgument("Fail to parse storage_root_path");
+    }
+    return Status::OK();
+}
+
+Status parse_conf_datacache_paths(const std::string& config_path, std::vector<std::string>* paths) {
+    if (config_path.empty()) {
+        return Status::OK();
+    }
+    std::vector<string> path_vec = strings::Split(config_path, ";", strings::SkipWhitespace());
+    for (auto& item : path_vec) {
+        if (item.empty()) {
+            continue;
+        }
+        // Remove last slash if it exists$
+        auto it = item.end() - 1;
+        if (*it == '/') {
+            item.erase(it);
+        }
+        // Check the parent path
+        std::filesystem::path local_path(item);
+        if (local_path.has_parent_path() && !std::filesystem::exists(local_path.parent_path())) {
+            LOG(WARNING) << "invalid block cache path. path=" << item;
+            continue;
+        }
+        paths->emplace_back(local_path.string());
+    }
+    if ((path_vec.size() != paths->size() && !config::ignore_broken_disk)) {
+        LOG(WARNING) << "fail to parse datacache_disk_path config. value=[" << config_path << "]";
+        return Status::InvalidArgument("fail to parse datacache_disk_path");
     }
     return Status::OK();
 }

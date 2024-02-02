@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.ast;
 
@@ -8,7 +21,6 @@ import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.LimitElement;
 import com.starrocks.analysis.OrderByElement;
 import com.starrocks.analysis.RedirectStatus;
-import com.starrocks.analysis.ShowStmt;
 import com.starrocks.catalog.Column;
 import com.starrocks.catalog.ScalarType;
 import com.starrocks.common.UserException;
@@ -16,7 +28,7 @@ import com.starrocks.common.proc.LoadProcDir;
 import com.starrocks.common.util.OrderByPair;
 import com.starrocks.load.loadv2.JobState;
 import com.starrocks.qe.ShowResultSetMetaData;
-import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.util.ArrayList;
 import java.util.HashSet;
@@ -34,6 +46,7 @@ public class ShowLoadStmt extends ShowStmt {
     private final LimitElement limitElement;
     private final List<OrderByElement> orderByElements;
 
+    private boolean all = false;
     private String labelValue;
     private String stateValue;
     private boolean isAccurateMatch;
@@ -41,14 +54,16 @@ public class ShowLoadStmt extends ShowStmt {
     private ArrayList<OrderByPair> orderByPairs;
 
     public ShowLoadStmt(String db, Expr labelExpr, List<OrderByElement> orderByElements, LimitElement limitElement) {
+        this(db, labelExpr, orderByElements, limitElement, NodePosition.ZERO);
+    }
+
+    public ShowLoadStmt(String db, Expr labelExpr, List<OrderByElement> orderByElements,
+                        LimitElement limitElement, NodePosition pos) {
+        super(pos);
         this.dbName = db;
         this.whereClause = labelExpr;
         this.orderByElements = orderByElements;
         this.limitElement = limitElement;
-
-        this.labelValue = null;
-        this.stateValue = null;
-        this.isAccurateMatch = false;
     }
 
     public String getDbName() {
@@ -125,18 +140,21 @@ public class ShowLoadStmt extends ShowStmt {
         this.isAccurateMatch = isAccurateMatch;
     }
 
+    public void setAll(boolean all) {
+        this.all = all;
+    }
+
+    public boolean isAll() {
+        return this.all;
+    }
+
     @Override
     public void analyze(Analyzer analyzer) throws UserException {
     }
 
     @Override
     public <R, C> R accept(AstVisitor<R, C> visitor, C context) {
-        return visitor.visitShowLoadStmt(this, context);
-    }
-
-    @Override
-    public boolean isSupportNewPlanner() {
-        return true;
+        return visitor.visitShowLoadStatement(this, context);
     }
 
     @Override

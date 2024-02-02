@@ -29,6 +29,11 @@
 
 namespace starrocks {
 
+#ifdef BE_TEST
+// Allow injected send_reply in BE TEST mode
+void (*s_injected_send_reply)(HttpRequest*, HttpStatus, std::string_view) = nullptr;
+#endif
+
 // Send Unauthorized status with basic challenge
 void HttpChannel::send_basic_challenge(HttpRequest* req, const std::string& realm) {
     static std::string s_prompt_str = "Please provide your userid and password\n";
@@ -46,9 +51,15 @@ void HttpChannel::send_reply(HttpRequest* request, HttpStatus status) {
     evhttp_send_reply(request->get_evhttp_request(), status, defalut_reason(status).c_str(), nullptr);
 }
 
-void HttpChannel::send_reply(HttpRequest* request, HttpStatus status, const std::string& content) {
+void HttpChannel::send_reply(HttpRequest* request, HttpStatus status, std::string_view content) {
+#ifdef BE_TEST
+    if (s_injected_send_reply != nullptr) {
+        s_injected_send_reply(request, status, content);
+        return;
+    }
+#endif
     auto evb = evbuffer_new();
-    evbuffer_add(evb, content.c_str(), content.size());
+    evbuffer_add(evb, content.data(), content.size());
     evhttp_send_reply(request->get_evhttp_request(), status, defalut_reason(status).c_str(), evb);
     evbuffer_free(evb);
 }

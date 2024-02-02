@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.plan;
 
@@ -9,11 +22,37 @@ import com.starrocks.catalog.OlapTable;
 import com.starrocks.catalog.Partition;
 import com.starrocks.catalog.Replica;
 import com.starrocks.catalog.Tablet;
+import com.starrocks.common.FeConstants;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.utframe.StarRocksAssert;
 import org.junit.Assert;
+import org.junit.BeforeClass;
 import org.junit.Test;
 
 public class ExternalTableTest extends PlanTestBase {
+
+    @BeforeClass
+    public static void beforeClass() throws Exception {
+        PlanTestBase.beforeClass();
+        StarRocksAssert starRocksAssert = new StarRocksAssert(connectContext);
+        FeConstants.runningUnitTest = true;
+        starRocksAssert.withTable("create external table test.jdbc_key_words_test\n" +
+                "(a int, `schema` varchar(20))\n" +
+                "ENGINE=jdbc\n" +
+                "PROPERTIES (\n" +
+                "\"resource\"=\"jdbc_test\",\n" +
+                "\"table\"=\"test_table\"\n" +
+                ");");
+        FeConstants.runningUnitTest = false;
+    }
+
+    @Test
+    public void testKeyWordWhereCaluse() throws Exception {
+        String sql = "select * from test.jdbc_key_words_test where `schema` = \"test\"";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, "schema = 'test'");
+    }
+
     @Test
     public void testMysqlTableFilter() throws Exception {
         String sql = "select * from ods_order where order_dt = '2025-08-07' and order_no = 'p' limit 10;";
@@ -145,20 +184,20 @@ public class ExternalTableTest extends PlanTestBase {
     public void testJDBCTableFilter() throws Exception {
         String sql = "select * from test.jdbc_test where a > 10 and b < 'abc' limit 10";
         String plan = getFragmentPlan(sql);
-        Assert.assertTrue(plan.contains("0:SCAN JDBC\n" +
-                "     TABLE: `test_table`\n" +
-                "     QUERY: SELECT a, b, c FROM `test_table` WHERE (a > 10) AND (b < 'abc')\n" +
+        Assert.assertTrue(plan, plan.contains("0:SCAN JDBC\n" +
+                "     TABLE: test_table\n" +
+                "     QUERY: SELECT a, b, c FROM test_table WHERE (a > 10) AND (b < 'abc')\n" +
                 "     limit: 10"));
         sql = "select * from test.jdbc_test where a > 10 and length(b) < 20 limit 10";
         plan = getFragmentPlan(sql);
-        Assert.assertTrue(plan.contains(
+        Assert.assertTrue(plan, plan.contains(
                 "  1:SELECT\n" +
                         "  |  predicates: length(b) < 20\n" +
                         "  |  limit: 10\n" +
                         "  |  \n" +
                         "  0:SCAN JDBC\n" +
-                        "     TABLE: `test_table`\n" +
-                        "     QUERY: SELECT a, b, c FROM `test_table` WHERE (a > 10)"));
+                        "     TABLE: test_table\n" +
+                        "     QUERY: SELECT a, b, c FROM test_table WHERE (a > 10)"));
 
     }
 
@@ -172,8 +211,8 @@ public class ExternalTableTest extends PlanTestBase {
                         "  |  group by: b\n" +
                         "  |  \n" +
                         "  0:SCAN JDBC\n" +
-                        "     TABLE: `test_table`\n" +
-                        "     QUERY: SELECT a, b FROM `test_table`"));
+                        "     TABLE: test_table\n" +
+                        "     QUERY: SELECT a, b FROM test_table"));
     }
 
     @Test

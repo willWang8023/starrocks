@@ -1,30 +1,51 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "exec/pipeline/result_sink_operator.h"
 
-#include "column/chunk.h"
 #include "exprs/expr.h"
 #include "runtime/buffer_control_block.h"
+#include "runtime/http_result_writer.h"
 #include "runtime/mysql_result_writer.h"
 #include "runtime/query_statistics.h"
 #include "runtime/result_buffer_mgr.h"
 #include "runtime/runtime_state.h"
 #include "runtime/statistic_result_writer.h"
+#include "runtime/variable_result_writer.h"
 
 namespace starrocks::pipeline {
 Status ResultSinkOperator::prepare(RuntimeState* state) {
-    Operator::prepare(state);
+    RETURN_IF_ERROR(Operator::prepare(state));
 
     // Create profile
     _profile = std::make_unique<RuntimeProfile>("result sink");
+    _unique_metrics->add_child(_profile.get(), true, nullptr);
 
     // Create writer based on sink type
     switch (_sink_type) {
     case TResultSinkType::MYSQL_PROTOCAL:
-        _writer = std::make_shared<MysqlResultWriter>(_sender.get(), _output_expr_ctxs, _profile.get());
+        _writer = std::make_shared<MysqlResultWriter>(_sender.get(), _output_expr_ctxs, _is_binary_format,
+                                                      _profile.get());
         break;
     case TResultSinkType::STATISTIC:
-        _writer = std::make_shared<vectorized::StatisticResultWriter>(_sender.get(), _output_expr_ctxs, _profile.get());
+        _writer = std::make_shared<StatisticResultWriter>(_sender.get(), _output_expr_ctxs, _profile.get());
+        break;
+    case TResultSinkType::VARIABLE:
+        _writer = std::make_shared<VariableResultWriter>(_sender.get(), _output_expr_ctxs, _profile.get());
+        break;
+    case TResultSinkType::HTTP_PROTOCAL:
+        _writer = std::make_shared<HttpResultWriter>(_sender.get(), _output_expr_ctxs, _profile.get(), _format_type);
         break;
     default:
         return Status::InternalError("Unknown result sink type");
@@ -43,17 +64,14 @@ void ResultSinkOperator::close(RuntimeState* state) {
     }
 
     // Close the shared sender when the last result sink operator is closing.
-    if (_num_result_sinkers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
+    if (_num_sinkers.fetch_sub(1, std::memory_order_acq_rel) == 1) {
         if (_sender != nullptr) {
             // Incrementing and reading _num_written_rows needn't memory barrier, because
-            // the visibility of _num_written_rows is guaranteed by _num_result_sinkers.fetch_sub().
+            // the visibility of _num_written_rows is guaranteed by _num_sinkers.fetch_sub().
             _sender->update_num_written_rows(_num_written_rows.load(std::memory_order_relaxed));
 
-            auto query_statistic = std::make_shared<QueryStatistics>();
             QueryContext* query_ctx = state->query_ctx();
-            query_statistic->add_scan_stats(query_ctx->cur_scan_rows_num(), query_ctx->get_scan_bytes());
-            query_statistic->add_cpu_costs(query_ctx->cpu_cost());
-            query_statistic->add_mem_costs(query_ctx->mem_cost_bytes());
+            auto query_statistic = query_ctx->final_query_statistic();
             query_statistic->set_returned_rows(_num_written_rows);
             _sender->set_query_statistics(query_statistic);
 
@@ -61,17 +79,17 @@ void ResultSinkOperator::close(RuntimeState* state) {
             if (!st.ok() && final_status.ok()) {
                 final_status = st;
             }
-            _sender->close(final_status);
+            WARN_IF_ERROR(_sender->close(final_status), "close sender failed");
         }
 
-        state->exec_env()->result_mgr()->cancel_at_time(time(nullptr) + config::result_buffer_cancelled_interval_time,
-                                                        state->fragment_instance_id());
+        (void)state->exec_env()->result_mgr()->cancel_at_time(
+                time(nullptr) + config::result_buffer_cancelled_interval_time, state->fragment_instance_id());
     }
 
     Operator::close(state);
 }
 
-StatusOr<vectorized::ChunkPtr> ResultSinkOperator::pull_chunk(RuntimeState* state) {
+StatusOr<ChunkPtr> ResultSinkOperator::pull_chunk(RuntimeState* state) {
     return Status::InternalError("Shouldn't pull chunk from result sink operator");
 }
 
@@ -101,7 +119,7 @@ bool ResultSinkOperator::need_input() const {
     }
 }
 
-Status ResultSinkOperator::push_chunk(RuntimeState* state, const vectorized::ChunkPtr& chunk) {
+Status ResultSinkOperator::push_chunk(RuntimeState* state, const ChunkPtr& chunk) {
     // The ResultWriter memory that sends the results is no longer recorded to the query memory.
     // There are two reason:
     // 1. the query result has come out, and then the memory limit is triggered, cancel, it is not necessary
@@ -127,9 +145,11 @@ Status ResultSinkOperator::push_chunk(RuntimeState* state, const vectorized::Chu
 
 Status ResultSinkOperatorFactory::prepare(RuntimeState* state) {
     RETURN_IF_ERROR(OperatorFactory::prepare(state));
-    RETURN_IF_ERROR(state->exec_env()->result_mgr()->create_sender(state->fragment_instance_id(), 1024, &_sender));
+    auto dop = state->query_options().pipeline_dop;
+    RETURN_IF_ERROR(state->exec_env()->result_mgr()->create_sender(state->fragment_instance_id(),
+                                                                   std::min(dop << 1, 1024), &_sender));
 
-    RETURN_IF_ERROR(Expr::create_expr_trees(state->obj_pool(), _t_output_expr, &_output_expr_ctxs));
+    RETURN_IF_ERROR(Expr::create_expr_trees(state->obj_pool(), _t_output_expr, &_output_expr_ctxs, state));
 
     RETURN_IF_ERROR(Expr::prepare(_output_expr_ctxs, state));
     RETURN_IF_ERROR(Expr::open(_output_expr_ctxs, state));
@@ -138,6 +158,10 @@ Status ResultSinkOperatorFactory::prepare(RuntimeState* state) {
 }
 
 void ResultSinkOperatorFactory::close(RuntimeState* state) {
+    if (_sender != nullptr) {
+        WARN_IF_ERROR(_sender->close(_fragment_ctx->final_status()), "close sender failed");
+    }
+
     Expr::close(_output_expr_ctxs, state);
     OperatorFactory::close(state);
 }

@@ -1,14 +1,25 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "connector/mysql_connector.h"
 
 #include "column/chunk.h"
 #include "exprs/expr.h"
-#include "exprs/vectorized/in_const_predicate.hpp"
+#include "exprs/in_const_predicate.hpp"
 #include "storage/chunk_helper.h"
 
-namespace starrocks {
-namespace connector {
+namespace starrocks::connector {
 #define APPLY_FOR_NUMERICAL_TYPE(M, APPEND_TO_SQL) \
     M(TYPE_TINYINT, APPEND_TO_SQL)                 \
     M(TYPE_BOOLEAN, APPEND_TO_SQL)                 \
@@ -22,22 +33,24 @@ namespace connector {
     M(TYPE_CHAR, APPEND_TO_SQL)                       \
     M(TYPE_VARCHAR, APPEND_TO_SQL)
 
-using namespace vectorized;
-
 // ================================
 
-DataSourceProviderPtr MySQLConnector::create_data_source_provider(vectorized::ConnectorScanNode* scan_node,
+DataSourceProviderPtr MySQLConnector::create_data_source_provider(ConnectorScanNode* scan_node,
                                                                   const TPlanNode& plan_node) const {
     return std::make_unique<MySQLDataSourceProvider>(scan_node, plan_node);
 }
 
 // ================================
 
-MySQLDataSourceProvider::MySQLDataSourceProvider(vectorized::ConnectorScanNode* scan_node, const TPlanNode& plan_node)
+MySQLDataSourceProvider::MySQLDataSourceProvider(ConnectorScanNode* scan_node, const TPlanNode& plan_node)
         : _scan_node(scan_node), _mysql_scan_node(plan_node.mysql_scan_node) {}
 
 DataSourcePtr MySQLDataSourceProvider::create_data_source(const TScanRange& scan_range) {
     return std::make_unique<MySQLDataSource>(this, scan_range);
+}
+
+const TupleDescriptor* MySQLDataSourceProvider::tuple_descriptor(RuntimeState* state) const {
+    return state->desc_tbl().get_tuple_descriptor(_mysql_scan_node.tuple_id);
 }
 
 // ================================
@@ -52,6 +65,7 @@ Status MySQLDataSource::_init_params(RuntimeState* state) {
 
     _columns = _provider->_mysql_scan_node.columns;
     _filters = _provider->_mysql_scan_node.filters;
+    _temporal_clause = _provider->_mysql_scan_node.temporal_clause;
 
     _table_name = _provider->_mysql_scan_node.table_name;
 
@@ -76,8 +90,12 @@ Status MySQLDataSource::_init_params(RuntimeState* state) {
     return Status::OK();
 }
 
+std::string MySQLDataSource::name() const {
+    return "MySQLDataSource";
+}
+
 Status MySQLDataSource::open(RuntimeState* state) {
-    _init_params(state);
+    RETURN_IF_ERROR(_init_params(state));
     DCHECK(state != nullptr);
     RETURN_IF_CANCELLED(state);
     SCOPED_TIMER(_runtime_profile->total_time_counter());
@@ -94,8 +112,7 @@ Status MySQLDataSource::open(RuntimeState* state) {
 
     // In Filter have been put into _conjunct_ctxs,
     // so we iterate all ExprContext to use it.
-    for (int i = 0; i < _conjunct_ctxs.size(); ++i) {
-        ExprContext* ctx = _conjunct_ctxs[i];
+    for (auto ctx : _conjunct_ctxs) {
         const Expr* root_expr = ctx->root();
         if (root_expr == nullptr) {
             continue;
@@ -111,7 +128,7 @@ Status MySQLDataSource::open(RuntimeState* state) {
         SlotId slot_id = slot_ids[0];
         auto iter = slot_by_id.find(slot_id);
         if (iter != slot_by_id.end()) {
-            PrimitiveType type = iter->second->type().type;
+            LogicalType type = iter->second->type().type;
             // dipatch to process,
             // we support numerical type, char type and date type.
             switch (type) {
@@ -141,20 +158,12 @@ Status MySQLDataSource::open(RuntimeState* state) {
 #undef APPLY_FOR_NUMERICAL_TYPE
 #undef DIRECT_APPEND_TO_SQL
 
-#define CONVERT_APPEND_TO_SQL          \
-    std::stringstream ss;              \
-    for (char c : value.to_string()) { \
-        if (c == '"') {                \
-            ss << '\\';                \
-        }                              \
-        ss << c;                       \
-    }                                  \
-    vector_values.emplace_back(fmt::format("'{}'", ss.str()));
+#define CONVERT_APPEND_TO_SQL vector_values.emplace_back(_mysql_scanner->escape(value.to_string()).to_string());
                 APPLY_FOR_VARCHAR_DATE_TYPE(READ_CONST_PREDICATE, CONVERT_APPEND_TO_SQL)
 #undef APPLY_FOR_VARCHAR_DATE_TYPE
 #undef CONVERT_APPEND_TO_SQL
 
-            case INVALID_TYPE:
+            case TYPE_UNKNOWN:
             case TYPE_NULL:
             case TYPE_BINARY:
             case TYPE_DECIMAL:
@@ -174,13 +183,23 @@ Status MySQLDataSource::open(RuntimeState* state) {
             case TYPE_FLOAT:
             case TYPE_JSON:
             case TYPE_FUNCTION:
+            case TYPE_VARBINARY:
+            case TYPE_UNSIGNED_TINYINT:
+            case TYPE_UNSIGNED_SMALLINT:
+            case TYPE_UNSIGNED_INT:
+            case TYPE_UNSIGNED_BIGINT:
+            case TYPE_DISCRETE_DOUBLE:
+            case TYPE_DATE_V1:
+            case TYPE_DATETIME_V1:
+            case TYPE_NONE:
+            case TYPE_MAX_VALUE:
                 break;
             }
         }
     }
 
-    RETURN_IF_ERROR(
-            _mysql_scanner->query(_table_name, _columns, _filters, filters_in, filters_null_in_set, _read_limit));
+    RETURN_IF_ERROR(_mysql_scanner->query(_table_name, _columns, _filters, filters_in, filters_null_in_set, _read_limit,
+                                          _temporal_clause));
     // check materialize slot num
     int materialize_num = 0;
 
@@ -197,7 +216,7 @@ Status MySQLDataSource::open(RuntimeState* state) {
     return Status::OK();
 }
 
-Status MySQLDataSource::get_next(RuntimeState* state, vectorized::ChunkPtr* chunk) {
+Status MySQLDataSource::get_next(RuntimeState* state, ChunkPtr* chunk) {
     VLOG(1) << "MySQLDataSource::GetNext";
 
     DCHECK(state != nullptr && chunk != nullptr);
@@ -249,15 +268,15 @@ int64_t MySQLDataSource::num_bytes_read() const {
 }
 
 int64_t MySQLDataSource::cpu_time_spent() const {
-    return _cpu_time_spent_ns;
+    return _cpu_time_ns;
 }
 
 void MySQLDataSource::close(RuntimeState* state) {
     SCOPED_TIMER(_runtime_profile->total_time_counter());
 }
 
-Status MySQLDataSource::fill_chunk(vectorized::ChunkPtr* chunk, char** data, size_t* length) {
-    SCOPED_RAW_TIMER(&_cpu_time_spent_ns);
+Status MySQLDataSource::fill_chunk(ChunkPtr* chunk, char** data, size_t* length) {
+    SCOPED_RAW_TIMER(&_cpu_time_ns);
 
     int materialized_col_idx = -1;
     for (size_t col_idx = 0; col_idx < _slot_num; ++col_idx) {
@@ -307,6 +326,11 @@ Status MySQLDataSource::append_text_to_column(const char* data, const int& len, 
 
     // Parse the raw-text data. Translate the text string to internal format.
     switch (slot_desc->type().type) {
+    case TYPE_JSON: {
+        ASSIGN_OR_RETURN(auto value, JsonValue::parse(Slice(data, len)));
+        reinterpret_cast<JsonColumn*>(data_column)->append(std::move(value));
+        break;
+    }
     case TYPE_VARCHAR:
     case TYPE_CHAR: {
         Slice value(data, len);
@@ -466,13 +490,12 @@ Status MySQLDataSource::append_text_to_column(const char* data, const int& len, 
     return Status::OK();
 }
 
-template <PrimitiveType PT, typename CppType>
+template <LogicalType LT, typename CppType>
 void MySQLDataSource::append_value_to_column(Column* column, CppType& value) {
-    using ColumnType = typename vectorized::RunTimeColumnType<PT>;
+    using ColumnType = typename starrocks::RunTimeColumnType<LT>;
 
-    ColumnType* runtime_column = down_cast<ColumnType*>(column);
+    auto* runtime_column = down_cast<ColumnType*>(column);
     runtime_column->append(value);
 }
 
-} // namespace connector
-} // namespace starrocks
+} // namespace starrocks::connector

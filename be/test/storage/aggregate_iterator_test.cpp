@@ -1,12 +1,25 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/aggregate_iterator.h"
 
 #include "column/column_pool.h"
 #include "gtest/gtest.h"
+#include "storage/aggregate_type.h"
 #include "storage/vector_chunk_iterator.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 static std::vector<Datum> row(const Chunk& chunk, size_t row_id) {
     std::vector<Datum> result;
@@ -30,26 +43,26 @@ protected:
 TEST_F(AggregateIteratorTest, agg_max) {
     config::vector_chunk_size = 1024;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BIGINT, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
-    auto c2 = std::make_shared<Field>(2, "c2", OLAP_FIELD_TYPE_LARGEINT, false);
-    auto c3 = std::make_shared<Field>(3, "c3", OLAP_FIELD_TYPE_FLOAT, false);
-    auto c4 = std::make_shared<Field>(4, "c4", OLAP_FIELD_TYPE_DOUBLE, false);
-    auto c5 = std::make_shared<Field>(5, "c5", OLAP_FIELD_TYPE_DECIMAL_V2, false);
-    auto c6 = std::make_shared<Field>(6, "c6", OLAP_FIELD_TYPE_DATE_V2, false);
-    auto c7 = std::make_shared<Field>(7, "c7", OLAP_FIELD_TYPE_TIMESTAMP, false);
-    auto c8 = std::make_shared<Field>(8, "c8", OLAP_FIELD_TYPE_VARCHAR, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BIGINT, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
+    auto c2 = std::make_shared<Field>(2, "c2", TYPE_LARGEINT, false);
+    auto c3 = std::make_shared<Field>(3, "c3", TYPE_FLOAT, false);
+    auto c4 = std::make_shared<Field>(4, "c4", TYPE_DOUBLE, false);
+    auto c5 = std::make_shared<Field>(5, "c5", TYPE_DECIMALV2, false);
+    auto c6 = std::make_shared<Field>(6, "c6", TYPE_DATE, false);
+    auto c7 = std::make_shared<Field>(7, "c7", TYPE_DATETIME, false);
+    auto c8 = std::make_shared<Field>(8, "c8", TYPE_VARCHAR, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
-    c2->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
-    c3->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
-    c4->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
-    c5->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
-    c6->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
-    c7->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
-    c8->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
+    c2->set_aggregate_method(STORAGE_AGGREGATE_MAX);
+    c3->set_aggregate_method(STORAGE_AGGREGATE_MAX);
+    c4->set_aggregate_method(STORAGE_AGGREGATE_MAX);
+    c5->set_aggregate_method(STORAGE_AGGREGATE_MAX);
+    c6->set_aggregate_method(STORAGE_AGGREGATE_MAX);
+    c7->set_aggregate_method(STORAGE_AGGREGATE_MAX);
+    c8->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, c1, c2, c3, c4, c5, c6, c7, c8});
 
@@ -74,7 +87,7 @@ TEST_F(AggregateIteratorTest, agg_max) {
                                                             COL_VARCHAR(v5));
     // clang-format on
     auto agg_iter = new_aggregate_iterator(child_iter);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st = agg_iter->get_next(chunk.get());
     ASSERT_TRUE(st.ok());
@@ -109,26 +122,26 @@ TEST_F(AggregateIteratorTest, agg_max) {
 TEST_F(AggregateIteratorTest, agg_min) {
     config::vector_chunk_size = 1024;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BIGINT, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
-    auto c2 = std::make_shared<Field>(2, "c2", OLAP_FIELD_TYPE_LARGEINT, false);
-    auto c3 = std::make_shared<Field>(3, "c3", OLAP_FIELD_TYPE_FLOAT, false);
-    auto c4 = std::make_shared<Field>(4, "c4", OLAP_FIELD_TYPE_DOUBLE, false);
-    auto c5 = std::make_shared<Field>(5, "c5", OLAP_FIELD_TYPE_DECIMAL_V2, false);
-    auto c6 = std::make_shared<Field>(6, "c6", OLAP_FIELD_TYPE_DATE_V2, false);
-    auto c7 = std::make_shared<Field>(7, "c7", OLAP_FIELD_TYPE_TIMESTAMP, false);
-    auto c8 = std::make_shared<Field>(8, "c8", OLAP_FIELD_TYPE_VARCHAR, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BIGINT, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
+    auto c2 = std::make_shared<Field>(2, "c2", TYPE_LARGEINT, false);
+    auto c3 = std::make_shared<Field>(3, "c3", TYPE_FLOAT, false);
+    auto c4 = std::make_shared<Field>(4, "c4", TYPE_DOUBLE, false);
+    auto c5 = std::make_shared<Field>(5, "c5", TYPE_DECIMALV2, false);
+    auto c6 = std::make_shared<Field>(6, "c6", TYPE_DATE, false);
+    auto c7 = std::make_shared<Field>(7, "c7", TYPE_DATETIME, false);
+    auto c8 = std::make_shared<Field>(8, "c8", TYPE_VARCHAR, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MIN);
-    c2->set_aggregate_method(OLAP_FIELD_AGGREGATION_MIN);
-    c3->set_aggregate_method(OLAP_FIELD_AGGREGATION_MIN);
-    c4->set_aggregate_method(OLAP_FIELD_AGGREGATION_MIN);
-    c5->set_aggregate_method(OLAP_FIELD_AGGREGATION_MIN);
-    c6->set_aggregate_method(OLAP_FIELD_AGGREGATION_MIN);
-    c7->set_aggregate_method(OLAP_FIELD_AGGREGATION_MIN);
-    c8->set_aggregate_method(OLAP_FIELD_AGGREGATION_MIN);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MIN);
+    c2->set_aggregate_method(STORAGE_AGGREGATE_MIN);
+    c3->set_aggregate_method(STORAGE_AGGREGATE_MIN);
+    c4->set_aggregate_method(STORAGE_AGGREGATE_MIN);
+    c5->set_aggregate_method(STORAGE_AGGREGATE_MIN);
+    c6->set_aggregate_method(STORAGE_AGGREGATE_MIN);
+    c7->set_aggregate_method(STORAGE_AGGREGATE_MIN);
+    c8->set_aggregate_method(STORAGE_AGGREGATE_MIN);
 
     Schema schema({k1, c1, c2, c3, c4, c5, c6, c7, c8});
 
@@ -153,7 +166,7 @@ TEST_F(AggregateIteratorTest, agg_min) {
                                                             COL_VARCHAR(v5));
     // clang-format on
     auto agg_iter = new_aggregate_iterator(child_iter);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st = agg_iter->get_next(chunk.get());
     ASSERT_TRUE(st.ok());
@@ -188,26 +201,26 @@ TEST_F(AggregateIteratorTest, agg_min) {
 TEST_F(AggregateIteratorTest, agg_sum) {
     config::vector_chunk_size = 1024;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BIGINT, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_TINYINT, false);
-    auto c2 = std::make_shared<Field>(2, "c2", OLAP_FIELD_TYPE_SMALLINT, false);
-    auto c3 = std::make_shared<Field>(3, "c3", OLAP_FIELD_TYPE_INT, false);
-    auto c4 = std::make_shared<Field>(4, "c4", OLAP_FIELD_TYPE_BIGINT, false);
-    auto c5 = std::make_shared<Field>(5, "c5", OLAP_FIELD_TYPE_LARGEINT, false);
-    auto c6 = std::make_shared<Field>(6, "c6", OLAP_FIELD_TYPE_FLOAT, false);
-    auto c7 = std::make_shared<Field>(7, "c7", OLAP_FIELD_TYPE_DOUBLE, false);
-    auto c8 = std::make_shared<Field>(8, "c8", OLAP_FIELD_TYPE_DECIMAL_V2, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BIGINT, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_TINYINT, false);
+    auto c2 = std::make_shared<Field>(2, "c2", TYPE_SMALLINT, false);
+    auto c3 = std::make_shared<Field>(3, "c3", TYPE_INT, false);
+    auto c4 = std::make_shared<Field>(4, "c4", TYPE_BIGINT, false);
+    auto c5 = std::make_shared<Field>(5, "c5", TYPE_LARGEINT, false);
+    auto c6 = std::make_shared<Field>(6, "c6", TYPE_FLOAT, false);
+    auto c7 = std::make_shared<Field>(7, "c7", TYPE_DOUBLE, false);
+    auto c8 = std::make_shared<Field>(8, "c8", TYPE_DECIMALV2, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
-    c2->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
-    c3->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
-    c4->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
-    c5->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
-    c6->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
-    c7->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
-    c8->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_SUM);
+    c2->set_aggregate_method(STORAGE_AGGREGATE_SUM);
+    c3->set_aggregate_method(STORAGE_AGGREGATE_SUM);
+    c4->set_aggregate_method(STORAGE_AGGREGATE_SUM);
+    c5->set_aggregate_method(STORAGE_AGGREGATE_SUM);
+    c6->set_aggregate_method(STORAGE_AGGREGATE_SUM);
+    c7->set_aggregate_method(STORAGE_AGGREGATE_SUM);
+    c8->set_aggregate_method(STORAGE_AGGREGATE_SUM);
 
     Schema schema({k1, c1, c2, c3, c4, c5, c6, c7, c8});
     auto pk = std::vector<int64_t>{1, 1, 1, 2, 2};
@@ -227,7 +240,7 @@ TEST_F(AggregateIteratorTest, agg_sum) {
                                                             COL_DECIMAL(v2));
     // clang-format on
     auto agg_iter = new_aggregate_iterator(child_iter);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st = agg_iter->get_next(chunk.get());
     ASSERT_TRUE(st.ok());
@@ -262,26 +275,26 @@ TEST_F(AggregateIteratorTest, agg_sum) {
 TEST_F(AggregateIteratorTest, agg_replace) {
     config::vector_chunk_size = 1024;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BIGINT, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
-    auto c2 = std::make_shared<Field>(2, "c2", OLAP_FIELD_TYPE_LARGEINT, false);
-    auto c3 = std::make_shared<Field>(3, "c3", OLAP_FIELD_TYPE_FLOAT, false);
-    auto c4 = std::make_shared<Field>(4, "c4", OLAP_FIELD_TYPE_DOUBLE, false);
-    auto c5 = std::make_shared<Field>(5, "c5", OLAP_FIELD_TYPE_DECIMAL_V2, false);
-    auto c6 = std::make_shared<Field>(6, "c6", OLAP_FIELD_TYPE_DATE_V2, false);
-    auto c7 = std::make_shared<Field>(7, "c7", OLAP_FIELD_TYPE_TIMESTAMP, false);
-    auto c8 = std::make_shared<Field>(8, "c8", OLAP_FIELD_TYPE_VARCHAR, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BIGINT, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
+    auto c2 = std::make_shared<Field>(2, "c2", TYPE_LARGEINT, false);
+    auto c3 = std::make_shared<Field>(3, "c3", TYPE_FLOAT, false);
+    auto c4 = std::make_shared<Field>(4, "c4", TYPE_DOUBLE, false);
+    auto c5 = std::make_shared<Field>(5, "c5", TYPE_DECIMALV2, false);
+    auto c6 = std::make_shared<Field>(6, "c6", TYPE_DATE, false);
+    auto c7 = std::make_shared<Field>(7, "c7", TYPE_DATETIME, false);
+    auto c8 = std::make_shared<Field>(8, "c8", TYPE_VARCHAR, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
-    c2->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
-    c3->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
-    c4->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
-    c5->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
-    c6->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
-    c7->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
-    c8->set_aggregate_method(OLAP_FIELD_AGGREGATION_REPLACE);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
+    c2->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
+    c3->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
+    c4->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
+    c5->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
+    c6->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
+    c7->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
+    c8->set_aggregate_method(STORAGE_AGGREGATE_REPLACE);
 
     Schema schema({k1, c1, c2, c3, c4, c5, c6, c7, c8});
 
@@ -306,7 +319,7 @@ TEST_F(AggregateIteratorTest, agg_replace) {
                                                             COL_VARCHAR(v5));
     // clang-format on
     auto agg_iter = new_aggregate_iterator(child_iter);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st = agg_iter->get_next(chunk.get());
     ASSERT_TRUE(st.ok());
@@ -341,12 +354,12 @@ TEST_F(AggregateIteratorTest, agg_replace) {
 TEST_F(AggregateIteratorTest, agg_max_no_duplicate) {
     config::vector_chunk_size = 1024;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BIGINT, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BIGINT, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, c1});
 
@@ -359,7 +372,7 @@ TEST_F(AggregateIteratorTest, agg_max_no_duplicate) {
                                                             COL_SMALLINT(v1));
     // clang-format on
     auto agg_iter = new_aggregate_iterator(child_iter);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st = agg_iter->get_next(chunk.get());
     ASSERT_TRUE(st.ok());
@@ -392,12 +405,12 @@ TEST_F(AggregateIteratorTest, agg_max_no_duplicate) {
 TEST_F(AggregateIteratorTest, agg_max_empty) {
     config::vector_chunk_size = 1024;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BIGINT, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BIGINT, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, c1});
 
@@ -410,7 +423,7 @@ TEST_F(AggregateIteratorTest, agg_max_empty) {
                                                             COL_SMALLINT(v1));
     // clang-format on
     auto agg_iter = new_aggregate_iterator(child_iter);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st = agg_iter->get_next(chunk.get());
     ASSERT_TRUE(st.is_end_of_file());
@@ -421,12 +434,12 @@ TEST_F(AggregateIteratorTest, agg_max_empty) {
 TEST_F(AggregateIteratorTest, agg_max_small_chunk) {
     config::vector_chunk_size = 2;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BIGINT, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BIGINT, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, c1});
 
@@ -439,7 +452,7 @@ TEST_F(AggregateIteratorTest, agg_max_small_chunk) {
                                                             COL_SMALLINT(v1));
     // clang-format on
     auto agg_iter = new_aggregate_iterator(child_iter);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st;
     std::vector<int16_t> values;
@@ -466,12 +479,12 @@ TEST_F(AggregateIteratorTest, agg_max_small_chunk) {
 TEST_F(AggregateIteratorTest, agg_max_all_duplicate) {
     config::vector_chunk_size = 2;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BIGINT, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BIGINT, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, c1});
 
@@ -484,7 +497,7 @@ TEST_F(AggregateIteratorTest, agg_max_all_duplicate) {
                                                             COL_SMALLINT(v1));
     // clang-format on
     auto agg_iter = new_aggregate_iterator(child_iter);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st;
     std::vector<int16_t> values;
@@ -509,12 +522,12 @@ TEST_F(AggregateIteratorTest, agg_max_all_duplicate) {
 TEST_F(AggregateIteratorTest, agg_boolean_key) {
     config::vector_chunk_size = 2;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BOOL, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BOOLEAN, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, c1});
 
@@ -527,7 +540,7 @@ TEST_F(AggregateIteratorTest, agg_boolean_key) {
                                                             COL_SMALLINT(v1));
     // clang-format on
     auto agg_iter = new_aggregate_iterator(child_iter);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st;
     std::vector<int16_t> values;
@@ -553,12 +566,12 @@ TEST_F(AggregateIteratorTest, agg_boolean_key) {
 TEST_F(AggregateIteratorTest, agg_varchar_key) {
     config::vector_chunk_size = 2;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_VARCHAR, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_VARCHAR, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, c1});
 
@@ -567,7 +580,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_key) {
         auto v1 = std::vector<int16_t>{1, 2, 3, 4, 5, 6};
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, COL_VARCHAR(pk), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -597,7 +610,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_key) {
         auto v1 = std::vector<int16_t>{1, 2, 3, 4, 5, 6};
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, COL_VARCHAR(pk), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -622,7 +635,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_key) {
         auto v1 = std::vector<int16_t>{1, 2, 3, 4, 5, 6};
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, COL_VARCHAR(pk), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -651,12 +664,12 @@ TEST_F(AggregateIteratorTest, agg_varchar_key) {
 TEST_F(AggregateIteratorTest, agg_date_key) {
     config::vector_chunk_size = 2;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_DATE_V2, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_DATE, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, c1});
 
@@ -665,7 +678,7 @@ TEST_F(AggregateIteratorTest, agg_date_key) {
         auto v1 = std::vector<int16_t>{1, 2, 3, 4};
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, COL_DATE(pk), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -693,7 +706,7 @@ TEST_F(AggregateIteratorTest, agg_date_key) {
         auto v1 = std::vector<int16_t>{1, 2, 3, 4};
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, COL_DATE(pk), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -718,7 +731,7 @@ TEST_F(AggregateIteratorTest, agg_date_key) {
         auto v1 = std::vector<int16_t>{1, 2, 3, 4};
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, COL_DATE(pk), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -746,12 +759,12 @@ TEST_F(AggregateIteratorTest, agg_date_key) {
 TEST_F(AggregateIteratorTest, agg_decimal_key) {
     config::vector_chunk_size = 2;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_DECIMAL_V2, false);
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_DECIMALV2, false);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, c1});
 
@@ -760,7 +773,7 @@ TEST_F(AggregateIteratorTest, agg_decimal_key) {
         auto v1 = std::vector<int16_t>{1, 2, 3, 4};
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, COL_DECIMAL(pk), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -788,7 +801,7 @@ TEST_F(AggregateIteratorTest, agg_decimal_key) {
         auto v1 = std::vector<int16_t>{1, 2, 3, 4};
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, COL_DECIMAL(pk), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -813,7 +826,7 @@ TEST_F(AggregateIteratorTest, agg_decimal_key) {
         auto v1 = std::vector<int16_t>{1, 2, 3, 4};
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, COL_DECIMAL(pk), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -841,15 +854,15 @@ TEST_F(AggregateIteratorTest, agg_decimal_key) {
 TEST_F(AggregateIteratorTest, agg_varchar_date_key) {
     config::vector_chunk_size = 2;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_VARCHAR, false);
-    auto k2 = std::make_shared<Field>(1, "k2", OLAP_FIELD_TYPE_DATE_V2, false);
-    auto c1 = std::make_shared<Field>(2, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_VARCHAR, false);
+    auto k2 = std::make_shared<Field>(1, "k2", TYPE_DATE, false);
+    auto c1 = std::make_shared<Field>(2, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
     k2->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    k2->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    k2->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({k1, k2, c1});
 
@@ -860,7 +873,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_date_key) {
         auto child_iter =
                 std::make_shared<VectorChunkIterator>(schema, COL_VARCHAR(pk1), COL_DATE(pk2), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -890,7 +903,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_date_key) {
         auto child_iter =
                 std::make_shared<VectorChunkIterator>(schema, COL_VARCHAR(pk1), COL_DATE(pk2), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -911,7 +924,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_date_key) {
         ASSERT_EQ(2, values[1]);
         ASSERT_EQ(3, values[2]);
         ASSERT_EQ(4, values[3]);
-        agg_iter->get_next(chunk.get());
+        ASSERT_FALSE(agg_iter->get_next(chunk.get()).ok());
     }
     {
         auto pk1 = std::vector<std::string>{"abc", "abc", "abc", "abc"};
@@ -920,7 +933,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_date_key) {
         auto child_iter =
                 std::make_shared<VectorChunkIterator>(schema, COL_VARCHAR(pk1), COL_DATE(pk2), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -947,7 +960,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_date_key) {
         auto child_iter =
                 std::make_shared<VectorChunkIterator>(schema, COL_VARCHAR(pk1), COL_DATE(pk2), COL_SMALLINT(v1));
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -974,15 +987,15 @@ TEST_F(AggregateIteratorTest, agg_varchar_date_key) {
 TEST_F(AggregateIteratorTest, agg_varchar_date_key_with_null) {
     config::vector_chunk_size = 2;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_VARCHAR, true);
-    auto k2 = std::make_shared<Field>(1, "k2", OLAP_FIELD_TYPE_DATE_V2, true);
-    auto c1 = std::make_shared<Field>(2, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_VARCHAR, true);
+    auto k2 = std::make_shared<Field>(1, "k2", TYPE_DATE, true);
+    auto c1 = std::make_shared<Field>(2, "c1", TYPE_SMALLINT, false);
 
     k1->set_is_key(true);
     k2->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    k2->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    k2->set_aggregate_method(STORAGE_AGGREGATE_NONE);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_SUM);
 
     Schema schema({k1, k2, c1});
 
@@ -1002,7 +1015,7 @@ TEST_F(AggregateIteratorTest, agg_varchar_date_key_with_null) {
         auto child_iter = std::make_shared<VectorChunkIterator>(schema, pkd1, pkd2, vd1);
 
         auto agg_iter = new_aggregate_iterator(child_iter);
-        ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+        ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
         ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
         Status st;
         std::vector<int16_t> values;
@@ -1030,9 +1043,9 @@ TEST_F(AggregateIteratorTest, agg_varchar_date_key_with_null) {
 TEST_F(AggregateIteratorTest, gen_source_masks) {
     config::vector_chunk_size = 2;
 
-    auto k1 = std::make_shared<Field>(0, "k1", OLAP_FIELD_TYPE_BIGINT, false);
+    auto k1 = std::make_shared<Field>(0, "k1", TYPE_BIGINT, false);
     k1->set_is_key(true);
-    k1->set_aggregate_method(OLAP_FIELD_AGGREGATION_NONE);
+    k1->set_aggregate_method(STORAGE_AGGREGATE_NONE);
 
     Schema schema({k1});
 
@@ -1041,7 +1054,7 @@ TEST_F(AggregateIteratorTest, gen_source_masks) {
     child_iter->chunk_size(1024);
     std::vector<RowSourceMask> source_masks{1, 1, 1, 2, 2, 2, 3, 3, 3};
     auto agg_iter = new_aggregate_iterator(child_iter, true);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
 
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st;
@@ -1067,8 +1080,8 @@ TEST_F(AggregateIteratorTest, gen_source_masks) {
 TEST_F(AggregateIteratorTest, sum_from_source_masks) {
     config::vector_chunk_size = 2;
 
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_SUM);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_SUM);
 
     Schema schema({c1});
 
@@ -1080,7 +1093,7 @@ TEST_F(AggregateIteratorTest, sum_from_source_masks) {
     std::vector<RowSourceMask> source_masks{{1, false}, {2, false}, {1, false}, {1, true},  {1, false}, {2, false},
                                             {2, true},  {2, true},  {3, false}, {3, false}, {3, true}};
     auto agg_iter = new_aggregate_iterator(child_iter, false);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
 
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st;
@@ -1112,8 +1125,8 @@ TEST_F(AggregateIteratorTest, sum_from_source_masks) {
 TEST_F(AggregateIteratorTest, max_from_source_masks) {
     config::vector_chunk_size = 2;
 
-    auto c1 = std::make_shared<Field>(1, "c1", OLAP_FIELD_TYPE_SMALLINT, false);
-    c1->set_aggregate_method(OLAP_FIELD_AGGREGATION_MAX);
+    auto c1 = std::make_shared<Field>(1, "c1", TYPE_SMALLINT, false);
+    c1->set_aggregate_method(STORAGE_AGGREGATE_MAX);
 
     Schema schema({c1});
 
@@ -1124,7 +1137,7 @@ TEST_F(AggregateIteratorTest, max_from_source_masks) {
     std::vector<RowSourceMask> source_masks{{1, false}, {1, true},  {1, false}, {2, false}, {2, true},
                                             {2, true},  {3, false}, {3, false}, {3, true}};
     auto agg_iter = new_aggregate_iterator(child_iter, false);
-    ASSERT_TRUE(agg_iter->init_encoded_schema(vectorized::EMPTY_GLOBAL_DICTMAPS).ok());
+    ASSERT_TRUE(agg_iter->init_encoded_schema(EMPTY_GLOBAL_DICTMAPS).ok());
 
     ChunkPtr chunk = ChunkHelper::new_chunk(agg_iter->schema(), config::vector_chunk_size);
     Status st;
@@ -1152,4 +1165,4 @@ TEST_F(AggregateIteratorTest, max_from_source_masks) {
     agg_iter->close();
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

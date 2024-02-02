@@ -1,23 +1,41 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer;
 
-import com.clearspring.analytics.util.Lists;
 import com.google.common.base.Preconditions;
+import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.starrocks.common.Pair;
+import com.starrocks.sql.common.DebugOperatorTracer;
 import com.starrocks.sql.optimizer.base.ColumnRefSet;
-import com.starrocks.sql.optimizer.base.OutputInputProperty;
+import com.starrocks.sql.optimizer.base.OutputPropertyGroup;
 import com.starrocks.sql.optimizer.base.PhysicalPropertySet;
 import com.starrocks.sql.optimizer.operator.Operator;
 import com.starrocks.sql.optimizer.rule.Rule;
+import com.starrocks.sql.optimizer.rule.RuleSet;
+import com.starrocks.sql.optimizer.rule.RuleSetType;
 import com.starrocks.sql.optimizer.rule.RuleType;
 
+import java.util.Arrays;
 import java.util.BitSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Objects;
+import java.util.Optional;
 import java.util.Set;
 import java.util.stream.Collectors;
 
@@ -38,23 +56,26 @@ public class GroupExpression {
     private final List<Group> inputs;
     private final Operator op;
     private final BitSet ruleMasks = new BitSet(RuleType.NUM_RULES.ordinal() + 1);
+    private final BitSet appliedRuleMasks = new BitSet(RuleType.NUM_RULES.ordinal() + 1);
     private boolean statsDerived = false;
     private final Map<PhysicalPropertySet, Pair<Double, List<PhysicalPropertySet>>> lowestCostTable;
     // required property by parent -> output property
     private final Map<PhysicalPropertySet, PhysicalPropertySet> outputPropertyMap;
 
-    // valid output/input properties, only used in enum plan
-    private final Set<OutputInputProperty> validOutputInputProperties;
-    // property -> plan count, only used in enum plan
-    private final Map<OutputInputProperty, Integer> propertiesPlanCountMap;
+    // valid output property groups, only used in enum plan
+    private final Set<OutputPropertyGroup> validOutputPropertyGroups;
+    // property group -> plan count, only used in enum plan
+    private final Map<OutputPropertyGroup, Integer> propertiesPlanCountMap;
 
     private boolean isUnused = false;
+
+    private Optional<Boolean> isAppliedMVRules = Optional.empty();
 
     public GroupExpression(Operator op, List<Group> inputs) {
         this.op = op;
         this.inputs = inputs;
         this.lowestCostTable = Maps.newHashMap();
-        this.validOutputInputProperties = Sets.newLinkedHashSet();
+        this.validOutputPropertyGroups = Sets.newLinkedHashSet();
         this.propertiesPlanCountMap = Maps.newLinkedHashMap();
         this.outputPropertyMap = Maps.newHashMap();
     }
@@ -115,6 +136,22 @@ public class GroupExpression {
         return ruleMasks.get(rule.type().ordinal());
     }
 
+    public BitSet getAppliedRuleMasks() {
+        return this.appliedRuleMasks;
+    }
+
+    public void mergeAppliedRules(BitSet bitSet) {
+        appliedRuleMasks.or(bitSet);
+    }
+
+    public void addNewAppliedRule(Rule rule) {
+        appliedRuleMasks.set(rule.type().ordinal());
+    }
+
+    public boolean hasRuleApplied(Rule rule) {
+        return appliedRuleMasks.get(rule.type().ordinal());
+    }
+
     public PhysicalPropertySet getOutputProperty(PhysicalPropertySet requiredPropertySet) {
         PhysicalPropertySet outputProperty = outputPropertyMap.get(requiredPropertySet);
         Preconditions.checkState(outputProperty != null);
@@ -126,39 +163,39 @@ public class GroupExpression {
         this.outputPropertyMap.put(requiredPropertySet, outputPropertySet);
     }
 
-    public void addValidOutputInputProperties(PhysicalPropertySet outputProperty,
-                                              List<PhysicalPropertySet> inputProperties) {
-        validOutputInputProperties.add(OutputInputProperty.of(outputProperty, inputProperties));
+    public void addValidOutputPropertyGroup(PhysicalPropertySet outputProperty,
+                                            List<PhysicalPropertySet> childrenOutputProperties) {
+        validOutputPropertyGroups.add(OutputPropertyGroup.of(outputProperty, childrenOutputProperties));
     }
 
-    public List<List<PhysicalPropertySet>> getRequiredInputProperties(PhysicalPropertySet requiredProperty) {
-        List<List<PhysicalPropertySet>> result = Lists.newArrayList();
-        for (OutputInputProperty outputInputProperty : validOutputInputProperties) {
-            if (outputInputProperty.getOutputProperty().equals(requiredProperty)) {
-                result.add(outputInputProperty.getInputProperties());
+    public List<OutputPropertyGroup> getChildrenOutputProperties(PhysicalPropertySet outputProperty) {
+        List<OutputPropertyGroup> outputPropertyGroups = Lists.newArrayList();
+        for (OutputPropertyGroup outputPropertyGroup : validOutputPropertyGroups) {
+            if (outputPropertyGroup.getOutputProperty().equals(outputProperty)) {
+                outputPropertyGroups.add(outputPropertyGroup);
             }
         }
-        return result;
+        return outputPropertyGroups;
     }
 
     public boolean hasValidSubPlan() {
-        return !validOutputInputProperties.isEmpty();
+        return !validOutputPropertyGroups.isEmpty();
     }
 
-    public void addPlanCountOfProperties(OutputInputProperty properties, int count) {
+    public void addPlanCountOfProperties(OutputPropertyGroup properties, int count) {
         propertiesPlanCountMap.put(properties, count);
     }
 
-    public Map<OutputInputProperty, Integer> getPropertiesPlanCountMap(
+    public Map<OutputPropertyGroup, Integer> getPropertiesPlanCountMap(
             PhysicalPropertySet requiredProperty) {
-        Map<OutputInputProperty, Integer> result = Maps.newLinkedHashMap();
+        Map<OutputPropertyGroup, Integer> result = Maps.newLinkedHashMap();
         propertiesPlanCountMap.entrySet().stream()
                 .filter(entry -> entry.getKey().getOutputProperty().equals(requiredProperty))
                 .forEach(entry -> result.put(entry.getKey(), entry.getValue()));
         return result;
     }
 
-    public int getRequiredPropertyPlanCount(PhysicalPropertySet requiredProperty) {
+    public int getOutputPropertyPlanCount(PhysicalPropertySet requiredProperty) {
         return propertiesPlanCountMap.entrySet().stream()
                 .filter(entry -> entry.getKey().getOutputProperty().equals(requiredProperty))
                 .mapToInt(Map.Entry::getValue).sum();
@@ -182,8 +219,12 @@ public class GroupExpression {
      * @return List of children input physical properties required
      */
     public List<PhysicalPropertySet> getInputProperties(PhysicalPropertySet require) {
-        Preconditions.checkState(lowestCostTable.containsKey(require));
-        return lowestCostTable.get(require).second;
+        Pair<Double, List<PhysicalPropertySet>> lowestInput = lowestCostTable.get(require);
+        if (lowestInput == null) {
+            String msg = "no best plan with this required property %s for this groupExpression %s";
+            throw new IllegalArgumentException(String.format(msg, require, this));
+        }
+        return lowestInput.second;
     }
 
     /**
@@ -294,15 +335,24 @@ public class GroupExpression {
         return sb.toString();
     }
 
-    public String toPrettyString(String headlineIndent, String detailIndent) {
+    public String debugString(String headlineIndent, String detailIndent) {
         StringBuilder sb = new StringBuilder();
         sb.append(detailIndent)
-                .append(op.accept(new OptimizerTraceUtil.OperatorTracePrinter(), null)).append("\n");
+                .append(op.accept(new DebugOperatorTracer(), null)).append("\n");
         String childHeadlineIndent = detailIndent + "->  ";
         String childDetailIndent = detailIndent + "    ";
         for (Group input : inputs) {
-            sb.append(input.toPrettyString(childHeadlineIndent, childDetailIndent));
+            sb.append(input.debugString(childHeadlineIndent, childDetailIndent));
         }
         return sb.toString();
+    }
+
+    public boolean hasAppliedMVRules() {
+        if (!isAppliedMVRules.isPresent()) {
+            List<Rule> mvRules = RuleSet.getRewriteRulesByType(Arrays.asList(RuleSetType.MULTI_TABLE_MV_REWRITE,
+                    RuleSetType.SINGLE_TABLE_MV_REWRITE));
+            isAppliedMVRules = Optional.of(mvRules.stream().anyMatch(rule -> hasRuleApplied(rule)));
+        }
+        return isAppliedMVRules.get();
     }
 }

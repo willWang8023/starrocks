@@ -1,17 +1,51 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.analysis;
 
+import com.starrocks.catalog.MaterializedView;
+import com.starrocks.common.AnalysisException;
 import com.starrocks.common.FeConstants;
+import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.common.util.UUIDUtil;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.DDLStmtExecutor;
+import com.starrocks.qe.SessionVariable;
+import com.starrocks.qe.ShowResultSet;
+import com.starrocks.scheduler.Task;
+import com.starrocks.scheduler.TaskBuilder;
+import com.starrocks.scheduler.TaskManager;
+import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.WarehouseManager;
+import com.starrocks.sql.analyzer.AnalyzeTestUtil;
+import com.starrocks.sql.analyzer.TaskAnalyzer;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.SubmitTaskStmt;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
+import com.starrocks.warehouse.LocalWarehouse;
+import com.starrocks.warehouse.Warehouse;
+import mockit.Mock;
+import mockit.MockUp;
 import org.junit.Assert;
 import org.junit.BeforeClass;
 import org.junit.Test;
 
 import java.util.Map;
+
+import static org.junit.Assert.assertEquals;
+import static org.junit.Assert.assertThrows;
 
 public class SubmitTaskStmtTest {
 
@@ -81,4 +115,96 @@ public class SubmitTaskStmtTest {
         Assert.assertEquals(submitTaskStmt4.getProperties().size(), 0);
     }
 
+    @Test
+    public void SubmitStmtShouldShow() throws Exception {
+        AnalyzeTestUtil.init();
+        ConnectContext ctx = starRocksAssert.getCtx();
+        String submitSQL = "SUBMIT TASK test1 AS CREATE TABLE t1 AS SELECT SLEEP(5);";
+        StatementBase submitStmt = AnalyzeTestUtil.analyzeSuccess(submitSQL);
+        Assert.assertTrue(submitStmt instanceof SubmitTaskStmt);
+        SubmitTaskStmt statement = (SubmitTaskStmt) submitStmt;
+        ShowResultSet showResult = DDLStmtExecutor.execute(statement, ctx);
+        Assert.assertNotNull(showResult);
+    }
+
+    @Test
+    public void testSubmitInsert() throws Exception {
+        ConnectContext ctx = starRocksAssert.getCtx();
+        starRocksAssert.withDatabase("test").useDatabase("test")
+                .withTable("CREATE TABLE test.test_insert\n" +
+                        "(\n" +
+                        "    k1 date,\n" +
+                        "    k2 int,\n" +
+                        "    v1 int sum\n" +
+                        ")\n" +
+                        "DISTRIBUTED BY HASH(k2) BUCKETS 3\n" +
+                        "PROPERTIES('replication_num' = '1');");
+
+        String sql1 = "submit task task1 as insert into test.test_insert select * from test.test_insert";
+        UtFrameUtils.parseStmtWithNewParser(sql1, ctx);
+
+        String sql2 = "submit task task1 as insert overwrite test.test_insert select * from test.test_insert";
+        UtFrameUtils.parseStmtWithNewParser(sql2, ctx);
+
+        SubmitTaskStmt submitStmt = (SubmitTaskStmt) UtFrameUtils.parseStmtWithNewParser(sql1, ctx);
+        Assert.assertNotNull(submitStmt.getDbName());
+        Assert.assertNotNull(submitStmt.getSqlText());
+    }
+
+    @Test
+    public void testSubmitWithWarehouse() throws Exception {
+        TaskManager tm = GlobalStateMgr.getCurrentState().getTaskManager();
+
+        // not supported
+        Exception e = assertThrows(AnalysisException.class, () ->
+                starRocksAssert.ddl("submit task t_warehouse properties('warehouse'='w1') as " +
+                        "insert into tbl1 select * from tbl1")
+        );
+        Assert.assertEquals("Getting analyzing error. Detail message: Invalid parameter warehouse.", e.getMessage());
+
+        // mock the warehouse
+        new MockUp<TaskAnalyzer>() {
+            @Mock
+            public void analyzeTaskProperties(Map<String, String> properties) {
+            }
+        };
+        new MockUp<WarehouseManager>() {
+            @Mock
+            Warehouse getWarehouse(String name) {
+                return new LocalWarehouse(123, name);
+            }
+        };
+
+        starRocksAssert.ddl("submit task t_warehouse properties('warehouse'='w1') as " +
+                "insert into tbl1 select * from tbl1");
+        Task task = tm.getTask("t_warehouse");
+        Assert.assertFalse(task.getProperties().toString(),
+                task.getProperties().containsKey(SessionVariable.WAREHOUSE));
+        Assert.assertTrue(task.getProperties().toString(),
+                task.getProperties().containsKey(PropertyAnalyzer.PROPERTIES_WAREHOUSE_ID));
+        Assert.assertEquals("('warehouse_id'='123')", task.getPropertiesString());
+    }
+
+    @Test
+    public void testDropTaskForce() throws Exception {
+        String name = "mv_force";
+        starRocksAssert.withMaterializedView("create materialized view " + name +
+                " refresh async every(interval 1 minute)" +
+                "as select * from tbl1");
+        MaterializedView mv = starRocksAssert.getMv("test", name);
+        String taskName = TaskBuilder.getMvTaskName(mv.getId());
+
+        // regular drop
+        Exception e = assertThrows(RuntimeException.class,
+                () -> starRocksAssert.ddl(String.format("drop task `%s`", taskName)));
+        assertEquals("Can not drop task generated by materialized view. " +
+                "You can use DROP MATERIALIZED VIEW to drop task, when the materialized view is deleted, " +
+                "the related task will be deleted automatically.", e.getMessage());
+
+        // force drop
+        starRocksAssert.ddl(String.format("drop task `%s` force", taskName));
+        TaskManager tm = GlobalStateMgr.getCurrentState().getTaskManager();
+        Assert.assertNull(tm.getTask(taskName));
+        starRocksAssert.dropMaterializedView(name);
+    }
 }

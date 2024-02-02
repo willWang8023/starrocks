@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/test/runtime/memory_scratch_sink_test.cpp
 
@@ -31,15 +44,15 @@
 #include <arrow/visitor.h>
 #include <arrow/visitor_inline.h>
 #include <gtest/gtest.h>
-#include <stdio.h>
-#include <stdlib.h>
 
+#include <cstdio>
+#include <cstdlib>
 #include <iostream>
 
 #include "column/chunk.h"
 #include "common/config.h"
 #include "common/logging.h"
-#include "exec/vectorized/csv_scanner.h"
+#include "exec/csv_scanner.h"
 #include "exprs/expr.h"
 #include "gen_cpp/Exprs_types.h"
 #include "gen_cpp/PlanNodes_types.h"
@@ -47,12 +60,11 @@
 #include "runtime/descriptor_helper.h"
 #include "runtime/exec_env.h"
 #include "runtime/memory_scratch_sink.h"
-#include "runtime/primitive_type.h"
 #include "runtime/result_queue_mgr.h"
 #include "runtime/runtime_state.h"
-#include "runtime/thread_resource_mgr.h"
 #include "storage/options.h"
 #include "testutil/desc_tbl_builder.h"
+#include "types/logical_type.h"
 #include "util/blocking_queue.hpp"
 #include "util/logging.h"
 
@@ -114,28 +126,30 @@ public:
         }
     }
 
-    ~MemoryScratchSinkIssue8676Test() { delete _state; }
+    ~MemoryScratchSinkIssue8676Test() override { delete _state; }
 
-    virtual void SetUp() {
+    void SetUp() override {
         config::periodic_counter_update_period_ms = 500;
+        _default_storage_root_path = config::storage_root_path;
         config::storage_root_path = "./data";
 
-        system("mkdir -p ./test_run/output/");
-        system("pwd");
-        system("cp -r ./be/test/runtime/test_data/ ./test_run/.");
+        [[maybe_unused]] auto res = system("mkdir -p ./test_run/output/");
+        res = system("pwd");
+        res = system("cp -r ./be/test/runtime/test_data/ ./test_run/.");
 
         init();
     }
 
-    virtual void TearDown() {
+    void TearDown() override {
         _obj_pool.clear();
-        system("rm -rf ./test_run");
+        [[maybe_unused]] auto res = system("rm -rf ./test_run");
+        config::storage_root_path = _default_storage_root_path;
     }
 
-    std::unique_ptr<vectorized::CSVScanner> create_csv_scanner(const std::vector<TypeDescriptor>& types,
-                                                               const std::vector<TBrokerRangeDesc>& ranges,
-                                                               const string& multi_row_delimiter = "\n",
-                                                               const string& multi_column_separator = "|") {
+    std::unique_ptr<CSVScanner> create_csv_scanner(const std::vector<TypeDescriptor>& types,
+                                                   const std::vector<TBrokerRangeDesc>& ranges,
+                                                   const string& multi_row_delimiter = "\n",
+                                                   const string& multi_column_separator = "|") {
         /// Init DescriptorTable
         TDescriptorTableBuilder desc_tbl_builder;
         TTupleDescriptorBuilder tuple_desc_builder;
@@ -147,8 +161,8 @@ public:
         tuple_desc_builder.build(&desc_tbl_builder);
 
         DescriptorTbl* desc_tbl = nullptr;
-        Status st =
-                DescriptorTbl::create(&_obj_pool, desc_tbl_builder.desc_tbl(), &desc_tbl, config::vector_chunk_size);
+        Status st = DescriptorTbl::create(_state, &_obj_pool, desc_tbl_builder.desc_tbl(), &desc_tbl,
+                                          config::vector_chunk_size);
         CHECK(st.ok()) << st.to_string();
 
         /// Init RuntimeState
@@ -180,12 +194,12 @@ public:
 
         RuntimeProfile* profile = _obj_pool.add(new RuntimeProfile("test_prof", true));
 
-        vectorized::ScannerCounter* counter = _obj_pool.add(new vectorized::ScannerCounter());
+        ScannerCounter* counter = _obj_pool.add(new ScannerCounter());
 
         TBrokerScanRange* broker_scan_range = _obj_pool.add(new TBrokerScanRange());
         broker_scan_range->params = *params;
         broker_scan_range->ranges = ranges;
-        return std::make_unique<vectorized::CSVScanner>(state, profile, *broker_scan_range, counter);
+        return std::make_unique<CSVScanner>(state, profile, *broker_scan_range, counter);
     }
 
     void init();
@@ -203,6 +217,7 @@ private:
     TMemoryScratchSink _tsink;
     DescriptorTbl* _desc_tbl = nullptr;
     std::vector<TExpr> _exprs;
+    std::string _default_storage_root_path;
 };
 
 void MemoryScratchSinkIssue8676Test::init() {
@@ -289,7 +304,7 @@ void MemoryScratchSinkIssue8676Test::init_desc_tbl() {
     t_tuple_desc.__isset.tableId = true;
     _t_desc_table.tupleDescriptors.push_back(t_tuple_desc);
 
-    DescriptorTbl::create(&_obj_pool, _t_desc_table, &_desc_tbl, config::vector_chunk_size);
+    CHECK(DescriptorTbl::create(_state, &_obj_pool, _t_desc_table, &_desc_tbl, config::vector_chunk_size).ok());
 
     std::vector<TTupleId> row_tids;
     row_tids.push_back(0);
@@ -328,7 +343,7 @@ TEST_F(MemoryScratchSinkIssue8676Test, work_flow_normal) {
     MemoryScratchSink sink(*_row_desc, _exprs, _tsink);
     TDataSink data_sink;
     data_sink.memory_scratch_sink = _tsink;
-    ASSERT_TRUE(sink.init(data_sink).ok());
+    ASSERT_TRUE(sink.init(data_sink, nullptr).ok());
     ASSERT_TRUE(sink.prepare(_state).ok());
 
     auto maybe_chunk = scanner->get_next();

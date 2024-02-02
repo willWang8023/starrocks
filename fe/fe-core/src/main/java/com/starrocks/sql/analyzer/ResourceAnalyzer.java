@@ -1,16 +1,27 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.sql.analyzer;
 
-import com.starrocks.analysis.StatementBase;
 import com.starrocks.catalog.Resource;
-import com.starrocks.common.AnalysisException;
-import com.starrocks.common.FeNameFormat;
 import com.starrocks.common.util.PropertyAnalyzer;
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.sql.ast.AlterResourceStmt;
 import com.starrocks.sql.ast.AstVisitor;
 import com.starrocks.sql.ast.CreateResourceStmt;
 import com.starrocks.sql.ast.DropResourceStmt;
+import com.starrocks.sql.ast.StatementBase;
 
 import java.util.Arrays;
 import java.util.Map;
@@ -31,11 +42,7 @@ public class ResourceAnalyzer {
         @Override
         public Void visitCreateResourceStatement(CreateResourceStmt createResourceStmt, ConnectContext context) {
             // check name
-            try {
-                FeNameFormat.checkResourceName(createResourceStmt.getResourceName());
-            } catch (AnalysisException e) {
-                throw new SemanticException(e.getMessage());
-            }
+            FeNameFormat.checkResourceName(createResourceStmt.getResourceName());
             // check type in properties
             Map<String, String> properties = createResourceStmt.getProperties();
             if (properties == null || properties.isEmpty()) {
@@ -63,22 +70,14 @@ public class ResourceAnalyzer {
 
         @Override
         public Void visitDropResourceStatement(DropResourceStmt dropResourceStmt, ConnectContext context) {
-            try {
-                FeNameFormat.checkResourceName(dropResourceStmt.getResourceName());
-            } catch (AnalysisException e) {
-                throw new SemanticException(e.getMessage());
-            }
+            FeNameFormat.checkResourceName(dropResourceStmt.getResourceName());
             return null;
         }
 
         @Override
         public Void visitAlterResourceStatement(AlterResourceStmt alterResourceStmt, ConnectContext context) {
             // check name
-            try {
-                FeNameFormat.checkResourceName(alterResourceStmt.getResourceName());
-            } catch (AnalysisException e) {
-                throw new SemanticException(e.getMessage());
-            }
+            FeNameFormat.checkResourceName(alterResourceStmt.getResourceName());
             // check properties
             Map<String, String> properties = alterResourceStmt.getProperties();
             String typeStr = PropertyAnalyzer.analyzeType(properties);

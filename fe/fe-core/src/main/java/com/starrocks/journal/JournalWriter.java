@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.journal;
 
@@ -22,13 +35,13 @@ import java.util.concurrent.BlockingQueue;
 public class JournalWriter {
     public static final Logger LOG = LogManager.getLogger(JournalWriter.class);
     // other threads can put log to this queue by calling Editlog.logEdit()
-    private BlockingQueue<JournalTask> journalQueue;
-    private Journal journal;
+    private final BlockingQueue<JournalTask> journalQueue;
+    private final Journal journal;
 
     // used for checking if edit log need to roll
     protected long rollJournalCounter = 0;
     // increment journal id
-    // this is the persist journal id
+    // this is the persisted journal id
     protected long nextVisibleJournalId = -1;
 
     // belows are variables that will reset every batch
@@ -40,6 +53,18 @@ public class JournalWriter {
     private long startTimeNano;
     // batch size in bytes
     private long uncommittedEstimatedBytes;
+
+    /**
+     * If this flag is set true, we will roll journal,
+     * i.e. create a new database in BDB immediately after
+     * current journal batch has been written.
+     */
+    private boolean forceRollJournal;
+
+    /** Last timestamp in millisecond to log the commit triggered by delay. */
+    private long lastLogTimeForDelayTriggeredCommit = -1;
+
+    private long lastSlowEditLogTimeNs = -1L;
 
     public JournalWriter(Journal journal, BlockingQueue<JournalTask> journalQueue) {
         this.journal = journal;
@@ -143,11 +168,9 @@ public class JournalWriter {
 
     /**
      * We should notify the caller to rollback or report error on abort, like this.
-     *
      * task.markAbort();
-     *
      * But now we have to exit for historical reason.
-     * Note that if we exit here, the finally clause(commit current batch) will not be executed.
+     * Note that if we exit here, the final clause(commit current batch) will not be executed.
      */
     protected void abortJournalTask(JournalTask task, String msg) {
         LOG.error(msg);
@@ -157,11 +180,16 @@ public class JournalWriter {
 
     private boolean shouldCommitNow() {
         // 1. check if is an emergency journal
-        if (currentJournal.getBetterCommitBeforeTime() > 0) {
-            long delayMillis = (System.nanoTime() - currentJournal.getBetterCommitBeforeTime()) / 1000000;
-            if (delayMillis >= 0) {
-                LOG.warn("journal expect commit before {} is delayed {} mills, will commit now",
-                        currentJournal.getBetterCommitBeforeTime(), delayMillis);
+        if (currentJournal.getBetterCommitBeforeTimeInNano() > 0) {
+            long delayNanos = System.nanoTime() - currentJournal.getBetterCommitBeforeTimeInNano();
+            if (delayNanos >= 0) {
+                long logTime = System.currentTimeMillis();
+                // avoid logging too many messages if triggered frequently
+                if (lastLogTimeForDelayTriggeredCommit + 500 < logTime) {
+                    lastLogTimeForDelayTriggeredCommit = logTime;
+                    LOG.warn("journal expect commit before {} is delayed {} nanos, will commit now",
+                            currentJournal.getBetterCommitBeforeTimeInNano(), delayNanos);
+                }
                 return true;
             }
         }
@@ -175,7 +203,7 @@ public class JournalWriter {
 
         // 3. check uncommitted journals by size
         uncommittedEstimatedBytes += currentJournal.estimatedSizeByte();
-        if (uncommittedEstimatedBytes >= Config.metadata_journal_max_batch_size_mb * 1024 * 1024) {
+        if (uncommittedEstimatedBytes >= (long) Config.metadata_journal_max_batch_size_mb * 1024 * 1024) {
             LOG.warn("uncommitted estimated bytes {} >= {}MB, will commit now",
                     uncommittedEstimatedBytes, Config.metadata_journal_max_batch_size_mb);
             return true;
@@ -189,9 +217,20 @@ public class JournalWriter {
      * update all metrics after batch write
      */
     private void updateBatchMetrics() {
-        if (MetricRepo.isInit) {
+        // Log slow edit log write if needed.
+        long currentTimeNs = System.nanoTime();
+        long durationMs = (currentTimeNs - startTimeNano) / 1000000;
+        final long DEFAULT_EDIT_LOG_SLOW_LOGGING_INTERVAL_NS = 2000000000L; // 2 seconds
+        if (durationMs > Config.edit_log_write_slow_log_threshold_ms &&
+                currentTimeNs - lastSlowEditLogTimeNs > DEFAULT_EDIT_LOG_SLOW_LOGGING_INTERVAL_NS) {
+            LOG.warn("slow edit log write, batch size: {}, took: {}ms, current journal queue size: {}," +
+                    " please check the IO pressure of FE LEADER node or the latency between LEADER and FOLLOWER nodes",
+                    currentBatchTasks.size(), durationMs, journalQueue.size());
+            lastSlowEditLogTimeNs = currentTimeNs;
+        }
+        if (MetricRepo.hasInit) {
             MetricRepo.COUNTER_EDIT_LOG_WRITE.increase((long) currentBatchTasks.size());
-            MetricRepo.HISTO_JOURNAL_WRITE_LATENCY.update((System.nanoTime() - startTimeNano) / 1000000);
+            MetricRepo.HISTO_JOURNAL_WRITE_LATENCY.update(durationMs);
             MetricRepo.HISTO_JOURNAL_WRITE_BATCH.update(currentBatchTasks.size());
             MetricRepo.HISTO_JOURNAL_WRITE_BYTES.update(uncommittedEstimatedBytes);
             MetricRepo.GAUGE_STACKED_JOURNAL_NUM.setValue((long) journalQueue.size());
@@ -205,9 +244,23 @@ public class JournalWriter {
         }
     }
 
+    public void setForceRollJournal() {
+        forceRollJournal = true;
+    }
+
+    private boolean needForceRollJournal() {
+        if (forceRollJournal) {
+            // Reset flag, alter system create image only trigger new image once
+            forceRollJournal = false;
+            return true;
+        }
+
+        return false;
+    }
+
     private void rollJournalAfterBatch() {
         rollJournalCounter += currentBatchTasks.size();
-        if (rollJournalCounter >= Config.edit_log_roll_num) {
+        if (rollJournalCounter >= Config.edit_log_roll_num || needForceRollJournal()) {
             try {
                 journal.rollJournal(nextVisibleJournalId);
             } catch (JournalException e) {
@@ -217,8 +270,14 @@ public class JournalWriter {
                 // TODO exit gracefully
                 System.exit(-1);
             }
-            LOG.info("rolled edig log because rollEditCounter {} >= edit_log_roll_num {}.",
-                    rollJournalCounter, Config.edit_log_roll_num);
+            String reason;
+            if (rollJournalCounter >= Config.edit_log_roll_num) {
+                reason = String.format("rollEditCounter %d >= edit_log_roll_num %d",
+                        rollJournalCounter, Config.edit_log_roll_num);
+            } else {
+                reason = "triggering a new checkpoint manually";
+            }
+            LOG.info("edit log rolled because {}", reason);
             rollJournalCounter = 0;
         }
     }

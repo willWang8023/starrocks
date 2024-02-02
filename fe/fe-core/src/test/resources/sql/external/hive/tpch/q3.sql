@@ -1,26 +1,3 @@
-[sql]
-select
-    l_orderkey,
-    sum(l_extendedprice * (1 - l_discount)) as revenue,
-    o_orderdate,
-    o_shippriority
-from
-    customer,
-    orders,
-    lineitem
-where
-  c_mktsegment = 'HOUSEHOLD'
-  and c_custkey = o_custkey
-  and l_orderkey = o_orderkey
-  and o_orderdate < date '1995-03-11'
-  and l_shipdate > date '1995-03-11'
-group by
-    l_orderkey,
-    o_orderdate,
-    o_shippriority
-order by
-    revenue desc,
-    o_orderdate limit 10;
 [fragment statistics]
 PLAN FRAGMENT 0(F07)
 Output Exprs:18: l_orderkey | 35: sum | 13: o_orderdate | 16: o_shippriority
@@ -28,13 +5,14 @@ Input Partition: UNPARTITIONED
 RESULT SINK
 
 14:MERGING-EXCHANGE
+distribution type: GATHER
 limit: 10
 cardinality: 10
 column statistics:
 * o_orderdate-->[6.941952E8, 7.948512E8, 0.0, 4.0, 2412.0] ESTIMATE
 * o_shippriority-->[0.0, 0.0, 0.0, 4.0, 1.0] ESTIMATE
 * l_orderkey-->[1.0, 6.0E8, 0.0, 8.0, 2.1729079702600703E7] ESTIMATE
-* sum-->[810.9, 555165.3513421458, 0.0, 16.0, 3736520.0] ESTIMATE
+* sum-->[810.9, 1315947.4994776787, 0.0, 16.0, 3736520.0] ESTIMATE
 
 PLAN FRAGMENT 1(F06)
 
@@ -51,17 +29,17 @@ OutPut Exchange Id: 14
 |  * o_orderdate-->[6.941952E8, 7.948512E8, 0.0, 4.0, 2412.0] ESTIMATE
 |  * o_shippriority-->[0.0, 0.0, 0.0, 4.0, 1.0] ESTIMATE
 |  * l_orderkey-->[1.0, 6.0E8, 0.0, 8.0, 2.1729079702600703E7] ESTIMATE
-|  * sum-->[810.9, 555165.3513421458, 0.0, 16.0, 3736520.0] ESTIMATE
+|  * sum-->[810.9, 1315947.4994776787, 0.0, 16.0, 3736520.0] ESTIMATE
 |
 12:AGGREGATE (update finalize)
 |  aggregate: sum[([34: expr, DECIMAL128(33,4), true]); args: DECIMAL128; result: DECIMAL128(38,4); args nullable: true; result nullable: true]
 |  group by: [18: l_orderkey, INT, true], [13: o_orderdate, DATE, true], [16: o_shippriority, INT, true]
-|  cardinality: 19765568
+|  cardinality: 46851716
 |  column statistics:
 |  * o_orderdate-->[6.941952E8, 7.948512E8, 0.0, 4.0, 2412.0] ESTIMATE
 |  * o_shippriority-->[0.0, 0.0, 0.0, 4.0, 1.0] ESTIMATE
 |  * l_orderkey-->[1.0, 6.0E8, 0.0, 8.0, 2.1729079702600703E7] ESTIMATE
-|  * sum-->[810.9, 555165.3513421458, 0.0, 16.0, 3736520.0] ESTIMATE
+|  * sum-->[810.9, 1315947.4994776787, 0.0, 16.0, 3736520.0] ESTIMATE
 |
 11:Project
 |  output columns:
@@ -93,9 +71,13 @@ OutPut Exchange Id: 14
 |  * expr-->[810.9, 104949.5, 0.0, 16.0, 3736520.0] ESTIMATE
 |
 |----9:EXCHANGE
+|       distribution type: SHUFFLE
+|       partition exprs: [9: o_orderkey, INT, true]
 |       cardinality: 21729080
 |
 2:EXCHANGE
+distribution type: SHUFFLE
+partition exprs: [18: l_orderkey, INT, true]
 cardinality: 323426370
 
 PLAN FRAGMENT 2(F02)
@@ -130,15 +112,15 @@ OutPut Exchange Id: 09
 |  * o_shippriority-->[0.0, 0.0, 0.0, 4.0, 1.0] ESTIMATE
 |
 |----6:EXCHANGE
+|       distribution type: BROADCAST
 |       cardinality: 3000000
 |
 3:HdfsScanNode
 TABLE: orders
 NON-PARTITION PREDICATES: 13: o_orderdate < '1995-03-11'
-MIN/MAX PREDICATES: 37: o_orderdate < '1995-03-11'
+MIN/MAX PREDICATES: 13: o_orderdate < '1995-03-11'
 partitions=1/1
 avgRowSize=24.0
-numNodes=0
 cardinality: 72661123
 probe runtime filters:
 - filter_id = 0, probe_expr = (10: o_custkey)
@@ -164,10 +146,9 @@ OutPut Exchange Id: 06
 4:HdfsScanNode
 TABLE: customer
 NON-PARTITION PREDICATES: 7: c_mktsegment = 'HOUSEHOLD'
-MIN/MAX PREDICATES: 38: c_mktsegment <= 'HOUSEHOLD', 39: c_mktsegment >= 'HOUSEHOLD'
+MIN/MAX PREDICATES: 7: c_mktsegment <= 'HOUSEHOLD', 7: c_mktsegment >= 'HOUSEHOLD'
 partitions=1/1
 avgRowSize=18.0
-numNodes=0
 cardinality: 3000000
 column statistics:
 * c_custkey-->[1.0, 1.5E7, 0.0, 8.0, 3000000.0] ESTIMATE
@@ -193,10 +174,9 @@ OutPut Exchange Id: 02
 0:HdfsScanNode
 TABLE: lineitem
 NON-PARTITION PREDICATES: 28: l_shipdate > '1995-03-11'
-MIN/MAX PREDICATES: 36: l_shipdate > '1995-03-11'
+MIN/MAX PREDICATES: 28: l_shipdate > '1995-03-11'
 partitions=1/1
 avgRowSize=28.0
-numNodes=0
 cardinality: 323426370
 probe runtime filters:
 - filter_id = 1, probe_expr = (18: l_orderkey)

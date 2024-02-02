@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include <gtest/gtest.h>
 
@@ -7,14 +19,15 @@
 
 #include "column/array_column.h"
 #include "column/column_helper.h"
-#include "storage/array_type_info.h"
+#include "storage/aggregate_type.h"
 #include "storage/column_aggregate_func.h"
+#include "types/array_type_info.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 TEST(ColumnAggregator, testIntSum) {
-    FieldPtr field = std::make_shared<Field>(1, "test", FieldType::OLAP_FIELD_TYPE_INT, false);
-    field->set_aggregate_method(FieldAggregationMethod::OLAP_FIELD_AGGREGATION_SUM);
+    FieldPtr field = std::make_shared<Field>(1, "test", LogicalType::TYPE_INT, false);
+    field->set_aggregate_method(StorageAggregateType::STORAGE_AGGREGATE_SUM);
 
     auto aggregator = ColumnAggregatorFactory::create_value_column_aggregator(field);
 
@@ -76,8 +89,8 @@ TEST(ColumnAggregator, testIntSum) {
 }
 
 TEST(ColumnAggregator, testNullIntSum) {
-    FieldPtr field = std::make_shared<Field>(1, "test", FieldType::OLAP_FIELD_TYPE_INT, true);
-    field->set_aggregate_method(FieldAggregationMethod::OLAP_FIELD_AGGREGATION_SUM);
+    FieldPtr field = std::make_shared<Field>(1, "test", LogicalType::TYPE_INT, true);
+    field->set_aggregate_method(StorageAggregateType::STORAGE_AGGREGATE_SUM);
 
     auto aggregator = ColumnAggregatorFactory::create_value_column_aggregator(field);
 
@@ -144,7 +157,6 @@ TEST(ColumnAggregator, testNullIntSum) {
     ASSERT_EQ(1022, dst->get_data()[1]);
     ASSERT_EQ(0, ndst->get_data()[1]);
 
-    ASSERT_EQ(0, dst->get_data()[2]);
     ASSERT_EQ(1, ndst->get_data()[2]);
 
     aggregator->update_source(nsrc3);
@@ -165,13 +177,10 @@ TEST(ColumnAggregator, testNullIntSum) {
     ASSERT_EQ(1022, dst->get_data()[1]);
     ASSERT_EQ(0, ndst->get_data()[1]);
 
-    ASSERT_EQ(0, dst->get_data()[2]);
     ASSERT_EQ(1, ndst->get_data()[2]);
 
-    ASSERT_EQ(0, dst->get_data()[3]);
     ASSERT_EQ(1, ndst->get_data()[3]);
 
-    ASSERT_EQ(0, dst->get_data()[4]);
     ASSERT_EQ(1, ndst->get_data()[4]);
 
     ASSERT_EQ(512, dst->get_data()[5]);
@@ -186,8 +195,8 @@ TEST(ColumnAggregator, testNullIntSum) {
 }
 
 TEST(ColumnAggregator, testIntMax) {
-    FieldPtr field = std::make_shared<Field>(1, "test", FieldType::OLAP_FIELD_TYPE_INT, false);
-    field->set_aggregate_method(FieldAggregationMethod::OLAP_FIELD_AGGREGATION_MAX);
+    FieldPtr field = std::make_shared<Field>(1, "test", LogicalType::TYPE_INT, false);
+    field->set_aggregate_method(StorageAggregateType::STORAGE_AGGREGATE_MAX);
 
     auto aggregator = ColumnAggregatorFactory::create_value_column_aggregator(field);
 
@@ -249,8 +258,8 @@ TEST(ColumnAggregator, testIntMax) {
 }
 
 TEST(ColumnAggregator, testStringMin) {
-    FieldPtr field = std::make_shared<Field>(1, "test", FieldType::OLAP_FIELD_TYPE_VARCHAR, false);
-    field->set_aggregate_method(FieldAggregationMethod::OLAP_FIELD_AGGREGATION_MIN);
+    FieldPtr field = std::make_shared<Field>(1, "test", LogicalType::TYPE_VARCHAR, false);
+    field->set_aggregate_method(StorageAggregateType::STORAGE_AGGREGATE_MIN);
 
     auto aggregator = ColumnAggregatorFactory::create_value_column_aggregator(field);
 
@@ -312,8 +321,8 @@ TEST(ColumnAggregator, testStringMin) {
 }
 
 TEST(ColumnAggregator, testNullBooleanMin) {
-    FieldPtr field = std::make_shared<Field>(1, "test_boolean", FieldType::OLAP_FIELD_TYPE_BOOL, true);
-    field->set_aggregate_method(FieldAggregationMethod::OLAP_FIELD_AGGREGATION_MIN);
+    FieldPtr field = std::make_shared<Field>(1, "test_boolean", LogicalType::TYPE_BOOLEAN, true);
+    field->set_aggregate_method(StorageAggregateType::STORAGE_AGGREGATE_MIN);
 
     auto agg = NullableColumn::create(BooleanColumn::create(), NullColumn::create());
     auto aggregator = ColumnAggregatorFactory::create_value_column_aggregator(field);
@@ -369,13 +378,14 @@ TEST(ColumnAggregator, testNullBooleanMin) {
     ASSERT_EQ("0", agg->debug_item(2));
 
     // check agg data and null column
-    ASSERT_EQ("[1, 1, 0]", agg->data_column()->debug_string());
     ASSERT_EQ("[1, 0, 0]", agg->null_column()->debug_string());
+    ASSERT_TRUE(agg->data_column()->get(1).get_uint8());
+    ASSERT_FALSE(agg->data_column()->get(2).get_uint8());
 }
 
 TEST(ColumnAggregator, testNullIntReplaceIfNotNull) {
-    FieldPtr field = std::make_shared<Field>(1, "test", FieldType::OLAP_FIELD_TYPE_INT, true);
-    field->set_aggregate_method(FieldAggregationMethod::OLAP_FIELD_AGGREGATION_REPLACE_IF_NOT_NULL);
+    FieldPtr field = std::make_shared<Field>(1, "test", LogicalType::TYPE_INT, true);
+    field->set_aggregate_method(StorageAggregateType::STORAGE_AGGREGATE_REPLACE_IF_NOT_NULL);
 
     auto aggregator = ColumnAggregatorFactory::create_value_column_aggregator(field);
 
@@ -442,7 +452,6 @@ TEST(ColumnAggregator, testNullIntReplaceIfNotNull) {
     EXPECT_EQ(1023, dst->get_data()[1]);
     EXPECT_EQ(0, ndst->get_data()[1]);
 
-    EXPECT_EQ(0, dst->get_data()[2]);
     EXPECT_EQ(1, ndst->get_data()[2]);
 
     aggregator->update_source(nsrc3);
@@ -463,10 +472,8 @@ TEST(ColumnAggregator, testNullIntReplaceIfNotNull) {
     EXPECT_EQ(1023, dst->get_data()[1]);
     EXPECT_EQ(0, ndst->get_data()[1]);
 
-    EXPECT_EQ(0, dst->get_data()[2]);
     EXPECT_EQ(1, ndst->get_data()[2]);
 
-    EXPECT_EQ(0, dst->get_data()[3]);
     EXPECT_EQ(1, ndst->get_data()[3]);
 
     EXPECT_EQ(0, dst->get_data()[4]);
@@ -484,8 +491,8 @@ TEST(ColumnAggregator, testNullIntReplaceIfNotNull) {
 }
 
 TEST(ColumnAggregator, testNullIntReplace) {
-    FieldPtr field = std::make_shared<Field>(1, "test", FieldType::OLAP_FIELD_TYPE_INT, true);
-    field->set_aggregate_method(FieldAggregationMethod::OLAP_FIELD_AGGREGATION_REPLACE);
+    FieldPtr field = std::make_shared<Field>(1, "test", LogicalType::TYPE_INT, true);
+    field->set_aggregate_method(StorageAggregateType::STORAGE_AGGREGATE_REPLACE);
 
     auto aggregator = ColumnAggregatorFactory::create_value_column_aggregator(field);
 
@@ -594,11 +601,11 @@ TEST(ColumnAggregator, testNullIntReplace) {
 }
 
 TEST(ColumnAggregator, testArrayReplace) {
-    auto array_type_info = get_array_type_info(get_type_info(FieldType::OLAP_FIELD_TYPE_VARCHAR));
+    auto array_type_info = get_array_type_info(get_type_info(LogicalType::TYPE_VARCHAR));
     FieldPtr field = std::make_shared<Field>(1, "test_array", array_type_info,
-                                             FieldAggregationMethod::OLAP_FIELD_AGGREGATION_REPLACE, 1, false, false);
+                                             StorageAggregateType::STORAGE_AGGREGATE_REPLACE, 1, false, false);
 
-    auto agg_elements = BinaryColumn::create();
+    auto agg_elements = NullableColumn::create(BinaryColumn::create(), NullColumn::create());
     auto agg_offsets = UInt32Column::create();
     auto agg = ArrayColumn::create(agg_elements, agg_offsets);
 
@@ -607,11 +614,11 @@ TEST(ColumnAggregator, testArrayReplace) {
     std::vector<uint32_t> loops;
 
     // first chunk column
-    auto elements = BinaryColumn::create();
+    auto elements = NullableColumn::create(BinaryColumn::create(), NullColumn::create());
     auto offsets = UInt32Column::create();
     auto src = ArrayColumn::create(elements, offsets);
     for (int i = 0; i < 10; ++i) {
-        elements->append(Slice(std::to_string(i)));
+        elements->append_datum(Slice(std::to_string(i)));
     }
     offsets->append(2);
     offsets->append(5);
@@ -626,12 +633,12 @@ TEST(ColumnAggregator, testArrayReplace) {
     aggregator->aggregate_values(0, 2, loops.data(), false);
 
     ASSERT_EQ(1, agg->size());
-    EXPECT_EQ("['2', '3', '4']", agg->debug_item(0));
+    EXPECT_EQ("['2','3','4']", agg->debug_item(0));
 
     // second chunk column
     src->reset_column();
     for (int i = 10; i < 20; ++i) {
-        elements->append(Slice(std::to_string(i)));
+        elements->append_datum(Slice(std::to_string(i)));
     }
     offsets->append(2);
     offsets->append(7);
@@ -648,13 +655,13 @@ TEST(ColumnAggregator, testArrayReplace) {
     aggregator->aggregate_values(0, 3, loops.data(), false);
 
     EXPECT_EQ(3, agg->size());
-    EXPECT_EQ("['10', '11']", agg->debug_item(1));
-    EXPECT_EQ("['17', '18']", agg->debug_item(2));
+    EXPECT_EQ("['10','11']", agg->debug_item(1));
+    EXPECT_EQ("['17','18']", agg->debug_item(2));
 
     // third chunk column
     src->reset_column();
     for (int i = 20; i < 30; ++i) {
-        elements->append(Slice(std::to_string(i)));
+        elements->append_datum(Slice(std::to_string(i)));
     }
     offsets->append(10);
 
@@ -669,15 +676,15 @@ TEST(ColumnAggregator, testArrayReplace) {
 
     EXPECT_EQ(5, agg->size());
     EXPECT_EQ("['19']", agg->debug_item(3));
-    EXPECT_EQ("['20', '21', '22', '23', '24', '25', '26', '27', '28', '29']", agg->debug_item(4));
+    EXPECT_EQ("['20','21','22','23','24','25','26','27','28','29']", agg->debug_item(4));
 }
 
 // NOLINTNEXTLINE
 TEST(ColumnAggregator, testNullArrayReplaceIfNotNull2) {
-    auto array_type_info = get_array_type_info(get_type_info(FieldType::OLAP_FIELD_TYPE_INT));
+    auto array_type_info = get_array_type_info(get_type_info(LogicalType::TYPE_INT));
     FieldPtr field =
             std::make_shared<Field>(1, "test_array", array_type_info,
-                                    FieldAggregationMethod::OLAP_FIELD_AGGREGATION_REPLACE_IF_NOT_NULL, 1, false, true);
+                                    StorageAggregateType::STORAGE_AGGREGATE_REPLACE_IF_NOT_NULL, 1, false, true);
     auto agg = NullableColumn::create(
             ArrayColumn::create(NullableColumn::create(Int32Column::create(), NullColumn::create()),
                                 UInt32Column::create()),
@@ -751,10 +758,10 @@ TEST(ColumnAggregator, testNullArrayReplaceIfNotNull2) {
 
 // insert into tbl values (key, null);
 TEST(ColumnAggregator, testNullArrayReplaceIfNotNull) {
-    auto array_type_info = get_array_type_info(get_type_info(FieldType::OLAP_FIELD_TYPE_VARCHAR));
+    auto array_type_info = get_array_type_info(get_type_info(LogicalType::TYPE_VARCHAR));
     FieldPtr field =
             std::make_shared<Field>(1, "test_array", array_type_info,
-                                    FieldAggregationMethod::OLAP_FIELD_AGGREGATION_REPLACE_IF_NOT_NULL, 1, false, true);
+                                    StorageAggregateType::STORAGE_AGGREGATE_REPLACE_IF_NOT_NULL, 1, false, true);
 
     auto agg = NullableColumn::create(
             ArrayColumn::create(NullableColumn::create(BinaryColumn::create(), NullColumn::create()),
@@ -786,4 +793,4 @@ TEST(ColumnAggregator, testNullArrayReplaceIfNotNull) {
     ASSERT_EQ("NULL", agg->debug_item(0));
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/agent/task_worker_pool.h
 
@@ -26,7 +39,6 @@
 #include <memory>
 #include <mutex>
 #include <thread>
-#include <utility>
 #include <vector>
 
 #include "agent/agent_common.h"
@@ -34,13 +46,15 @@
 #include "agent/utils.h"
 #include "gen_cpp/AgentService_types.h"
 #include "gen_cpp/HeartbeatService_types.h"
-#include "storage/olap_define.h"
 #include "storage/storage_engine.h"
-#include "util/threadpool.h"
+#include "util/cpu_usage_info.h"
 
 namespace starrocks {
 
 class ExecEnv;
+
+int64_t curr_report_version();
+int64_t next_report_version();
 
 class TaskWorkerPoolBase {
 public:
@@ -57,7 +71,7 @@ public:
     typedef void* (*CALLBACK_FUNCTION)(void*);
 
     TaskWorkerPool(ExecEnv* env, int worker_num);
-    ~TaskWorkerPool();
+    virtual ~TaskWorkerPool();
 
     // start the task worker callback thread
     void start();
@@ -97,6 +111,7 @@ protected:
     std::deque<AgentTaskRequestPtr> _tasks;
 
     uint32_t _worker_count = 0;
+    uint32_t _sleeping_count = 0;
     CALLBACK_FUNCTION _callback_function = nullptr;
 
     std::atomic<bool> _stopped{false};
@@ -190,6 +205,37 @@ private:
 class ReportWorkgroupTaskWorkerPool : public TaskWorkerPool<AgentTaskRequestWithoutReqBody> {
 public:
     ReportWorkgroupTaskWorkerPool(ExecEnv* env, int worker_num) : TaskWorkerPool(env, worker_num) {
+        _callback_function = _worker_thread_callback;
+    }
+
+private:
+    static void* _worker_thread_callback(void* arg_this);
+
+    AgentTaskRequestPtr _convert_task(const TAgentTaskRequest& task, time_t recv_time) override {
+        return std::make_shared<AgentTaskRequestWithoutReqBody>(task, recv_time);
+    }
+};
+
+class ReportResourceUsageTaskWorkerPool : public TaskWorkerPool<AgentTaskRequestWithoutReqBody> {
+public:
+    ReportResourceUsageTaskWorkerPool(ExecEnv* env, int worker_num) : TaskWorkerPool(env, worker_num) {
+        _callback_function = _worker_thread_callback;
+    }
+
+private:
+    static void* _worker_thread_callback(void* arg_this);
+
+    AgentTaskRequestPtr _convert_task(const TAgentTaskRequest& task, time_t recv_time) override {
+        return std::make_shared<AgentTaskRequestWithoutReqBody>(task, recv_time);
+    }
+
+private:
+    CpuUsageRecorder _cpu_usage_recorder;
+};
+
+class ReportDataCacheMetricsTaskWorkerPool final : public TaskWorkerPool<AgentTaskRequestWithoutReqBody> {
+public:
+    ReportDataCacheMetricsTaskWorkerPool(ExecEnv* env, int worker_num) : TaskWorkerPool(env, worker_num) {
         _callback_function = _worker_thread_callback;
     }
 

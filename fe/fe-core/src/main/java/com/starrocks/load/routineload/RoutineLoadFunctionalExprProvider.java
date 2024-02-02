@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.load.routineload;
 
 import com.google.common.collect.ImmutableList;
@@ -7,9 +20,10 @@ import com.starrocks.catalog.PrimitiveType;
 import com.starrocks.common.MetaNotFoundException;
 import com.starrocks.common.util.LogBuilder;
 import com.starrocks.common.util.LogKey;
-import com.starrocks.mysql.privilege.PrivPredicate;
+import com.starrocks.privilege.AccessDeniedException;
+import com.starrocks.privilege.PrivilegeType;
 import com.starrocks.qe.ConnectContext;
-import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.sql.analyzer.Authorizer;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
 
@@ -233,9 +247,17 @@ public class RoutineLoadFunctionalExprProvider extends FunctionalExprProvider<Ro
     @Override
     protected boolean delegatePostRowFilter(ConnectContext cxt, RoutineLoadJob job) {
         try {
-            // validate table privilege at the end of a predicateChain in the `stream().filter()`
-            return GlobalStateMgr.getCurrentState().getAuth()
-                    .checkTblPriv(cxt, job.getDbFullName(), job.getName(), PrivPredicate.LOAD);
+            try {
+                Authorizer.checkTableAction(
+                        cxt.getCurrentUserIdentity(), cxt.getCurrentRoleIds(),
+                        job.getDbFullName(),
+                        job.getTableName(),
+                        PrivilegeType.INSERT);
+            } catch (AccessDeniedException e) {
+                return false;
+            }
+
+            return true;
         } catch (MetaNotFoundException e) {
             LOG.warn(new LogBuilder(LogKey.ROUTINE_LOAD_JOB, job.getId())
                     .add("error_msg", "The metadata of this job has been changed. "

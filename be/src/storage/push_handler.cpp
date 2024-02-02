@@ -1,7 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/push_handler.h"
 
+#include "storage/compaction_manager.h"
 #include "storage/rowset/rowset_factory.h"
 #include "storage/rowset/rowset_id_generator.h"
 #include "storage/rowset/rowset_meta_manager.h"
@@ -11,7 +24,7 @@
 #include "storage/txn_manager.h"
 #include "util/defer_op.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // Process push command, the main logical is as follows:
 //    a. related tablets not exist:
@@ -29,7 +42,6 @@ Status PushHandler::process_streaming_ingestion(const TabletSharedPtr& tablet, c
                                                 PushType push_type, std::vector<TTabletInfo>* tablet_info_vec) {
     LOG(INFO) << "begin to realtime vectorized push. tablet=" << tablet->full_name()
               << ", txn_id: " << request.transaction_id;
-    DCHECK(request.__isset.use_vectorized && request.use_vectorized);
 
     _request = request;
     std::vector<TabletVars> tablet_vars(1);
@@ -90,8 +102,16 @@ Status PushHandler::_do_streaming_ingestion(TabletSharedPtr tablet, const TPushR
             DeletePredicatePB del_pred;
             DeleteConditionHandler del_cond_handler;
             tablet_var.tablet->obtain_header_rdlock();
-            res = del_cond_handler.generate_delete_predicate(tablet_var.tablet->tablet_schema(),
-                                                             request.delete_conditions, &del_pred);
+            auto tablet_schema = TabletSchema::copy(tablet_var.tablet->tablet_schema());
+            if (request.__isset.columns_desc && !request.columns_desc.empty() &&
+                request.columns_desc[0].col_unique_id >= 0) {
+                tablet_schema->clear_columns();
+                for (const auto& column_desc : request.columns_desc) {
+                    tablet_schema->append_column(TabletColumn(column_desc));
+                }
+                tablet_schema->generate_sort_key_idxes();
+            }
+            res = del_cond_handler.generate_delete_predicate(*tablet_schema, request.delete_conditions, &del_pred);
             del_preds.push(del_pred);
             tablet_var.tablet->release_header_lock();
             if (!res.ok()) {
@@ -102,12 +122,21 @@ Status PushHandler::_do_streaming_ingestion(TabletSharedPtr tablet, const TPushR
         }
     }
 
+    auto tablet_schema = std::shared_ptr<TabletSchema>(TabletSchema::copy(tablet_vars->at(0).tablet->tablet_schema()));
+    if (request.__isset.columns_desc && !request.columns_desc.empty() && request.columns_desc[0].col_unique_id >= 0) {
+        tablet_schema->clear_columns();
+        for (const auto& column_desc : request.columns_desc) {
+            tablet_schema->append_column(TabletColumn(column_desc));
+        }
+        tablet_schema->generate_sort_key_idxes();
+    }
+
     Status st = Status::OK();
     if (push_type == PUSH_NORMAL_V2) {
-        st = _load_convert(tablet_vars->at(0).tablet, &(tablet_vars->at(0).rowset_to_add));
+        st = _load_convert(tablet_vars->at(0).tablet, &(tablet_vars->at(0).rowset_to_add), tablet_schema);
     } else {
         DCHECK_EQ(push_type, PUSH_FOR_DELETE);
-        st = _delete_convert(tablet_vars->at(0).tablet, &(tablet_vars->at(0).rowset_to_add));
+        st = _delete_convert(tablet_vars->at(0).tablet, &(tablet_vars->at(0).rowset_to_add), tablet_schema);
     }
 
     if (!st.ok()) {
@@ -148,6 +177,7 @@ Status PushHandler::_do_streaming_ingestion(TabletSharedPtr tablet, const TPushR
                          << ", txn_id: " << request.transaction_id;
             st = Status::InternalError("Fail to commit txn");
         }
+        StorageEngine::instance()->compaction_manager()->update_tablet_async(tablet_var.tablet);
     }
     return st;
 }
@@ -167,7 +197,8 @@ void PushHandler::_get_tablet_infos(const std::vector<TabletVars>& tablet_vars,
     }
 }
 
-Status PushHandler::_delete_convert(const TabletSharedPtr& cur_tablet, RowsetSharedPtr* cur_rowset) {
+Status PushHandler::_delete_convert(const TabletSharedPtr& cur_tablet, RowsetSharedPtr* cur_rowset,
+                                    const TabletSchemaCSPtr& tablet_schema) {
     Status st = Status::OK();
     PUniqueId load_id;
     load_id.set_hi(0);
@@ -186,7 +217,7 @@ Status PushHandler::_delete_convert(const TabletSharedPtr& cur_tablet, RowsetSha
         context.partition_id = _request.partition_id;
         context.tablet_schema_hash = cur_tablet->schema_hash();
         context.rowset_path_prefix = cur_tablet->schema_hash_path();
-        context.tablet_schema = &cur_tablet->tablet_schema();
+        context.tablet_schema = tablet_schema;
         context.rowset_state = PREPARED;
         context.txn_id = _request.transaction_id;
         context.load_id = load_id;
@@ -205,7 +236,7 @@ Status PushHandler::_delete_convert(const TabletSharedPtr& cur_tablet, RowsetSha
 
         // 3. New RowsetBuilder to write data into rowset
         VLOG(3) << "init rowset builder. tablet=" << cur_tablet->full_name()
-                << ", block_row_size=" << cur_tablet->num_rows_per_row_block();
+                << ", block_row_size=" << cur_tablet->num_rows_per_row_block_with_max_version();
         st = rowset_writer->flush();
         if (!st.ok()) {
             LOG(WARNING) << "Failed to finalize writer: " << st;
@@ -223,9 +254,10 @@ Status PushHandler::_delete_convert(const TabletSharedPtr& cur_tablet, RowsetSha
     return st;
 }
 
-Status PushHandler::_load_convert(const TabletSharedPtr& cur_tablet, RowsetSharedPtr* cur_rowset) {
+Status PushHandler::_load_convert(const TabletSharedPtr& cur_tablet, RowsetSharedPtr* cur_rowset,
+                                  const TabletSchemaCSPtr& tablet_schema) {
     Status st;
-    uint32_t num_rows = 0;
+    size_t num_rows = 0;
     PUniqueId load_id;
     load_id.set_hi(0);
     load_id.set_lo(0);
@@ -234,7 +266,7 @@ Status PushHandler::_load_convert(const TabletSharedPtr& cur_tablet, RowsetShare
 
     // 1. init RowsetBuilder of cur_tablet for current push
     VLOG(3) << "init rowset builder. tablet=" << cur_tablet->full_name()
-            << ", block_row_size=" << cur_tablet->num_rows_per_row_block();
+            << ", block_row_size=" << tablet_schema->num_rows_per_row_block();
     RowsetWriterContext context;
     context.rowset_id = StorageEngine::instance()->next_rowset_id();
     context.tablet_uid = cur_tablet->tablet_uid();
@@ -242,7 +274,7 @@ Status PushHandler::_load_convert(const TabletSharedPtr& cur_tablet, RowsetShare
     context.partition_id = _request.partition_id;
     context.tablet_schema_hash = cur_tablet->schema_hash();
     context.rowset_path_prefix = cur_tablet->schema_hash_path();
-    context.tablet_schema = &(cur_tablet->tablet_schema());
+    context.tablet_schema = tablet_schema;
     context.rowset_state = PREPARED;
     context.txn_id = _request.transaction_id;
     context.load_id = load_id;
@@ -284,7 +316,7 @@ Status PushHandler::_load_convert(const TabletSharedPtr& cur_tablet, RowsetShare
 
         // read data from broker and write into Rowset of cur_tablet
         VLOG(3) << "start to convert etl file to delta.";
-        auto schema = ChunkHelper::convert_schema_to_format_v2(cur_tablet->tablet_schema());
+        auto schema = ChunkHelper::convert_schema(tablet_schema);
         ChunkPtr chunk = ChunkHelper::new_chunk(schema, 0);
         while (!reader->eof()) {
             st = reader->next_chunk(&chunk);
@@ -324,4 +356,4 @@ Status PushHandler::_load_convert(const TabletSharedPtr& cur_tablet, RowsetShare
              << ", processed_rows" << num_rows;
     return st;
 }
-} // namespace starrocks::vectorized
+} // namespace starrocks

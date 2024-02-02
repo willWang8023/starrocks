@@ -1,15 +1,29 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 package com.starrocks.system;
 
+import com.google.api.client.util.Maps;
 import com.starrocks.cluster.Cluster;
-import com.starrocks.common.Config;
 import com.starrocks.common.DdlException;
-import com.starrocks.common.ExceptionChecker;
 import com.starrocks.persist.EditLog;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.server.LocalMetastore;
+import com.starrocks.server.RunMode;
 import com.starrocks.service.FrontendOptions;
-import com.starrocks.sql.ast.ModifyBackendAddressClause;
+import com.starrocks.sql.analyzer.AlterSystemStmtAnalyzer;
+import com.starrocks.sql.ast.ModifyBackendClause;
 import mockit.Expectations;
 import mockit.Mock;
 import mockit.MockUp;
@@ -22,6 +36,8 @@ import java.lang.reflect.Field;
 import java.net.InetAddress;
 import java.net.UnknownHostException;
 import java.util.List;
+import java.util.Map;
+import java.util.stream.Collectors;
 
 public class SystemInfoServiceTest {
 
@@ -69,7 +85,7 @@ public class SystemInfoServiceTest {
         mockFunc();
         Backend be = new Backend(100, "127.0.0.1", 1000);
         service.addBackend(be);
-        ModifyBackendAddressClause clause = new ModifyBackendAddressClause("127.0.0.1", "sandbox");
+        ModifyBackendClause clause = new ModifyBackendClause("127.0.0.1", "sandbox");
         service.modifyBackendHost(clause);
         Backend backend = service.getBackendWithHeartbeatPort("sandbox", 1000);
         Assert.assertNotNull(backend);
@@ -82,7 +98,7 @@ public class SystemInfoServiceTest {
         Backend be2 = new Backend(101, "127.0.0.1", 1001);
         service.addBackend(be1);
         service.addBackend(be2);
-        ModifyBackendAddressClause clause = new ModifyBackendAddressClause("127.0.0.1", "sandbox");
+        ModifyBackendClause clause = new ModifyBackendClause("127.0.0.1", "sandbox");
         service.modifyBackendHost(clause);
         Backend backend = service.getBackendWithHeartbeatPort("sandbox", 1000);
         Assert.assertNotNull(backend);
@@ -92,9 +108,26 @@ public class SystemInfoServiceTest {
     public void testUpdateBackendAddressNotFoundBe() throws Exception {
         Backend be = new Backend(100, "originalHost", 1000);
         service.addBackend(be);
-        ModifyBackendAddressClause clause = new ModifyBackendAddressClause("originalHost-test", "sandbox");
+        ModifyBackendClause clause = new ModifyBackendClause("originalHost-test", "sandbox");
         // This case will occur backend [%s] not found exception
         service.modifyBackendHost(clause);
+    }
+
+    /**
+     * Test method for {@link SystemInfoService#modifyBackendProperty(ModifyBackendClause)}.
+     */
+    @Test
+    public void testModifyBackendProperty() throws DdlException {
+        Backend be = new Backend(100, "originalHost", 1000);
+        service.addBackend(be);
+        Map<String, String> properties = Maps.newHashMap();
+        String location = "rack:rack1";
+        properties.put(AlterSystemStmtAnalyzer.PROP_KEY_LOCATION, location);
+        ModifyBackendClause clause = new ModifyBackendClause("originalHost:1000", properties);
+        service.modifyBackendProperty(clause);
+        Backend backend = service.getBackendWithHeartbeatPort("originalHost", 1000);
+        Assert.assertNotNull(backend);
+        Assert.assertEquals("{rack=rack1}", backend.getLocation().toString());
     }
 
     @Test
@@ -107,10 +140,40 @@ public class SystemInfoServiceTest {
     }
 
     @Test
+    public void testGetBackendOrComputeNode() {
+        Backend be = new Backend(10001, "host1", 1000);
+        service.addBackend(be);
+        ComputeNode cn = new ComputeNode(10002, "host2", 1000);
+        cn.setBePort(1001);
+        service.addComputeNode(cn);
+
+        Assert.assertEquals(be, service.getBackendOrComputeNode(be.getId()));
+        Assert.assertEquals(cn, service.getBackendOrComputeNode(cn.getId()));
+        Assert.assertNull(service.getBackendOrComputeNode(/* Not Exist */ 100));
+
+        Assert.assertEquals(cn, service.getBackendOrComputeNodeWithBePort("host2", 1001));
+        Assert.assertFalse(service.checkNodeAvailable(cn));
+        Assert.assertFalse(service.checkNodeAvailable(be));
+
+        List<ComputeNode> nodes = service.backendAndComputeNodeStream().collect(Collectors.toList());
+        Assert.assertEquals(2, nodes.size());
+        Assert.assertEquals(be, nodes.get(0));
+        Assert.assertEquals(cn, nodes.get(1));
+    }
+
+    @Test
     public void testDropBackend() throws Exception {
-        Config.integrate_starmgr = true;
+        new MockUp<RunMode>() {
+            @Mock
+            public RunMode getCurrentRunMode() {
+                return RunMode.SHARED_DATA;
+            }
+        };
+
         Backend be = new Backend(10001, "newHost", 1000);
         service.addBackend(be);
+
+        LocalMetastore localMetastore = new LocalMetastore(globalStateMgr, null, null);
 
         new Expectations() {
             {
@@ -118,39 +181,55 @@ public class SystemInfoServiceTest {
                 minTimes = 0;
                 result = be;
 
-                globalStateMgr.getCluster();
+                globalStateMgr.getLocalMetastore();
+                minTimes = 0;
+                result = localMetastore;
+            }
+        };
+
+        new Expectations(localMetastore) {
+            {
+                localMetastore.getCluster();
                 minTimes = 0;
                 result = new Cluster("cluster", 1);
             }
         };
-
-        ExceptionChecker.expectThrowsWithMsg(DdlException.class,
-                "starletPort has not been updated by heartbeat from this backend",
-                () -> service.dropBackend("newHost", 1000, false));
-
 
         service.addBackend(be);
         be.setStarletPort(1001);
         service.dropBackend("newHost", 1000, false);
         Backend beIP = service.getBackendWithHeartbeatPort("newHost", 1000);
         Assert.assertTrue(beIP == null);
-
-        Config.integrate_starmgr = false;
     }
 
     @Test
     public void testReplayDropBackend() throws Exception {
-        Config.integrate_starmgr = true;
+        new MockUp<RunMode>() {
+            @Mock
+            public RunMode getCurrentRunMode() {
+                return RunMode.SHARED_DATA;
+            }
+        };
+
         Backend be = new Backend(10001, "newHost", 1000);
         be.setStarletPort(1001);
 
+        LocalMetastore localMetastore = new LocalMetastore(globalStateMgr, null, null);
         new Expectations() {
             {
                 service.getBackendWithHeartbeatPort("newHost", 1000);
                 minTimes = 0;
                 result = be;
 
-                globalStateMgr.getCluster();
+                globalStateMgr.getLocalMetastore();
+                minTimes = 0;
+                result = localMetastore;
+            }
+        };
+
+        new Expectations(localMetastore) {
+            {
+                localMetastore.getCluster();
                 minTimes = 0;
                 result = new Cluster("cluster", 1);
             }
@@ -160,10 +239,7 @@ public class SystemInfoServiceTest {
         service.replayDropBackend(be);
         Backend beIP = service.getBackendWithHeartbeatPort("newHost", 1000);
         Assert.assertTrue(beIP == null);
-
-        Config.integrate_starmgr = false;
     }
-
 
     @Mocked
     InetAddress addr;

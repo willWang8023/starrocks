@@ -1,16 +1,29 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.analysis;
 
 import com.starrocks.catalog.Database;
 import com.starrocks.common.util.UUIDUtil;
-import com.starrocks.mysql.privilege.Auth;
-import com.starrocks.mysql.privilege.PrivPredicate;
+
 import com.starrocks.qe.ConnectContext;
 import com.starrocks.qe.StmtExecutor;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.MetadataMgr;
 import com.starrocks.sql.analyzer.AnalyzeTestUtil;
+import com.starrocks.sql.ast.UserIdentity;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import mockit.Expectations;
@@ -29,6 +42,7 @@ public class UseDbStmtTest {
         AnalyzeTestUtil.init();
         starRocksAssert = new StarRocksAssert();
         starRocksAssert.withDatabase("db1").useDatabase("tbl1");
+        starRocksAssert.withDatabase("db");
         ctx = new ConnectContext(null);
         ctx.setGlobalStateMgr(AccessTestUtil.fetchAdminCatalog());
     }
@@ -49,7 +63,9 @@ public class UseDbStmtTest {
     }
 
     @Test
-    public void testUse(@Mocked CatalogMgr catalogMgr, @Mocked MetadataMgr metadataMgr, @Mocked Auth auth) throws Exception {
+    public void testUse(@Mocked CatalogMgr catalogMgr,
+                        @Mocked MetadataMgr metadataMgr) throws Exception {
+        Database db = new Database(1, "db");
         new Expectations() {
             {
                 CatalogMgr.isInternalCatalog("default_catalog");
@@ -60,15 +76,13 @@ public class UseDbStmtTest {
                 minTimes = 0;
 
                 metadataMgr.getDb("default_catalog", "db");
-                result = new Database();
+                result = db;
                 minTimes = 0;
-
-                auth.checkDbPriv(ctx, "db", PrivPredicate.SHOW);
-                result = true;
             }
         };
 
         ctx.setQueryId(UUIDUtil.genUUID());
+        ctx.setCurrentUserIdentity(UserIdentity.ROOT);
         StmtExecutor executor = new StmtExecutor(ctx, "use default_catalog.db");
         executor.execute();
 

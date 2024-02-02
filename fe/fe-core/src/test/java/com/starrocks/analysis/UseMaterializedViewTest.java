@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.analysis;
 
@@ -15,6 +28,7 @@ import com.starrocks.sql.analyzer.Field;
 import com.starrocks.sql.ast.QueryRelation;
 import com.starrocks.sql.ast.QueryStatement;
 import com.starrocks.sql.ast.SelectRelation;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.sql.ast.TableRelation;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
@@ -34,15 +48,13 @@ public class UseMaterializedViewTest {
 
     @BeforeClass
     public static void beforeClass() throws Exception {
-
-        FeConstants.runningUnitTest = true;
-        FeConstants.default_scheduler_interval_millisecond = 100;
-        Config.dynamic_partition_enable = true;
-        Config.dynamic_partition_check_interval_seconds = 1;
-        Config.enable_experimental_mv = true;
         UtFrameUtils.createMinStarRocksCluster();
         // create connect context
         connectContext = UtFrameUtils.createDefaultCtx();
+
+        // set default config for async mvs
+        UtFrameUtils.setDefaultConfigForAsyncMVTest(connectContext);
+
         starRocksAssert = new StarRocksAssert(connectContext);
         starRocksAssert.withDatabase("test").useDatabase("test")
                 .withTable("CREATE TABLE test.tbl1\n" +
@@ -71,7 +83,7 @@ public class UseMaterializedViewTest {
                         ")\n" +
                         "DISTRIBUTED BY HASH(k2) BUCKETS 3\n" +
                         "PROPERTIES('replication_num' = '1');")
-                .withNewMaterializedView("create materialized view mv1 " +
+                .withMaterializedView("create materialized view mv1 " +
                         "partition by ss " +
                         "distributed by hash(k2) " +
                         "refresh async START('2122-12-31') EVERY(INTERVAL 1 HOUR) " +
@@ -79,7 +91,7 @@ public class UseMaterializedViewTest {
                         "\"replication_num\" = \"1\"\n" +
                         ") " +
                         "as select tbl1.k1 ss, k2 from tbl1;")
-                .withNewMaterializedView("create materialized view mv_to_drop " +
+                .withMaterializedView("create materialized view mv_to_drop " +
                         "partition by ss " +
                         "distributed by hash(k2) " +
                         "refresh async START('2122-12-31') EVERY(INTERVAL 1 HOUR) " +
@@ -117,13 +129,13 @@ public class UseMaterializedViewTest {
             MaterializedView materializedView = (MaterializedView) table;
             long baseTableId = materializedView.getBaseTableInfos().iterator().next().getTableId();
             OlapTable baseTable = ((OlapTable) database.getTable(baseTableId));
-            Assert.assertEquals(baseTable.getRelatedMaterializedViews().size(), 2);
+            Assert.assertEquals(2, baseTable.getRelatedMaterializedViews().size());
             StatementBase statementBase = UtFrameUtils.parseStmtWithNewParser(sql, connectContext);
             StmtExecutor stmtExecutor = new StmtExecutor(connectContext, statementBase);
             stmtExecutor.execute();
             table = database.getTable("mv_to_drop");
             Assert.assertTrue(table == null);
-            Assert.assertEquals(baseTable.getRelatedMaterializedViews().size(), 1);
+            Assert.assertEquals(1, baseTable.getRelatedMaterializedViews().size());
         } catch (Exception e) {
             Assert.fail(e.getMessage());
         }

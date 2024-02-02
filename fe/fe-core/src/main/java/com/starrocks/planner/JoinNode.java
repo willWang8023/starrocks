@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/planner/HashJoinNode.java
 
@@ -26,12 +39,14 @@ import com.google.common.base.Preconditions;
 import com.google.common.collect.Lists;
 import com.starrocks.analysis.Analyzer;
 import com.starrocks.analysis.BinaryPredicate;
+import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.analysis.Expr;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.analysis.SlotId;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TableRef;
 import com.starrocks.analysis.TupleId;
+import com.starrocks.common.FeConstants;
 import com.starrocks.common.IdGenerator;
 import com.starrocks.common.UserException;
 import com.starrocks.qe.ConnectContext;
@@ -69,10 +84,14 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
     protected final List<RuntimeFilterDescription> buildRuntimeFilters = Lists.newArrayList();
     protected final List<Integer> filter_null_value_columns = Lists.newArrayList();
     protected List<Expr> partitionExprs;
+
+    // contains both the cols required by parent node and cols required by
+    // other join conjuncts and predicates
     protected List<Integer> outputSlots;
 
     // The partitionByExprs which need to check the probe side for partition join.
     protected List<Expr> probePartitionByExprs;
+    protected boolean canLocalShuffle = false;
 
     public List<RuntimeFilterDescription> getBuildRuntimeFilters() {
         return buildRuntimeFilters;
@@ -118,7 +137,6 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
     public JoinNode(String planNodename, PlanNodeId id, PlanNode outer, PlanNode inner, JoinOperator joinOp,
                     List<Expr> eqJoinConjuncts, List<Expr> otherJoinConjuncts) {
         super(id, planNodename);
-//        Preconditions.checkArgument(eqJoinConjuncts != null && !eqJoinConjuncts.isEmpty());
         Preconditions.checkArgument(otherJoinConjuncts != null);
         tupleIds.addAll(outer.getTupleIds());
         tupleIds.addAll(inner.getTupleIds());
@@ -158,7 +176,7 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
     }
 
     @Override
-    public void buildRuntimeFilters(IdGenerator<RuntimeFilterId> runtimeFilterIdIdGenerator) {
+    public void buildRuntimeFilters(IdGenerator<RuntimeFilterId> runtimeFilterIdIdGenerator, DescriptorTable descTbl) {
         SessionVariable sessionVariable = ConnectContext.get().getSessionVariable();
         JoinOperator joinOp = getJoinOp();
         PlanNode inner = getChild(1);
@@ -166,7 +184,7 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
             return;
         }
 
-        if (distrMode.equals(DistributionMode.PARTITIONED) || distrMode.equals(DistributionMode.LOCAL_HASH_BUCKET)) {
+        if (distrMode.equals(DistributionMode.PARTITIONED) || distrMode.equals(DistributionMode.SHUFFLE_HASH_BUCKET)) {
             // If it's partitioned join, and we can not get correct ndv
             // then it's hard to estimate right bloom filter size, or it's too big.
             // so we'd better to skip this global runtime filter.
@@ -207,7 +225,7 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
                 // push down rf to left child node, and build it only when it
                 // can be accepted by left child node.
                 rf.setBuildExpr(left);
-                if (getChild(0).pushDownRuntimeFilters(rf, right, probePartitionByExprs)) {
+                if (getChild(0).pushDownRuntimeFilters(descTbl, rf, right, probePartitionByExprs)) {
                     buildRuntimeFilters.add(rf);
                 }
             } else {
@@ -223,7 +241,7 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
                 rf.setFilterId(runtimeFilterIdIdGenerator.getNextId().asInt());
                 rf.setBuildExpr(right);
                 rf.setOnlyLocal(true);
-                if (getChild(0).pushDownRuntimeFilters(rf, left, probePartitionByExprs)) {
+                if (getChild(0).pushDownRuntimeFilters(descTbl, rf, left, probePartitionByExprs)) {
                     this.getBuildRuntimeFilters().add(rf);
                 }
             }
@@ -260,19 +278,22 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
             return Optional.empty();
         }
         List<List<Expr>> candidatesOfSlotExprs =
-                exprs.stream().map(expr -> candidatesOfSlotExprForChild(expr, childIdx).get()).collect(Collectors.toList());
+                exprs.stream().map(expr -> candidatesOfSlotExprForChild(expr, childIdx).get())
+                        .collect(Collectors.toList());
         return Optional.of(candidateOfPartitionByExprs(candidatesOfSlotExprs));
     }
 
-    public boolean pushDownRuntimeFiltersForChild(RuntimeFilterDescription description,
+    public boolean pushDownRuntimeFiltersForChild(DescriptorTable descTbl, RuntimeFilterDescription description,
                                                   Expr probeExpr,
                                                   List<Expr> partitionByExprs, int childIdx) {
-        return pushdownRuntimeFilterForChildOrAccept(description, probeExpr, candidatesOfSlotExprForChild(probeExpr, childIdx),
+        return pushdownRuntimeFilterForChildOrAccept(descTbl, description, probeExpr,
+                candidatesOfSlotExprForChild(probeExpr, childIdx),
                 partitionByExprs, candidatesOfSlotExprsForChild(partitionByExprs, childIdx), childIdx, false);
     }
 
     @Override
-    public boolean pushDownRuntimeFilters(RuntimeFilterDescription description, Expr probeExpr, List<Expr> partitionByExprs) {
+    public boolean pushDownRuntimeFilters(DescriptorTable descTbl, RuntimeFilterDescription description, Expr probeExpr,
+                                          List<Expr> partitionByExprs) {
         if (!canPushDownRuntimeFilter()) {
             return false;
         }
@@ -284,12 +305,12 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
             // SlotRef(b) are equivalent.
             boolean isInnerOrSemiJoin = joinOp.isSemiJoin() || joinOp.isInnerJoin();
             if ((probeExpr instanceof SlotRef) && isInnerOrSemiJoin) {
-                hasPushedDown |= pushDownRuntimeFiltersForChild(description, probeExpr, partitionByExprs, 0);
-                hasPushedDown |= pushDownRuntimeFiltersForChild(description, probeExpr, partitionByExprs, 1);
+                hasPushedDown |= pushDownRuntimeFiltersForChild(descTbl, description, probeExpr, partitionByExprs, 0);
+                hasPushedDown |= pushDownRuntimeFiltersForChild(descTbl, description, probeExpr, partitionByExprs, 1);
             }
             // fall back to PlanNode.pushDownRuntimeFilters for HJ if rf cannot be pushed down via equivalent
             // equalJoinConjuncts
-            if (hasPushedDown || super.pushDownRuntimeFilters(description, probeExpr, partitionByExprs)) {
+            if (hasPushedDown || super.pushDownRuntimeFilters(descTbl, description, probeExpr, partitionByExprs)) {
                 return true;
             }
 
@@ -306,6 +327,14 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
 
     public JoinOperator getJoinOp() {
         return joinOp;
+    }
+
+    public List<BinaryPredicate> getEqJoinConjuncts() {
+        return eqJoinConjuncts;
+    }
+
+    public DistributionMode getDistrMode() {
+        return distrMode;
     }
 
     public void setDistributionMode(DistributionMode distrMode) {
@@ -359,6 +388,14 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
         this.isPushDown = isPushDown;
     }
 
+    public boolean getCanLocalShuffle() {
+        return canLocalShuffle;
+    }
+
+    public void setCanLocalShuffle(boolean v) {
+        canLocalShuffle = v;
+    }
+
     @Override
     protected String getNodeExplainString(String detailPrefix, TExplainLevel detailLevel) {
         String distrModeStr =
@@ -366,59 +403,53 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
         StringBuilder output = new StringBuilder().append(
                 detailPrefix + "join op: " + joinOp.toString() + distrModeStr + "\n");
 
-        output.append(detailPrefix).append("colocate: ").append(isColocate)
-                .append(isColocate ? "" : ", reason: " + colocateReason).append("\n");
+        if (detailLevel == TExplainLevel.VERBOSE) {
+            if (isColocate) {
+                output.append(detailPrefix).append("colocate: ").append(isColocate).append("\n");
+            }
+        } else {
+            output.append(detailPrefix).append("colocate: ").append(isColocate)
+                    .append(isColocate ? "" : ", reason: " + colocateReason).append("\n");
+        }
 
         for (BinaryPredicate eqJoinPredicate : eqJoinConjuncts) {
-            output.append(detailPrefix).append("equal join conjunct: ").append(eqJoinPredicate.toSql() + "\n");
+            output.append(detailPrefix).append("equal join conjunct: ");
+            if (detailLevel.equals(TExplainLevel.VERBOSE)) {
+                output.append(eqJoinPredicate.explain());
+            } else {
+                output.append(eqJoinPredicate.toSql());
+            }
+            output.append("\n");
         }
         if (!otherJoinConjuncts.isEmpty()) {
             output.append(detailPrefix + "other join predicates: ").append(
-                    getExplainString(otherJoinConjuncts) + "\n");
+                    getVerboseExplain(otherJoinConjuncts, detailLevel) + "\n");
         }
         if (!conjuncts.isEmpty()) {
-            output.append(detailPrefix + "other predicates: ").append(
-                    getExplainString(conjuncts) + "\n");
-        }
-        return output.toString();
-    }
-
-    @Override
-    protected String getNodeVerboseExplain(String detailPrefix) {
-        String distrModeStr =
-                (distrMode != DistributionMode.NONE) ? (" (" + distrMode.toString() + ")") : "";
-        StringBuilder output = new StringBuilder().append(detailPrefix)
-                .append("join op: ").append(joinOp.toString()).append(distrModeStr).append("\n");
-
-        if (isColocate) {
-            output.append(detailPrefix).append("colocate: ").append(isColocate).append("\n");
+            output.append(detailPrefix).append("other predicates: ")
+                    .append(getVerboseExplain(conjuncts, detailLevel))
+                    .append("\n");
         }
 
-        for (BinaryPredicate eqJoinPredicate : eqJoinConjuncts) {
-            output.append(detailPrefix).append("equal join conjunct: ").
-                    append(eqJoinPredicate.explain()).append("\n");
-        }
-        if (!otherJoinConjuncts.isEmpty()) {
-            output.append(detailPrefix).append("other join predicates: ").
-                    append(getVerboseExplain(otherJoinConjuncts)).append("\n");
-        }
-        if (!conjuncts.isEmpty()) {
-            output.append(detailPrefix).append("other predicates: ").
-                    append(getVerboseExplain(conjuncts)).append("\n");
-        }
-        if (!buildRuntimeFilters.isEmpty()) {
-            output.append(detailPrefix).append("build runtime filters:\n");
-            for (RuntimeFilterDescription rf : buildRuntimeFilters) {
-                output.append(detailPrefix).append("- ").append(rf.toExplainString(-1)).append("\n");
+        if (detailLevel == TExplainLevel.VERBOSE) {
+
+            if (!buildRuntimeFilters.isEmpty()) {
+                output.append(detailPrefix).append("build runtime filters:\n");
+                for (RuntimeFilterDescription rf : buildRuntimeFilters) {
+                    output.append(detailPrefix).append("- ").append(rf.toExplainString(-1)).append("\n");
+                }
+            }
+
+            if (outputSlots != null) {
+                output.append(detailPrefix).append("output columns: ");
+                output.append(outputSlots.stream().map(Object::toString).collect(Collectors.joining(", ")));
+                output.append("\n");
+            }
+
+            if (FeConstants.showJoinLocalShuffleInExplain) {
+                output.append(detailPrefix).append("can local shuffle: " + canLocalShuffle + "\n");
             }
         }
-
-        if (outputSlots != null) {
-            output.append(detailPrefix).append("output columns: ");
-            output.append(outputSlots.stream().map(Object::toString).collect(Collectors.joining(", ")));
-            output.append("\n");
-        }
-
         return output.toString();
     }
 
@@ -448,6 +479,10 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
             return description;
         }
 
+        public boolean areBothSidesShuffled() {
+            return this == SHUFFLE_HASH_BUCKET || this == PARTITIONED;
+        }
+
         public TJoinDistributionMode toThrift() {
             switch (this) {
                 case BROADCAST:
@@ -466,11 +501,6 @@ public abstract class JoinNode extends PlanNode implements RuntimeFilterBuildNod
                     return TJoinDistributionMode.NONE;
             }
         }
-    }
-
-    @Override
-    public boolean canUsePipeLine() {
-        return getChildren().stream().allMatch(PlanNode::canUsePipeLine);
     }
 
     @Override

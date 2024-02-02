@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/runtime/routine_load/data_consumer.h
 
@@ -26,6 +39,7 @@
 #include <unordered_map>
 
 #include "librdkafka/rdkafkacpp.h"
+#include "pulsar/Client.h"
 #include "runtime/stream_load/stream_load_context.h"
 #include "util/blocking_queue.hpp"
 #include "util/uid_util.h"
@@ -36,14 +50,11 @@ class KafkaConsumerPipe;
 class Status;
 class StreamLoadPipe;
 
+using PulsarConsumerPipe = KafkaConsumerPipe;
+
 class DataConsumer {
 public:
-    DataConsumer()
-            : _id(UniqueId::gen_uid()),
-              _grp_id(UniqueId::gen_uid()),
-              _init(false),
-              _cancelled(false),
-              _last_visit_time(0) {}
+    DataConsumer() : _id(UniqueId::gen_uid()), _grp_id(UniqueId::gen_uid()) {}
 
     virtual ~DataConsumer() = default;
 
@@ -71,9 +82,9 @@ protected:
 
     // lock to protect the following bools
     std::mutex _lock;
-    bool _init;
-    bool _cancelled;
-    time_t _last_visit_time;
+    bool _init{false};
+    bool _cancelled{false};
+    time_t _last_visit_time{0};
 };
 
 class KafkaEventCb : public RdKafka::EventCb {
@@ -149,6 +160,58 @@ private:
     size_t _non_eof_partition_count = 0;
     KafkaEventCb _k_event_cb;
     RdKafka::KafkaConsumer* _k_consumer = nullptr;
+};
+
+class PulsarDataConsumer : public DataConsumer {
+public:
+    PulsarDataConsumer(StreamLoadContext* ctx)
+            : DataConsumer(),
+              _service_url(ctx->pulsar_info->service_url),
+              _topic(ctx->pulsar_info->topic),
+              _subscription(ctx->pulsar_info->subscription) {}
+
+    ~PulsarDataConsumer() override {
+        VLOG(3) << "deconstruct pulsar client";
+        if (_p_client) {
+            _p_client->close();
+            delete _p_client;
+            _p_client = nullptr;
+        }
+    }
+
+    enum InitialPosition { LATEST, EARLIEST };
+
+    Status init(StreamLoadContext* ctx) override;
+    Status assign_partition(const std::string& partition, StreamLoadContext* ctx, int64_t initial_position = -1);
+    // TODO(cmy): currently do not implement single consumer start method, using group_consume
+    Status consume(StreamLoadContext* ctx) override { return Status::OK(); }
+    Status cancel(StreamLoadContext* ctx) override;
+    // reassign partition topics
+    Status reset() override;
+    bool match(StreamLoadContext* ctx) override;
+    // acknowledge pulsar message
+    Status acknowledge_cumulative(pulsar::MessageId& message_id);
+
+    // start the consumer and put msgs to queue
+    Status group_consume(TimedBlockingQueue<pulsar::Message*>* queue, int64_t max_running_time_ms);
+
+    // get the partitions of the topic
+    Status get_topic_partition(std::vector<std::string>* partitions);
+
+    // get backlog num of partition
+    Status get_partition_backlog(int64_t* backlog);
+
+    const std::string& get_partition();
+
+private:
+    std::string _service_url;
+    std::string _topic;
+    std::string _subscription;
+    std::unordered_map<std::string, std::string> _custom_properties;
+
+    pulsar::Client* _p_client = nullptr;
+    pulsar::Consumer _p_consumer;
+    std::shared_ptr<PulsarConsumerPipe> _p_consumer_pipe;
 };
 
 } // end namespace starrocks

@@ -1,10 +1,24 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 package com.starrocks.load;
 
 import com.starrocks.analysis.TableName;
 import com.starrocks.common.Config;
-import com.starrocks.common.FeMetaVersion;
+import com.starrocks.persist.metablock.SRMetaBlockReader;
 import com.starrocks.server.GlobalStateMgr;
+import com.starrocks.utframe.UtFrameUtils;
 import mockit.Expectations;
 import mockit.Mocked;
 import org.junit.Assert;
@@ -28,13 +42,6 @@ public class ExportMgrTest {
                 GlobalStateMgr.getCurrentState();
                 minTimes = 0;
                 result = globalStateMgr;
-            }
-        };
-        new Expectations(globalStateMgr) {
-            {
-                globalStateMgr.getCurrentStateJournalVersion();
-                minTimes = 0;
-                result = FeMetaVersion.VERSION_CURRENT;
             }
         };
         Config.history_job_keep_max_second = 10;
@@ -68,6 +75,15 @@ public class ExportMgrTest {
         mgr.replayUpdateJobState(job3.getId(), ExportJob.JobState.FINISHED);
         Assert.assertEquals(2, mgr.getIdToJob().size());
 
+        // 6. get job by queryId
+        ExportJob jobResult = mgr.getExportByQueryId(job3.getQueryId());
+        Assert.assertNotNull(jobResult);
+        Assert.assertEquals(3, jobResult.getId());
+        ExportJob jobResultNull = mgr.getExportByQueryId(null);
+        Assert.assertNull(jobResultNull);
+        ExportJob jobResultNotExist = mgr.getExportByQueryId(new UUID(4, 4));
+        Assert.assertNull(jobResultNotExist);
+
         // 5. save image
         File tempFile = File.createTempFile("GlobalTransactionMgrTest", ".image");
         System.err.println("write image " + tempFile.getAbsolutePath());
@@ -90,5 +106,24 @@ public class ExportMgrTest {
         Assert.assertEquals(saveChecksum, loadChecksum);
 
         tempFile.delete();
+    }
+
+    @Test
+    public void testLoadSaveImageJsonFormat() throws Exception {
+        ExportMgr leaderMgr = new ExportMgr();
+        UtFrameUtils.setUpForPersistTest();
+        ExportJob job = new ExportJob(3, new UUID(3, 3));
+        job.setTableName(new TableName("dummy", "dummy"));
+        leaderMgr.replayCreateExportJob(job);
+
+        UtFrameUtils.PseudoImage image = new UtFrameUtils.PseudoImage();
+        leaderMgr.saveExportJobV2(image.getDataOutputStream());
+
+        ExportMgr followerMgr = new ExportMgr();
+        SRMetaBlockReader reader = new SRMetaBlockReader(image.getDataInputStream());
+        followerMgr.loadExportJobV2(reader);
+        reader.close();
+
+        Assert.assertEquals(1, followerMgr.getIdToJob().size());
     }
 }

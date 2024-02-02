@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/be/src/util/block_compression.cpp
 
@@ -21,6 +34,9 @@
 
 #include "util/compression/block_compression.h"
 
+#ifdef __x86_64__
+#include <libdeflate.h>
+#endif
 #include <lz4/lz4.h>
 #include <lz4/lz4frame.h>
 #include <snappy/snappy-sinksource.h>
@@ -31,8 +47,12 @@
 
 #include "gutil/endian.h"
 #include "gutil/strings/substitute.h"
+#include "util/coding.h"
 #include "util/compression/compression_context_pool_singletons.h"
 #include "util/faststring.h"
+namespace orc {
+uint64_t lzoDecompress(const char* inputAddress, const char* inputLimit, char* outputAddress, char* outputLimit);
+} // namespace orc
 
 namespace starrocks {
 
@@ -509,7 +529,7 @@ LZ4F_preferences_t Lz4fBlockCompression::_s_preferences = {
 
 class SnappySlicesSource : public snappy::Source {
 public:
-    explicit SnappySlicesSource(const std::vector<Slice>& slices) : _available(0), _cur_slice(0), _slice_off(0) {
+    explicit SnappySlicesSource(const std::vector<Slice>& slices) {
         for (auto& slice : slices) {
             // We filter empty slice here to avoid complicated process
             if (slice.size == 0) {
@@ -553,8 +573,9 @@ public:
     // a previous call to Peek().
     // REQUIRES: Available() >= n
     void Skip(size_t n) override {
+        DCHECK(_available >= n);
         _available -= n;
-        do {
+        while (n > 0) {
             auto left = _slices[_cur_slice].size - _slice_off;
             if (left > n) {
                 // n can be digest in current slice
@@ -564,14 +585,14 @@ public:
             _slice_off = 0;
             _cur_slice++;
             n -= left;
-        } while (n > 0);
+        }
     }
 
 private:
     std::vector<Slice> _slices;
-    size_t _available;
-    size_t _cur_slice;
-    size_t _slice_off;
+    size_t _available{0};
+    size_t _cur_slice{0};
+    size_t _slice_off{0};
 };
 
 class SnappyBlockCompression : public BlockCompressionCodec {
@@ -846,7 +867,7 @@ private:
     }
 };
 
-class GzipBlockCompression final : public ZlibBlockCompression {
+class GzipBlockCompression : public ZlibBlockCompression {
 public:
     GzipBlockCompression() : ZlibBlockCompression(CompressionTypePB::GZIP) {}
 
@@ -952,6 +973,108 @@ private:
     const static int MEM_LEVEL = 8;
 };
 
+#ifdef __x86_64__
+class GzipBlockCompressionV2 final : public GzipBlockCompression {
+public:
+    GzipBlockCompressionV2() : GzipBlockCompression() {}
+
+    static const GzipBlockCompressionV2* instance() {
+        static GzipBlockCompressionV2 s_instance;
+        return &s_instance;
+    }
+
+    ~GzipBlockCompressionV2() override = default;
+
+    Status decompress(const Slice& input, Slice* output) const override {
+        if (input.empty()) {
+            output->size = 0;
+            return Status::OK();
+        }
+
+        thread_local std::unique_ptr<libdeflate_decompressor, void (*)(libdeflate_decompressor*)> decompressor{
+                libdeflate_alloc_decompressor(), libdeflate_free_decompressor};
+        if (!decompressor) {
+            return Status::InternalError("libdeflate_alloc_decompressor failed");
+        }
+
+        std::size_t out_len;
+        auto result = libdeflate_gzip_decompress(decompressor.get(), input.data, input.size, output->data, output->size,
+                                                 &out_len);
+        if (result != LIBDEFLATE_SUCCESS) {
+            return Status::InvalidArgument("libdeflate_gzip_decompress failed");
+        }
+
+        return Status::OK();
+    }
+};
+#endif
+
+class LzoBlockCompression : public BlockCompressionCodec {
+public:
+    LzoBlockCompression() : BlockCompressionCodec(CompressionTypePB::LZO) {}
+
+    static const LzoBlockCompression* instance() {
+        static LzoBlockCompression s_instance;
+        return &s_instance;
+    }
+
+    ~LzoBlockCompression() override = default;
+
+    Status compress(const Slice& input, Slice* output, bool use_compression_buffer, size_t uncompressed_size,
+                    faststring* compressed_body1, raw::RawString* compressed_body2) const override {
+        return Status::NotSupported("LzoBlockCompression does not support compress. Support decompress only.");
+    }
+
+    Status decompress(const Slice& input, Slice* output) const override {
+        const char* input_data = input.get_data();
+        size_t input_size = input.get_size();
+        char* output_data = output->mutable_data();
+        char* output_limit = output_data + output->get_size();
+
+        uint32_t uncompressed_size = decode_fixed32_be((const uint8_t*)input_data);
+        if (uncompressed_size != output->get_size()) {
+            return Status::InternalError(
+                    "LzoBlockCompression decompress failed: uncompress size and output size not match");
+        }
+
+        input_data += 4;
+        input_size -= 4;
+
+        while (uncompressed_size) {
+            if (input_size < 4) {
+                return Status::InternalError("LzoBlockCompression decompress failed. input data not enough");
+            }
+            uint32_t block_size = decode_fixed32_be((const uint8_t*)input_data);
+            input_data += 4;
+            input_size -= 4;
+
+            if (input_size < block_size) {
+                return Status::InternalError("LzoBlockCompression decompress failed: input data not enough");
+            }
+            try {
+                uint64_t read = orc::lzoDecompress(input_data, input_data + block_size, output_data, output_limit);
+                DCHECK(read <= uncompressed_size);
+                uncompressed_size -= read;
+                output_data += read;
+            } catch (const std::runtime_error& e) {
+                return Status::InternalError("LzoBlockCompression decompress failed: data corruption");
+            }
+
+            input_data += block_size;
+            input_size -= block_size;
+        }
+        return Status::OK();
+    }
+
+    Status compress(const std::vector<Slice>& inputs, Slice* output, bool use_compression_buffer,
+                    size_t uncompressed_size, faststring* compressed_body1,
+                    raw::RawString* compressed_body2) const override {
+        return Status::NotSupported("LzoBlockCompression does not support compress. Support decompress only.");
+    }
+
+    size_t max_compressed_len(size_t len) const override { return size_t(-1); }
+};
+
 Status get_block_compression_codec(CompressionTypePB type, const BlockCompressionCodec** codec) {
     switch (type) {
     case CompressionTypePB::NO_COMPRESSION:
@@ -973,10 +1096,17 @@ Status get_block_compression_codec(CompressionTypePB type, const BlockCompressio
         *codec = ZstdBlockCompression::instance();
         break;
     case CompressionTypePB::GZIP:
+#ifdef __x86_64__
+        *codec = GzipBlockCompressionV2::instance();
+#else
         *codec = GzipBlockCompression::instance();
+#endif
         break;
     case CompressionTypePB::LZ4_HADOOP:
         *codec = Lz4HadoopBlockCompression::instance();
+        break;
+    case CompressionTypePB::LZO:
+        *codec = LzoBlockCompression::instance();
         break;
     default:
         return Status::NotFound(strings::Substitute("unknown compression type($0)", type));

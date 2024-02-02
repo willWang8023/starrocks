@@ -1,16 +1,28 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
 #include "formats/csv/converter.h"
 
-namespace starrocks::vectorized::csv {
+namespace starrocks::csv {
 class ArrayReader {
 public:
     explicit ArrayReader(char array_delimiter) : _array_delimiter(array_delimiter) {}
     virtual ~ArrayReader() = default;
     [[nodiscard]] virtual bool validate(const Slice& s) const = 0;
-    [[nodiscard]] virtual bool split_array_elements(Slice s, std::vector<Slice>* elements) const = 0;
+    [[nodiscard]] virtual bool split_array_elements(const Slice& s, std::vector<Slice>& elements) const = 0;
 
     // In Hive nested array, string is not quoted, you should set false here if you want
     // to parse Hive array format.
@@ -27,7 +39,7 @@ class DefaultArrayReader final : public ArrayReader {
 public:
     explicit DefaultArrayReader() : ArrayReader(',') {}
     [[nodiscard]] bool validate(const Slice& s) const override;
-    [[nodiscard]] bool split_array_elements(Slice s, std::vector<Slice>* elements) const override;
+    [[nodiscard]] bool split_array_elements(const Slice& s, std::vector<Slice>& elements) const override;
     [[nodiscard]] bool read_quoted_string(const std::unique_ptr<Converter>& elem_converter, Column* column,
                                           const Slice& s, const Converter::Options& options) const override;
 };
@@ -45,7 +57,7 @@ public:
                                                    options.array_hive_mapkey_delimiter,
                                                    options.array_hive_nested_level)) {}
     [[nodiscard]] bool validate(const Slice& s) const override;
-    [[nodiscard]] bool split_array_elements(Slice s, std::vector<Slice>* elements) const override;
+    [[nodiscard]] bool split_array_elements(const Slice& s, std::vector<Slice>& elements) const override;
     [[nodiscard]] bool read_quoted_string(const std::unique_ptr<Converter>& elem_converter, Column* column,
                                           const Slice& s, const Converter::Options& options) const override;
 
@@ -64,4 +76,4 @@ public:
     static char get_collection_delimiter(char collection_delimiter, char mapkey_delimiter, size_t nested_array_level);
 };
 
-} // namespace starrocks::vectorized::csv
+} // namespace starrocks::csv

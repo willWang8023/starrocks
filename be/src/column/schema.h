@@ -1,7 +1,20 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
+#include <numeric>
 #include <string_view>
 #include <utility>
 
@@ -9,7 +22,7 @@
 #include "column/vectorized_fwd.h"
 #include "gen_cpp/olap_file.pb.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // TODO: move constructor and move assignment
 class Schema {
@@ -18,17 +31,21 @@ public:
     Schema(Schema&&) = default;
     Schema& operator=(Schema&&) = default;
 
+    inline static const std::string FULL_ROW_COLUMN = "__row";
+
 #ifdef BE_TEST
     explicit Schema(Fields fields);
 #endif
 
-    explicit Schema(Fields fields, KeysType keys_type);
+    explicit Schema(Fields fields, KeysType keys_type, std::vector<ColumnId> sort_key_idxes);
 
     // if we use this constructor and share the name_to_index with another schema,
     // we must make sure another shema is read only!!!
     explicit Schema(Schema* schema);
 
     explicit Schema(Schema* schema, const std::vector<ColumnId>& cids);
+
+    explicit Schema(Schema* schema, const std::vector<ColumnId>& cids, const std::vector<ColumnId>& scids);
 
     // if we use this constructor and share the name_to_index with another schema,
     // we must make sure another shema is read only!!!
@@ -41,6 +58,9 @@ public:
     size_t num_fields() const { return _fields.size(); }
 
     size_t num_key_fields() const { return _num_keys; }
+
+    const std::vector<ColumnId> sort_key_idxes() const { return _sort_key_idxes; }
+    void append_sort_key_idx(ColumnId idx) { _sort_key_idxes.emplace_back(idx); }
 
     void reserve(size_t size) { _fields.reserve(size); }
 
@@ -61,20 +81,35 @@ public:
 
     std::vector<std::string> field_names() const;
 
+    std::vector<std::string> value_field_names() const;
+
+    std::vector<ColumnId> value_field_column_ids() const;
+
     // return null if name not found
     FieldPtr get_field_by_name(const std::string& name) const;
 
     size_t get_field_index_by_name(const std::string& name) const;
 
-    void convert_to(Schema* new_schema, const std::vector<FieldType>& new_types) const;
+    std::vector<ColumnId> field_column_ids(bool use_rowstore = false) const;
+
+    void convert_to(Schema* new_schema, const std::vector<LogicalType>& new_types) const;
 
     KeysType keys_type() const { return static_cast<KeysType>(_keys_type); }
 
+    void init_sort_key_idxes() { _init_sort_key_idxes(); }
+
 private:
     void _build_index_map(const Fields& fields);
+    void _init_sort_key_idxes() {
+        if (_sort_key_idxes.empty()) {
+            _sort_key_idxes.resize(num_key_fields());
+            std::iota(_sort_key_idxes.begin(), _sort_key_idxes.end(), 0);
+        }
+    }
 
     Fields _fields;
     size_t _num_keys = 0;
+    std::vector<ColumnId> _sort_key_idxes;
     std::shared_ptr<std::unordered_map<std::string_view, size_t>> _name_to_index;
 
     // If we share the same _name_to_index with another vectorized schema,
@@ -109,4 +144,4 @@ inline std::ostream& operator<<(std::ostream& os, const Schema& schema) {
     return os;
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

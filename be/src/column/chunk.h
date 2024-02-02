@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #pragma once
 
@@ -11,25 +23,44 @@
 #include "column/column_hash.h"
 #include "column/schema.h"
 #include "common/global_types.h"
+#include "exec/query_cache/owner_info.h"
 #include "util/phmap/phmap.h"
 
 namespace starrocks {
 class ChunkPB;
-namespace vectorized {
 
 class DatumTuple;
+class ChunkExtraData;
+using ChunkExtraDataPtr = std::shared_ptr<ChunkExtraData>;
+
+/**
+ * ChunkExtraData is an extra data which can be used to extend Chunk and 
+ * attach extra infos beside the schema. eg, In Stream MV scenes, 
+ * the hidden `_op_` column can be added in the ChunkExtraData.
+ *
+ * NOTE: Chunk only offers the set/get methods for ChunkExtraData, extra data
+ * callers need implement the Chunk's specific methods , eg, handle `filter` method 
+ * for the extra data.
+ */
+class ChunkExtraData {
+public:
+    ChunkExtraData() = default;
+    virtual ~ChunkExtraData() = default;
+};
 
 class Chunk {
 public:
     using ChunkPtr = std::shared_ptr<Chunk>;
     using SlotHashMap = phmap::flat_hash_map<SlotId, size_t, StdHash<SlotId>>;
     using ColumnIdHashMap = phmap::flat_hash_map<ColumnId, size_t, StdHash<SlotId>>;
-    using TupleHashMap = phmap::flat_hash_map<TupleId, size_t, StdHash<TupleId>>;
 
     Chunk();
     Chunk(Columns columns, SchemaPtr schema);
-    Chunk(Columns columns, const SlotHashMap& slot_map);
-    Chunk(Columns columns, const SlotHashMap& slot_map, const TupleHashMap& tuple_map);
+    Chunk(Columns columns, SlotHashMap slot_map);
+
+    // Chunk with extra data implements.
+    Chunk(Columns columns, SchemaPtr schema, ChunkExtraDataPtr extra_data);
+    Chunk(Columns columns, SlotHashMap slot_map, ChunkExtraDataPtr extra_data);
 
     Chunk(Chunk&& other) = default;
     Chunk& operator=(Chunk&& other) = default;
@@ -52,10 +83,8 @@ public:
     bool has_rows() const { return num_rows() > 0; }
     bool is_empty() const { return num_rows() == 0; }
     bool has_columns() const { return !_columns.empty(); }
-    bool has_tuple_columns() const { return !_tuple_id_to_index.empty(); }
     size_t num_columns() const { return _columns.size(); }
     size_t num_rows() const { return _columns.empty() ? 0 : _columns[0]->size(); }
-    size_t num_tuple_columns() const { return _tuple_id_to_index.size(); }
 
     // Resize the chunk to contain |count| rows elements.
     //  - If the current size is less than count, additional default values are appended.
@@ -80,8 +109,11 @@ public:
     void insert_column(size_t idx, ColumnPtr column, const FieldPtr& field);
 
     void update_column(ColumnPtr column, SlotId slot_id);
+    void update_column_by_index(ColumnPtr column, size_t idx);
 
-    void append_tuple_column(const ColumnPtr& column, TupleId tuple_id);
+    void update_rows(const Chunk& src, const uint32_t* indexes);
+
+    void append_default();
 
     void remove_column_by_index(size_t idx);
 
@@ -89,7 +121,7 @@ public:
     // For simplicity and better performance, we are assuming |indexes| all all valid
     // and is sorted in ascending order, if it's not, unexpected columns may be removed (silently).
     // |indexes| can be empty and no column will be removed in this case.
-    void remove_columns_by_index(const std::vector<size_t>& indexes);
+    [[maybe_unused]] void remove_columns_by_index(const std::vector<size_t>& indexes);
 
     // schema must exists.
     const ColumnPtr& get_column_by_name(const std::string& column_name) const;
@@ -101,34 +133,31 @@ public:
     const ColumnPtr& get_column_by_id(ColumnId cid) const;
     ColumnPtr& get_column_by_id(ColumnId cid);
 
-    const ColumnPtr& get_tuple_column_by_id(TupleId tuple_id) const;
-    ColumnPtr& get_tuple_column_by_id(TupleId tuple_id);
-
     // Must ensure the slot_id exist
     const ColumnPtr& get_column_by_slot_id(SlotId slot_id) const;
     ColumnPtr& get_column_by_slot_id(SlotId slot_id);
 
+    bool is_column_nullable(SlotId slot_id) const;
+
     void set_slot_id_to_index(SlotId slot_id, size_t idx) { _slot_id_to_index[slot_id] = idx; }
     bool is_slot_exist(SlotId id) const { return _slot_id_to_index.contains(id); }
-    bool is_tuple_exist(TupleId id) const { return _tuple_id_to_index.contains(id); }
     void reset_slot_id_to_index() { _slot_id_to_index.clear(); }
+    size_t get_index_by_slot_id(SlotId slot_id) { return _slot_id_to_index[slot_id]; }
 
     void set_columns(const Columns& columns) { _columns = columns; }
 
+    void set_source_filename(const std::string& source_filename) { _source_filename = source_filename; }
+
+    const std::string& source_filename() const { return _source_filename; }
+
     // Create an empty chunk with the same meta and reserve it of size chunk _num_rows
-    // not clone tuple column
     ChunkUniquePtr clone_empty() const;
     ChunkUniquePtr clone_empty_with_slot() const;
     ChunkUniquePtr clone_empty_with_schema() const;
     // Create an empty chunk with the same meta and reserve it of specified size.
-    // not clone tuple column
     ChunkUniquePtr clone_empty(size_t size) const;
     ChunkUniquePtr clone_empty_with_slot(size_t size) const;
     ChunkUniquePtr clone_empty_with_schema(size_t size) const;
-    // Create an empty chunk with the same meta and reserve it of size chunk _num_rows
-    ChunkUniquePtr clone_empty_with_tuple() const;
-    // Create an empty chunk with the same meta and reserve it of specified size.
-    ChunkUniquePtr clone_empty_with_tuple(size_t size) const;
     ChunkUniquePtr clone_unique() const;
 
     void append(const Chunk& src) { append(src, 0, src.num_rows()); }
@@ -181,7 +210,6 @@ public:
 
     DelCondSatisfied delete_state() const { return _delete_state; }
 
-    const TupleHashMap& get_tuple_id_to_index_map() const { return _tuple_id_to_index; }
     const SlotHashMap& get_slot_id_to_index_map() const { return _slot_id_to_index; }
 
     // Call `Column::reserve` on each column of |chunk|, with |cap| passed as argument.
@@ -196,9 +224,9 @@ public:
     // Column container memory usage
     size_t container_memory_usage() const;
     // Element memory usage that is not in the container, such as memory referenced by pointer.
-    size_t element_memory_usage() const { return element_memory_usage(0, num_rows()); }
+    size_t reference_memory_usage() const { return reference_memory_usage(0, num_rows()); }
     // Element memory usage of |size| rows from |from| in chunk
-    size_t element_memory_usage(size_t from, size_t size) const;
+    size_t reference_memory_usage(size_t from, size_t size) const;
 
     // Chunk bytes usage, used for memtable data size statistic.
     // Including element data size only.
@@ -209,6 +237,12 @@ public:
     size_t bytes_usage(size_t from, size_t size) const;
 
     bool has_const_column() const;
+
+    void materialized_nullable() {
+        for (ColumnPtr& c : _columns) {
+            c->materialized_nullable();
+        }
+    }
 
 #ifndef NDEBUG
     // check whether the internal state is consistent, abort the program if check failed.
@@ -228,9 +262,11 @@ public:
 #define DCHECK_CHUNK(chunk_ptr)
 #endif
 
-    std::string debug_row(uint32_t index) const;
+    std::string debug_row(size_t index) const;
 
     std::string debug_columns() const;
+
+    std::string rebuild_csv_row(size_t index, const std::string& delimiter) const;
 
     bool capacity_limit_reached(std::string* msg = nullptr) const {
         for (const auto& column : _columns) {
@@ -241,6 +277,11 @@ public:
         return false;
     }
 
+    query_cache::owner_info& owner_info() { return _owner_info; }
+    const ChunkExtraDataPtr& get_extra_data() const { return _extra_data; }
+    void set_extra_data(ChunkExtraDataPtr data) { this->_extra_data = std::move(data); }
+    bool has_extra_data() const { return this->_extra_data != nullptr; }
+
 private:
     void rebuild_cid_index();
 
@@ -249,8 +290,10 @@ private:
     ColumnIdHashMap _cid_to_index;
     // For compatibility
     SlotHashMap _slot_id_to_index;
-    TupleHashMap _tuple_id_to_index;
     DelCondSatisfied _delete_state = DEL_NOT_SATISFIED;
+    query_cache::owner_info _owner_info;
+    ChunkExtraDataPtr _extra_data;
+    std::string _source_filename;
 };
 
 inline const ColumnPtr& Chunk::get_column_by_name(const std::string& column_name) const {
@@ -272,6 +315,10 @@ inline ColumnPtr& Chunk::get_column_by_slot_id(SlotId slot_id) {
     return _columns[idx];
 }
 
+inline bool Chunk::is_column_nullable(SlotId slot_id) const {
+    return get_column_by_slot_id(slot_id)->is_nullable();
+}
+
 inline const ColumnPtr& Chunk::get_column_by_index(size_t idx) const {
     return const_cast<Chunk*>(this)->get_column_by_index(idx);
 }
@@ -291,13 +338,4 @@ inline ColumnPtr& Chunk::get_column_by_id(ColumnId cid) {
     return _columns[_cid_to_index[cid]];
 }
 
-inline const ColumnPtr& Chunk::get_tuple_column_by_id(TupleId tuple_id) const {
-    return const_cast<Chunk*>(this)->get_tuple_column_by_id(tuple_id);
-}
-
-inline ColumnPtr& Chunk::get_tuple_column_by_id(TupleId tuple_id) {
-    return _columns[_tuple_id_to_index[tuple_id]];
-}
-
-} // namespace vectorized
 } // namespace starrocks

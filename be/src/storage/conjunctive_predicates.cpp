@@ -1,25 +1,39 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/conjunctive_predicates.h"
 
 #include "column/chunk.h"
+#include "util/failpoint/fail_point.h"
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 // NOTE: No short-circuit.
 Status ConjunctivePredicates::evaluate(const Chunk* chunk, uint8_t* selection) const {
-    return evaluate(chunk, selection, 0, chunk->num_rows());
+    return evaluate(chunk, selection, 0, static_cast<uint16_t>(chunk->num_rows()));
 }
 
 Status ConjunctivePredicates::evaluate_and(const Chunk* chunk, uint8_t* selection) const {
-    return evaluate_and(chunk, selection, 0, chunk->num_rows());
+    return evaluate_and(chunk, selection, 0, static_cast<uint16_t>(chunk->num_rows()));
 }
 
 Status ConjunctivePredicates::evaluate_or(const Chunk* chunk, uint8_t* selection) const {
-    return evaluate_or(chunk, selection, 0, chunk->num_rows());
+    return evaluate_or(chunk, selection, 0, static_cast<uint16_t>(chunk->num_rows()));
 }
 
 Status ConjunctivePredicates::evaluate(const Chunk* chunk, uint8_t* selection, uint16_t from, uint16_t to) const {
+    FAIL_POINT_TRIGGER_RETURN_ERROR(random_error);
     DCHECK_LE(to, chunk->num_rows());
     if (!_vec_preds.empty()) {
         const ColumnPredicate* pred = _vec_preds[0];
@@ -114,4 +128,4 @@ std::string ConjunctivePredicates::debug_string() const {
     return ss.str();
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

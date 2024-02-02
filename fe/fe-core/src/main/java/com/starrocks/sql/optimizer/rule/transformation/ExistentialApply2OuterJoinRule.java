@@ -1,9 +1,23 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.optimizer.rule.transformation;
 
 import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
+import com.starrocks.analysis.BinaryType;
 import com.starrocks.analysis.JoinOperator;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.optimizer.OptExpression;
@@ -32,7 +46,6 @@ import com.starrocks.sql.optimizer.rule.RuleType;
 import java.util.Arrays;
 import java.util.List;
 import java.util.Map;
-import java.util.stream.Collectors;
 
 public class ExistentialApply2OuterJoinRule extends TransformationRule {
     public ExistentialApply2OuterJoinRule() {
@@ -65,7 +78,7 @@ public class ExistentialApply2OuterJoinRule extends TransformationRule {
     private List<OptExpression> transformCorrelation(OptExpression input, LogicalApplyOperator apply,
                                                      ExistsPredicateOperator epo, OptimizerContext context) {
         boolean hasEqPredicate = Utils.extractConjuncts(apply.getCorrelationConjuncts()).stream()
-                .anyMatch(d -> OperatorType.BINARY.equals(d.getOpType()) && BinaryPredicateOperator.BinaryType.EQ
+                .anyMatch(d -> OperatorType.BINARY.equals(d.getOpType()) && BinaryType.EQ
                         .equals(((BinaryPredicateOperator) d).getBinaryType()));
 
         if (hasEqPredicate) {
@@ -185,10 +198,10 @@ public class ExistentialApply2OuterJoinRule extends TransformationRule {
                 .mapToObj(context.getColumnRefFactory()::getColumnRef).forEach(d -> projectMap.put(d, d));
 
         if (isNotExists) {
-            projectMap.put(apply.getOutput(), new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.EQ, count,
+            projectMap.put(apply.getOutput(), new BinaryPredicateOperator(BinaryType.EQ, count,
                     ConstantOperator.createBigint(0)));
         } else {
-            projectMap.put(apply.getOutput(), new BinaryPredicateOperator(BinaryPredicateOperator.BinaryType.GT, count,
+            projectMap.put(apply.getOutput(), new BinaryPredicateOperator(BinaryType.GT, count,
                     ConstantOperator.createBigint(0)));
         }
         OptExpression projectExpression = OptExpression.create(new LogicalProjectOperator(projectMap), joinExpression);
@@ -244,18 +257,21 @@ public class ExistentialApply2OuterJoinRule extends TransformationRule {
         // extract join-key
         CorrelatedPredicateRewriter rewriter = new CorrelatedPredicateRewriter(
                 correlationColumnRefs, context);
-        ScalarOperator newPredicate = SubqueryUtils.rewritePredicateAndExtractColumnRefs(
-                Utils.compoundAnd(correlationPredicates), rewriter);
-
+        ScalarOperator newPredicate = rewriter.rewrite(Utils.compoundAnd(correlationPredicates));
         Map<ColumnRefOperator, ScalarOperator> innerRefMap = rewriter.getColumnRefToExprMap();
 
         // rootOptExpression
         OptExpression rootOptExpression;
 
-        // aggregate
+        // aggregate, need add a countRows to indicate the further join match process result.
+        Map<ColumnRefOperator, CallOperator> aggregates = Maps.newHashMap();
+        CallOperator countRowsCallOp = SubqueryUtils.createCountRowsOperator();
+        ColumnRefOperator countRowsCol = context.getColumnRefFactory()
+                .create("countRows", countRowsCallOp.getType(), countRowsCallOp.isNullable());
+        aggregates.put(countRowsCol, countRowsCallOp);
         LogicalAggregationOperator aggregate =
                 new LogicalAggregationOperator(AggType.GLOBAL, Lists.newArrayList(innerRefMap.keySet()),
-                        Maps.newHashMap());
+                        aggregates);
 
         OptExpression aggregateOptExpression = OptExpression.create(aggregate);
         rootOptExpression = aggregateOptExpression;
@@ -273,9 +289,7 @@ public class ExistentialApply2OuterJoinRule extends TransformationRule {
 
         // filter(UnCorrelation) agg -> project -> un-correlation filter
         if (null != apply.getPredicate()) {
-            OptExpression filterOptExpression =
-                    OptExpression.create(new LogicalFilterOperator(apply.getPredicate()), input.getInputs().get(1));
-
+            OptExpression filterOptExpression = OptExpression.create(new LogicalFilterOperator(apply.getPredicate()));
             rootOptExpression.getInputs().add(filterOptExpression);
             rootOptExpression = filterOptExpression;
         }
@@ -295,9 +309,7 @@ public class ExistentialApply2OuterJoinRule extends TransformationRule {
         Arrays.stream(input.getInputs().get(1).getOutputColumns().getColumnIds())
                 .mapToObj(context.getColumnRefFactory()::getColumnRef).forEach(d -> projectMap.put(d, d));
 
-        ScalarOperator nullPredicate = Utils.compoundAnd(
-                innerRefMap.keySet().stream().map(d -> new IsNullPredicateOperator(!isNot, d))
-                        .collect(Collectors.toList()));
+        ScalarOperator nullPredicate = new IsNullPredicateOperator(!isNot, countRowsCol);
         projectMap.put(apply.getOutput(), nullPredicate);
         LogicalProjectOperator projectOperator = new LogicalProjectOperator(projectMap);
         OptExpression projectOptExpression = OptExpression.create(projectOperator, joinOptExpression);

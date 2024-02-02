@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/TableRef.java
 
@@ -27,14 +40,11 @@ import com.google.gson.annotations.SerializedName;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.common.ErrorCode;
 import com.starrocks.common.ErrorReport;
-import com.starrocks.common.FeMetaVersion;
 import com.starrocks.common.UserException;
 import com.starrocks.common.io.Text;
 import com.starrocks.common.io.Writable;
-import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.ast.PartitionNames;
-import org.apache.logging.log4j.LogManager;
-import org.apache.logging.log4j.Logger;
+import com.starrocks.sql.parser.NodePosition;
 
 import java.io.DataInput;
 import java.io.DataOutput;
@@ -71,7 +81,6 @@ import java.util.List;
  * structure of all subclasses.
  */
 public class TableRef implements ParseNode, Writable {
-    private static final Logger LOG = LogManager.getLogger(TableRef.class);
     @SerializedName(value = "name")
     protected TableName name;
     @SerializedName(value = "partitionNames")
@@ -128,36 +137,31 @@ public class TableRef implements ParseNode, Writable {
     // analysis output
     protected TupleDescriptor desc;
 
+    protected final NodePosition pos;
+
     // END: Members that need to be reset()
     // ///////////////////////////////////////
 
     public TableRef() {
         // for persist
+        pos = NodePosition.ZERO;
     }
 
     public TableRef(TableName name, String alias) {
-        this(name, alias, null);
+        this(name, alias, null, NodePosition.ZERO);
     }
 
     public TableRef(TableName name, String alias, PartitionNames partitionNames) {
-        this(name, alias, partitionNames, null);
+        this(name, alias, partitionNames, null, null, NodePosition.ZERO);
     }
 
-    public TableRef(TableName name, String alias, PartitionNames partitionNames, ArrayList<String> commonHints) {
-        this.name = name;
-        if (alias != null) {
-            aliases_ = new String[] {alias};
-            hasExplicitAlias_ = true;
-        } else {
-            hasExplicitAlias_ = false;
-        }
-        this.partitionNames = partitionNames;
-        this.commonHints = commonHints;
-        isAnalyzed = false;
+    public TableRef(TableName name, String alias, PartitionNames partitionNames, NodePosition pos) {
+        this(name, alias, partitionNames, null, null, pos);
     }
 
     public TableRef(TableName name, String alias, PartitionNames partitionNames, ArrayList<Long> tableIds,
-                    ArrayList<String> commonHints) {
+                    ArrayList<String> commonHints, NodePosition pos) {
+        this.pos = pos;
         this.name = name;
         if (alias != null) {
             aliases_ = new String[] {alias};
@@ -176,6 +180,7 @@ public class TableRef implements ParseNode, Writable {
     // Only used to clone
     // this will reset all the 'analyzed' stuff
     protected TableRef(TableRef other) {
+        pos = other.pos;
         name = other.name;
         aliases_ = other.aliases_;
         hasExplicitAlias_ = other.hasExplicitAlias_;
@@ -207,8 +212,13 @@ public class TableRef implements ParseNode, Writable {
     }
 
     @Override
-    public void analyze(Analyzer analyzer) throws AnalysisException, UserException {
+    public void analyze(Analyzer analyzer) throws UserException {
         ErrorReport.reportAnalysisException(ErrorCode.ERR_UNRESOLVED_TABLE_REF, tableRefToSql());
+    }
+
+    @Override
+    public NodePosition getPos() {
+        return pos;
     }
 
     /**
@@ -403,17 +413,7 @@ public class TableRef implements ParseNode, Writable {
         name = new TableName();
         name.readFields(in);
         if (in.readBoolean()) {
-            if (GlobalStateMgr.getCurrentStateJournalVersion() < FeMetaVersion.VERSION_77) {
-                List<String> partitions = Lists.newArrayList();
-                int size = in.readInt();
-                for (int i = 0; i < size; i++) {
-                    String partName = Text.readString(in);
-                    partitions.add(partName);
-                }
-                partitionNames = new PartitionNames(false, partitions);
-            } else {
-                partitionNames = PartitionNames.read(in);
-            }
+            partitionNames = PartitionNames.read(in);
         }
 
         if (in.readBoolean()) {

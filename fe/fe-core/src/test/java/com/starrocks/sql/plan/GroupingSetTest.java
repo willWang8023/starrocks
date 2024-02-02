@@ -1,4 +1,17 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.sql.plan;
 
@@ -240,6 +253,27 @@ public class GroupingSetTest extends PlanTestBase {
     }
 
     @Test
+    public void testSameGroupingAggIF1() throws Exception {
+        String sql = "select xx, v2, max(v2 + 1), max(if(xx > 1, v2, v3)) / sum(if(xx < 1, v2, v1)) from " +
+                "(select if(v1=1, 2, 3) as xx, * from t0) ff group by grouping sets ((xx, v2))";
+        String plan = getFragmentPlan(sql);
+        assertContains(plan, ":REPEAT_NODE\n" +
+                "  |  repeat: repeat 0 lines [[2, 4]]\n" +
+                "  |  \n" +
+                "  1:Project\n" +
+                "  |  <slot 2> : 2: v2\n" +
+                "  |  <slot 4> : 14: if\n" +
+                "  |  <slot 5> : clone(2: v2) + 1\n" +
+                "  |  <slot 6> : if(clone(14: if) > 1, clone(2: v2), 3: v3)\n" +
+                "  |  <slot 7> : if(clone(14: if) < 1, clone(2: v2), 1: v1)",
+                "6:Project\n" +
+                "  |  <slot 2> : 2: v2\n" +
+                "  |  <slot 4> : 4: if\n" +
+                "  |  <slot 8> : 8: max\n" +
+                "  |  <slot 12> : CAST(9: max AS DOUBLE) / CAST(10: sum AS DOUBLE)");
+    }
+
+    @Test
     public void testSameGroupingAggIF2() throws Exception {
         String sql = "select xx, x2, max(xx + 1) from (" +
                 "select if(x1=1, 2, 3) as xx, * from (" +
@@ -270,13 +304,16 @@ public class GroupingSetTest extends PlanTestBase {
                 "    ) tev,unnest(x2) \n" +
                 ") tev group by GROUPING SETS((u2, r1)) ";
         String plan = getFragmentPlan(sql);
-        assertContains(plan, "6:Project\n" +
+        assertContains(plan, "8:Project\n" +
                 "  |  <slot 10> : 10: unnest\n" +
                 "  |  <slot 11> : datediff(CAST(split(9: array_join, ',')[2] AS DATETIME), CAST(10: unnest AS DATETIME))\n" +
                 "  |  \n" +
-                "  5:TableValueFunction\n" +
+                "  7:TableValueFunction\n" +
+                "  |  tableFunctionName: unnest\n" +
+                "  |  columns: [unnest]\n" +
+                "  |  returnTypes: [BIGINT]\n" +
                 "  |  \n" +
-                "  4:Project\n" +
+                "  6:Project\n" +
                 "  |  <slot 6> : 6: array_agg\n" +
                 "  |  <slot 9> : array_join(7: array_agg, ',')");
     }

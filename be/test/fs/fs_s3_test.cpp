@@ -1,4 +1,16 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "fs/fs_s3.h"
 
@@ -11,22 +23,45 @@
 #include "common/config.h"
 #include "gutil/strings/join.h"
 #include "testutil/assert.h"
+#include "util/uid_util.h"
 
 namespace starrocks {
 
 // NOTE: The bucket must be created before running this test.
-constexpr static const char* kBucketName = "starrocks-fs-s3-unit-test";
+constexpr static const char* kBucketName = "starrocks-fs-s3-ut";
 
 class S3FileSystemTest : public testing::Test {
 public:
-    S3FileSystemTest() = default;
+    S3FileSystemTest() : _root_path(generate_uuid_string()) {}
     ~S3FileSystemTest() override = default;
-    void SetUp() override { Aws::InitAPI(_options); }
-    void TearDown() override { Aws::ShutdownAPI(_options); }
 
-    std::string S3Path(std::string_view path) {
-        return fmt::format("s3://{}.{}{}", kBucketName, config::object_storage_endpoint, path);
+    static void SetUpTestCase() {
+        CHECK(!config::object_storage_access_key_id.empty()) << "Need set object_storage_access_key_id in be_test.conf";
+        CHECK(!config::object_storage_secret_access_key.empty())
+                << "Need set object_storage_secret_access_key in be_test.conf";
+        CHECK(!config::object_storage_endpoint.empty()) << "Need set object_storage_endpoint in be_test.conf";
+
+        Aws::InitAPI(_s_options);
     }
+
+    virtual void SetUp() override {
+        ASSIGN_OR_ABORT(auto fs, FileSystem::CreateUniqueFromString("s3://"));
+        (void)fs->delete_dir_recursive(S3Path("/"));
+    }
+
+    virtual void TearDown() override {
+        ASSIGN_OR_ABORT(auto fs, FileSystem::CreateUniqueFromString("s3://"));
+        (void)fs->delete_dir_recursive(S3Path("/"));
+    }
+
+    static void TearDownTestCase() {
+        close_s3_clients();
+        Aws::ShutdownAPI(_s_options);
+    }
+
+    std::string S3Path(std::string_view path) { return fmt::format("s3://{}/{}{}", kBucketName, _root_path, path); }
+
+    static std::string S3Root() { return fmt::format("s3://{}", kBucketName); }
 
     void CheckIsDirectory(FileSystem* fs, const std::string& dir_name, bool expected_success,
                           bool expected_is_dir = true) {
@@ -38,11 +73,12 @@ public:
     }
 
 private:
-    Aws::SDKOptions _options;
+    std::string _root_path;
+    static inline Aws::SDKOptions _s_options;
 };
 
 TEST_F(S3FileSystemTest, test_write_and_read) {
-    auto uri = fmt::format("s3://{}.{}/dir/test-object.png", kBucketName, config::object_storage_endpoint);
+    auto uri = S3Path("/dir/test-object.png");
     ASSIGN_OR_ABORT(auto fs, FileSystem::CreateUniqueFromString(uri));
     ASSIGN_OR_ABORT(auto wf, fs->new_writable_file(uri));
     EXPECT_OK(wf->append("hello"));
@@ -64,19 +100,24 @@ TEST_F(S3FileSystemTest, test_write_and_read) {
     EXPECT_ERROR(rf->read_at(0, buf, sizeof(buf)));
 }
 
-TEST_F(S3FileSystemTest, test_directory) {
+TEST_F(S3FileSystemTest, test_root_directory) {
     ASSIGN_OR_ABORT(auto fs, FileSystem::CreateUniqueFromString("s3://"));
     bool created = false;
+    auto bucket_root = S3Root();
 
-    ASSERT_TRUE(fs->create_dir(S3Path("/")).is_already_exist());
-    ASSERT_OK(fs->create_dir_if_missing(S3Path("/"), &created));
+    // no need to create the bucket_root
+    ASSERT_TRUE(fs->create_dir(bucket_root).is_already_exist());
+    ASSERT_OK(fs->create_dir_if_missing(bucket_root, &created));
     ASSERT_FALSE(created);
-    CheckIsDirectory(fs.get(), S3Path("/"), true, true);
-    ASSERT_OK(fs->iterate_dir(S3Path("/"), [&](std::string_view /*name*/) -> bool {
-        CHECK(false) << "root directory should be empty";
-        return true;
-    }));
-    ASSERT_ERROR(fs->delete_dir(S3Path(("/"))));
+    CheckIsDirectory(fs.get(), bucket_root, true, true);
+    // can't directly delete from bucket root
+    ASSERT_ERROR(fs->delete_dir(bucket_root));
+}
+
+TEST_F(S3FileSystemTest, test_directory) {
+    auto now = ::time(nullptr);
+    ASSIGN_OR_ABORT(auto fs, FileSystem::CreateUniqueFromString("s3://"));
+    bool created = false;
 
     //
     //  /dirname0/
@@ -139,7 +180,7 @@ TEST_F(S3FileSystemTest, test_directory) {
     //
     {
         ASSIGN_OR_ABORT(auto of, fs->new_writable_file(S3Path("/dirname2/1.dat")));
-        EXPECT_OK(of->append("hello"));
+        EXPECT_OK(of->append("starrocks"));
         EXPECT_OK(of->close());
         CheckIsDirectory(fs.get(), S3Path("/dirname2/1.dat"), true, false);
     }
@@ -155,6 +196,33 @@ TEST_F(S3FileSystemTest, test_directory) {
     //
     EXPECT_OK(fs->create_dir(S3Path("/dirname2/subdir0")));
     CheckIsDirectory(fs.get(), S3Path("/dirname2/subdir0"), true, true);
+
+    EXPECT_OK(fs->iterate_dir2(S3Path("/dirname2/"), [&](DirEntry entry) {
+        auto name = entry.name;
+        if (name == "0.dat") {
+            CHECK(entry.is_dir.has_value());
+            CHECK(!entry.is_dir.value());
+            CHECK(entry.size.has_value());
+            CHECK_EQ(/* length of "hello" = */ 5, entry.size.value());
+            CHECK(entry.mtime.has_value());
+            CHECK_GE(entry.mtime.value(), now);
+        } else if (name == "1.dat") {
+            CHECK(entry.is_dir.has_value());
+            CHECK(!entry.is_dir.value());
+            CHECK(entry.size.has_value());
+            CHECK_EQ(/* length of "starrocks" = */ 9, entry.size.value());
+            CHECK(entry.mtime.has_value());
+            CHECK_GE(entry.mtime.value(), now);
+        } else if (name == "subdir0") {
+            CHECK(entry.is_dir.has_value());
+            CHECK(entry.is_dir.value());
+            CHECK(!entry.size.has_value());
+            CHECK(!entry.mtime.has_value());
+        } else {
+            CHECK(false) << "Unexpected file " << name;
+        }
+        return true;
+    }));
 
     std::vector<std::string> entries;
     auto cb = [&](std::string_view name) -> bool {
@@ -208,7 +276,7 @@ TEST_F(S3FileSystemTest, test_delete_dir_recursive) {
     bool created;
     EXPECT_OK(fs->create_dir_if_missing(S3Path("/dirname0"), &created));
     ASSERT_OK(fs->delete_dir_recursive(S3Path("/dirname0")));
-    EXPECT_OK(fs->iterate_dir(S3Path("/"), cb));
+    EXPECT_TRUE(fs->iterate_dir(S3Path("/"), cb).is_not_found());
     ASSERT_EQ(0, entries.size());
 
     EXPECT_OK(fs->create_dir_if_missing(S3Path("/dirname0"), &created));
@@ -234,7 +302,7 @@ TEST_F(S3FileSystemTest, test_delete_dir_recursive) {
     ASSERT_EQ(1, entries.size());
     ASSERT_EQ("dirname0x", entries[0]);
     ASSERT_OK(fs->delete_dir(S3Path("/dirname0x")));
-    ASSERT_ERROR(fs->delete_dir_recursive(S3Path("/")));
+    ASSERT_TRUE(fs->delete_dir_recursive(S3Path("/")).is_not_found());
 }
 
 TEST_F(S3FileSystemTest, test_delete_nonexist_file) {

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/persist/Storage.java
 
@@ -54,6 +67,7 @@ public class Storage {
     // version file props keys
     private static final String VERSION_PROP_CLUSTER_ID = "clusterId";
     private static final String VERSION_PROP_TOKEN = "token";
+    private static final String VERSION_PROP_RUN_MODE = "runMode";
     // role file props keys
     private static final String ROLE_PROP_FRONTEND_ROLE = "role";
     private static final String ROLE_PROP_NODE_NAME = "name";
@@ -62,6 +76,7 @@ public class Storage {
     // version file props values
     private int clusterID = 0;
     private String token;
+    private String runMode;
     // role file props values
     private FrontendNodeType role = FrontendNodeType.UNKNOWN;
     private String nodeName;
@@ -100,7 +115,11 @@ public class Storage {
                 if (prop.getProperty(VERSION_PROP_TOKEN) != null) {
                     token = prop.getProperty(VERSION_PROP_TOKEN);
                 }
+                if (prop.getProperty(VERSION_PROP_RUN_MODE) != null) {
+                    runMode = prop.getProperty(VERSION_PROP_RUN_MODE);
+                }
             }
+
         }
 
         File roleFile = getRoleFile();
@@ -148,6 +167,14 @@ public class Storage {
         this.token = token;
     }
 
+    public String getRunMode() {
+        return runMode;
+    }
+
+    public void setRunMode(String runMode) {
+        this.runMode = runMode;
+    }
+
     public FrontendNodeType getRole() {
         return role;
     }
@@ -184,17 +211,14 @@ public class Storage {
         return UUID.randomUUID().toString();
     }
 
-    private void setFields(Properties properties) throws IOException {
+    public void writeVersionFile() throws IOException {
+        Properties properties = new Properties();
         Preconditions.checkState(clusterID > 0);
         properties.setProperty(VERSION_PROP_CLUSTER_ID, String.valueOf(clusterID));
         if (!Strings.isNullOrEmpty(token)) {
             properties.setProperty(VERSION_PROP_TOKEN, token);
         }
-    }
-
-    public void writeClusterIdAndToken() throws IOException {
-        Properties properties = new Properties();
-        setFields(properties);
+        properties.setProperty(VERSION_PROP_RUN_MODE, runMode);
         try (RandomAccessFile file = new RandomAccessFile(new File(metaDir, VERSION_FILE), "rws")) {
             file.seek(0);
             try (FileOutputStream out = new FileOutputStream(file.getFD())) {
@@ -240,10 +264,14 @@ public class Storage {
             if (children != null) {
                 for (String child : children) {
                     File file = new File(metaFile, child);
-                    file.delete();
+                    if (!file.delete()) {
+                        LOG.warn("Failed to delete file, filepath={}", file.getAbsolutePath());
+                    }
                 }
             }
-            metaFile.delete();
+            if (!metaFile.delete()) {
+                LOG.warn("Failed to delete file, filepath={}", metaFile.getAbsolutePath());
+            }
         }
 
         if (!metaFile.mkdirs()) {

@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/analysis/CastExpr.java
 
@@ -23,12 +36,12 @@ package com.starrocks.analysis;
 
 import com.google.common.base.Preconditions;
 import com.starrocks.catalog.Function;
-import com.starrocks.catalog.ScalarType;
 import com.starrocks.catalog.Type;
 import com.starrocks.common.AnalysisException;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.sql.analyzer.SemanticException;
 import com.starrocks.sql.ast.AstVisitor;
+import com.starrocks.sql.parser.NodePosition;
 import com.starrocks.thrift.TExprNode;
 import com.starrocks.thrift.TExprNodeType;
 import com.starrocks.thrift.TExprOpcode;
@@ -50,7 +63,11 @@ public class CastExpr extends Expr {
     private boolean noOp = false;
 
     public CastExpr(Type targetType, Expr e) {
-        super();
+        this(targetType, e, NodePosition.ZERO);
+    }
+
+    public CastExpr(Type targetType, Expr e, NodePosition pos) {
+        super(pos);
         Preconditions.checkArgument(targetType.isValid());
         Preconditions.checkNotNull(e);
         type = targetType;
@@ -72,6 +89,11 @@ public class CastExpr extends Expr {
      * Copy c'tor used in clone().
      */
     public CastExpr(TypeDef targetTypeDef, Expr e) {
+        this(targetTypeDef, e, NodePosition.ZERO);
+    }
+
+    public CastExpr(TypeDef targetTypeDef, Expr e, NodePosition pos) {
+        super(pos);
         Preconditions.checkNotNull(targetTypeDef);
         Preconditions.checkNotNull(e);
         this.targetTypeDef = targetTypeDef;
@@ -101,13 +123,10 @@ public class CastExpr extends Expr {
 
     @Override
     public String toSqlImpl() {
-        if (isImplicit) {
-            return getChild(0).toSql();
-        }
-        if (isAnalyzed) {
+        if (targetTypeDef == null) {
             return "CAST(" + getChild(0).toSql() + " AS " + type.toString() + ")";
         } else {
-            return "CAST(" + getChild(0).toSql() + " AS " + targetTypeDef.toString() + ")";
+            return "CAST(" + getChild(0).toSql() + " AS " + targetTypeDef + ")";
         }
     }
 
@@ -165,17 +184,7 @@ public class CastExpr extends Expr {
     @Override
     public void analyzeImpl(Analyzer analyzer) throws AnalysisException {
         Preconditions.checkState(!isImplicit);
-        // When cast target type is string and it's length is default -1, the result length
-        // of cast is decided by child.
-        if (targetTypeDef.getType().isScalarType()) {
-            final ScalarType targetType = (ScalarType) targetTypeDef.getType();
-            if (!(targetType.getPrimitiveType().isStringType()
-                    && !targetType.isAssignedStrLenInColDefinition())) {
-                targetTypeDef.analyze(analyzer);
-            }
-        } else {
-            targetTypeDef.analyze(analyzer);
-        }
+        targetTypeDef.analyze(analyzer);
         type = targetTypeDef.getType();
         analyze();
     }
@@ -216,6 +225,10 @@ public class CastExpr extends Expr {
 
     @Override
     public boolean isNullable() {
+        Expr fromExpr = getChild(0);
+        if (fromExpr.getType().isFullyCompatible(getType())) {
+            return fromExpr.isNullable();
+        }
         return true;
     }
 

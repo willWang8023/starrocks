@@ -1,10 +1,24 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "storage/range.h"
 
 #include <gtest/gtest.h>
 
-namespace starrocks::vectorized {
+#include <sstream>
+
+namespace starrocks {
 
 inline std::string to_bitmap_string(const uint8_t* bitmap, size_t n) {
     std::string s;
@@ -15,7 +29,7 @@ inline std::string to_bitmap_string(const uint8_t* bitmap, size_t n) {
 }
 
 TEST(SparseRangeTest, range_union) {
-    SparseRange range;
+    SparseRange<> range;
     ASSERT_TRUE(range.empty());
     EXPECT_EQ(0, range.span_size());
 
@@ -65,11 +79,11 @@ TEST(SparseRangeTest, range_union) {
 }
 
 TEST(SparseRangeTest, range_intersection) {
-    SparseRange r1({{1, 10}, {20, 40}, {50, 70}});
-    SparseRange r2{{0, 100}};
-    SparseRange r3{};
-    SparseRange r4{{2, 30}};
-    SparseRange r5{{1, 20}, {25, 26}, {30, 65}};
+    SparseRange<> r1({{1, 10}, {20, 40}, {50, 70}});
+    SparseRange<> r2{{0, 100}};
+    SparseRange<> r3{};
+    SparseRange<> r4{{2, 30}};
+    SparseRange<> r5{{1, 20}, {25, 26}, {30, 65}};
 
     auto r = r1.intersection(r1);
     EXPECT_EQ(r1, r);
@@ -88,8 +102,8 @@ TEST(SparseRangeTest, range_intersection) {
 }
 
 TEST(SparseRangeIteratorTest, covered_ranges) {
-    SparseRange r1({{0, 10}, {20, 40}, {50, 70}});
-    SparseRangeIterator iter = r1.new_iterator();
+    SparseRange<> r1({{0, 10}, {20, 40}, {50, 70}});
+    SparseRangeIterator<> iter = r1.new_iterator();
     EXPECT_EQ(0, iter.covered_ranges(0));
     for (int i = 1; i <= 20; i++) {
         EXPECT_EQ(1u, iter.covered_ranges(i)) << "i=" << i;
@@ -125,10 +139,75 @@ TEST(SparseRangeIteratorTest, covered_ranges) {
     }
 }
 
+std::string dump_range_iter(const SparseRangeIterator<>& iter) {
+    std::stringstream ss;
+    if (!iter.has_more()) {
+        ss << "[]";
+        return ss.str();
+    }
+    bool fst = true;
+    for (size_t i = iter._index; i < iter._range->_ranges.size(); ++i) {
+        if (!fst) {
+            ss << ",";
+        }
+        ss << "[";
+        if (fst) {
+            ss << iter._next_rowid;
+        } else {
+            ss << iter._range->_ranges[i].begin();
+        }
+        ss << ",";
+        ss << iter._range->_ranges[i].end();
+        ss << "]";
+        fst = false;
+    }
+    return ss.str();
+}
+
+TEST(SparseRangeIteratorTest, intersect_test) {
+    // test intersection
+    {
+        SparseRange<> r1(0, 4096);
+        SparseRangeIterator<> iter = r1.new_iterator();
+        iter.skip(1000);
+        SparseRange<> r2({{0, 10}, {20, 40}, {50, 70}});
+        SparseRange<> r3;
+        auto iter2 = iter.intersection(r2, &r3);
+        EXPECT_STREQ(dump_range_iter(iter2).data(), "[]");
+    }
+    {
+        SparseRange<> r1(0, 4096);
+        SparseRangeIterator<> iter = r1.new_iterator();
+        iter.skip(30);
+        SparseRange<> r2({{0, 10}, {20, 40}, {50, 7000}});
+        SparseRange<> r3;
+        auto iter2 = iter.intersection(r2, &r3);
+        EXPECT_STREQ(dump_range_iter(iter2).data(), "[30,40],[50,4096]");
+    }
+    {
+        SparseRange<> r1(0, 4096);
+        SparseRangeIterator<> iter = r1.new_iterator();
+        iter.skip(30);
+        SparseRange<> r2({{1000, 1500}, {2000, 25000}, {3000, 7000}});
+        SparseRange<> r3;
+        auto iter2 = iter.intersection(r2, &r3);
+        EXPECT_STREQ(dump_range_iter(iter2).data(), "[1000,1500],[2000,4096]");
+    }
+    {
+        SparseRange<> r1(0, 100);
+        SparseRangeIterator<> iter = r1.new_iterator();
+        iter.skip(30);
+        SparseRange<> r2({{10, 200}, {2000, 25000}, {3000, 7000}});
+        SparseRange<> r3;
+        auto iter2 = iter.intersection(r2, &r3);
+        EXPECT_STREQ(dump_range_iter(iter2).data(), "[30,100]");
+    }
+}
+
 TEST(SparseRangeIteratorTest, convert_to_bitmap) {
     std::vector<uint8_t> bitmap(100, 0);
-    SparseRange r1({{1, 11}, {20, 22}, {24, 25}});
-    SparseRangeIterator iter = r1.new_iterator();
+    SparseRange<> r1({{1, 11}, {20, 22}, {24, 25}});
+    SparseRangeIterator<> iter = r1.new_iterator();
 
     ASSERT_EQ(0u, iter.convert_to_bitmap(bitmap.data(), 0));
 
@@ -166,4 +245,4 @@ TEST(SparseRangeIteratorTest, convert_to_bitmap) {
     ASSERT_EQ("111111111100000000011001", to_bitmap_string(bitmap.data(), 24));
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

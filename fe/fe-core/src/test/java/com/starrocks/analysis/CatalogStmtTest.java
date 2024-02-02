@@ -1,17 +1,31 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 
 package com.starrocks.analysis;
 
 import com.starrocks.connector.ConnectorMgr;
-import com.starrocks.execution.DataDefinitionExecutorFactory;
-import com.starrocks.mysql.nio.NConnectContext;
 import com.starrocks.qe.ConnectContext;
+import com.starrocks.qe.DDLStmtExecutor;
 import com.starrocks.server.CatalogMgr;
 import com.starrocks.server.GlobalStateMgr;
 import com.starrocks.server.MetadataMgr;
 import com.starrocks.sql.analyzer.AnalyzeTestUtil;
+import com.starrocks.sql.analyzer.AstToStringBuilder;
 import com.starrocks.sql.ast.CreateCatalogStmt;
 import com.starrocks.sql.ast.DropCatalogStmt;
+import com.starrocks.sql.ast.StatementBase;
 import com.starrocks.utframe.StarRocksAssert;
 import com.starrocks.utframe.UtFrameUtils;
 import org.junit.Assert;
@@ -83,16 +97,15 @@ public class CatalogStmtTest {
         ConnectContext connectCtx = new ConnectContext();
         connectCtx.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
         CreateCatalogStmt statement = (CreateCatalogStmt) stmt;
-        DataDefinitionExecutorFactory.execute(statement, connectCtx);
+        DDLStmtExecutor.execute(statement, connectCtx);
         CatalogMgr catalogMgr = GlobalStateMgr.getCurrentState().getCatalogMgr();
         ConnectorMgr connectorMgr = GlobalStateMgr.getCurrentState().getConnectorMgr();
         MetadataMgr metadataMgr = GlobalStateMgr.getCurrentState().getMetadataMgr();
         Assert.assertTrue(catalogMgr.catalogExists("hive_catalog"));
         Assert.assertTrue(connectorMgr.connectorExists("hive_catalog"));
-        Assert.assertTrue(metadataMgr.connectorMetadataExists("hive_catalog"));
 
         try {
-            DataDefinitionExecutorFactory.execute(statement, connectCtx);
+            DDLStmtExecutor.execute(statement, connectCtx);
         } catch (IllegalStateException e) {
             Assert.assertTrue(e.getMessage().contains("exists"));
         }
@@ -100,7 +113,6 @@ public class CatalogStmtTest {
         catalogMgr.dropCatalog(new DropCatalogStmt("hive_catalog"));
         Assert.assertFalse(catalogMgr.catalogExists("hive_catalog"));
         Assert.assertFalse(connectorMgr.connectorExists("hive_catalog"));
-        Assert.assertFalse(metadataMgr.connectorMetadataExists("hive_catalog"));
     }
 
     @Test
@@ -119,33 +131,50 @@ public class CatalogStmtTest {
         ConnectContext connectCtx = new ConnectContext();
         connectCtx.setGlobalStateMgr(GlobalStateMgr.getCurrentState());
         CreateCatalogStmt createCatalogStmt = (CreateCatalogStmt) createStmtBase;
-        DataDefinitionExecutorFactory.execute(createCatalogStmt, connectCtx);
+        DDLStmtExecutor.execute(createCatalogStmt, connectCtx);
         Assert.assertTrue(catalogMgr.catalogExists("hive_catalog"));
         Assert.assertTrue(connectorMgr.connectorExists("hive_catalog"));
-        Assert.assertTrue(metadataMgr.connectorMetadataExists("hive_catalog"));
 
         StatementBase dropStmtBase = AnalyzeTestUtil.analyzeSuccess(dropSql);
         Assert.assertTrue(dropStmtBase instanceof DropCatalogStmt);
         DropCatalogStmt dropCatalogStmt = (DropCatalogStmt) dropStmtBase;
-        DataDefinitionExecutorFactory.execute(dropCatalogStmt, connectCtx);
+        DDLStmtExecutor.execute(dropCatalogStmt, connectCtx);
         Assert.assertFalse(catalogMgr.catalogExists("hive_catalog"));
         Assert.assertFalse(connectorMgr.connectorExists("hive_catalog"));
-        Assert.assertFalse(metadataMgr.connectorMetadataExists("hive_catalog"));
 
         // test drop ddl DROP CATALOG 'catalog_name'
         String dropSql_2 = "DROP CATALOG 'hive_catalog'";
 
-        DataDefinitionExecutorFactory.execute(createCatalogStmt, connectCtx);
+        DDLStmtExecutor.execute(createCatalogStmt, connectCtx);
         Assert.assertTrue(catalogMgr.catalogExists("hive_catalog"));
         Assert.assertTrue(connectorMgr.connectorExists("hive_catalog"));
-        Assert.assertTrue(metadataMgr.connectorMetadataExists("hive_catalog"));
 
         StatementBase dropStmtBase_2 = AnalyzeTestUtil.analyzeSuccess(dropSql_2);
         Assert.assertTrue(dropStmtBase_2 instanceof DropCatalogStmt);
         DropCatalogStmt dropCatalogStmt_2 = (DropCatalogStmt) dropStmtBase;
-        DataDefinitionExecutorFactory.execute(dropCatalogStmt_2, connectCtx);
+        DDLStmtExecutor.execute(dropCatalogStmt_2, connectCtx);
         Assert.assertFalse(catalogMgr.catalogExists("hive_catalog"));
         Assert.assertFalse(connectorMgr.connectorExists("hive_catalog"));
-        Assert.assertFalse(metadataMgr.connectorMetadataExists("hive_catalog"));
+    }
+
+    @Test
+    public void testToString() {
+        String sql = "CREATE EXTERNAL CATALOG " +
+                "`aauato_test_delta_lake_access_key_catalog` COMMENT 'auto test delta lake access key catalog!@#' " +
+                "PROPERTIES(\"type\" = \"deltalake\",\"aws.s3.region\" = \"us-west-2\"," +
+                "\"hive.metastore.type\" = \"glue\",\"aws.glue.region\" = \"us-west-2\"," +
+                "\"aws.glue.use_instance_profile\" = \"false\",\"aws.glue.access_key\" = \"some_key1\"," +
+                "\"aws.glue.secret_key\" = \"some_key2\",\"aws.s3.use_instance_profile\" = \"false\"" +
+                ",\"aws.s3.access_key\" = \"some_key3\",\"aws.s3.secret_key\" = \"some_key4\");\n";
+        ConnectContext ctx = starRocksAssert.getCtx();
+        CreateCatalogStmt
+                stmt = (CreateCatalogStmt) com.starrocks.sql.parser.SqlParser.parse(sql, ctx.getSessionVariable()).get(0);
+        Assert.assertEquals("CREATE EXTERNAL CATALOG 'aauato_test_delta_lake_access_key_catalog' " +
+                "COMMENT \"auto test delta lake access key catalog!@#\" PROPERTIES(\"aws.s3.access_key\"  =  \"***\", " +
+                "\"hive.metastore.type\"  =  \"glue\", \"aws.s3.secret_key\"  =  \"***\", " +
+                "\"aws.glue.secret_key\"  =  \"***\", \"aws.s3.region\"  =  \"us-west-2\", " +
+                "\"aws.glue.use_instance_profile\"  =  \"false\", \"aws.s3.use_instance_profile\"  =  \"false\", " +
+                "\"aws.glue.region\"  =  \"us-west-2\", \"type\"  =  \"deltalake\", " +
+                "\"aws.glue.access_key\"  =  \"***\")", AstToStringBuilder.toString(stmt));
     }
 }

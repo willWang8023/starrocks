@@ -1,29 +1,46 @@
-// This file is licensed under the Elastic License 2.0. Copyright 2021-present, StarRocks Inc.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
 
 #include "column/schema.h"
 
 #include <algorithm>
+#include <utility>
 
-namespace starrocks::vectorized {
+namespace starrocks {
 
 #ifdef BE_TEST
 
-Schema::Schema(Fields fields) : Schema(fields, KeysType::DUP_KEYS) {}
+Schema::Schema(Fields fields) : Schema(fields, KeysType::DUP_KEYS, {}) {
+    _init_sort_key_idxes();
+}
 
 #endif
 
-Schema::Schema(Fields fields, KeysType keys_type)
+Schema::Schema(Fields fields, KeysType keys_type, std::vector<ColumnId> sort_key_idxes)
         : _fields(std::move(fields)),
+          _sort_key_idxes(std::move(sort_key_idxes)),
           _name_to_index_append_buffer(nullptr),
-          _share_name_to_index(false),
+
           _keys_type(static_cast<uint8_t>(keys_type)) {
     auto is_key = [](const FieldPtr& f) { return f->is_key(); };
     _num_keys = std::count_if(_fields.begin(), _fields.end(), is_key);
     _build_index_map(_fields);
+    _init_sort_key_idxes();
 }
 
 Schema::Schema(Schema* schema, const std::vector<ColumnId>& cids)
-        : _name_to_index_append_buffer(nullptr), _share_name_to_index(false), _keys_type(schema->_keys_type) {
+        : _name_to_index_append_buffer(nullptr), _keys_type(schema->_keys_type) {
     _fields.resize(cids.size());
     for (int i = 0; i < cids.size(); i++) {
         DCHECK_LT(cids[i], schema->_fields.size());
@@ -32,6 +49,22 @@ Schema::Schema(Schema* schema, const std::vector<ColumnId>& cids)
     auto is_key = [](const FieldPtr& f) { return f->is_key(); };
     _num_keys = std::count_if(_fields.begin(), _fields.end(), is_key);
     _build_index_map(_fields);
+    _init_sort_key_idxes();
+}
+
+Schema::Schema(Schema* schema, const std::vector<ColumnId>& cids, const std::vector<ColumnId>& scids)
+        : _name_to_index_append_buffer(nullptr), _keys_type(schema->_keys_type) {
+    DCHECK(!scids.empty());
+    _fields.resize(cids.size());
+    for (int i = 0; i < cids.size(); i++) {
+        DCHECK_LT(cids[i], schema->_fields.size());
+        _fields[i] = schema->_fields[cids[i]];
+    }
+    _sort_key_idxes = scids;
+    auto is_key = [](const FieldPtr& f) { return f->is_key(); };
+    _num_keys = std::count_if(_fields.begin(), _fields.end(), is_key);
+    _build_index_map(_fields);
+    _init_sort_key_idxes();
 }
 
 // if we use this constructor and share the name_to_index with another schema,
@@ -43,6 +76,7 @@ Schema::Schema(Schema* schema)
     for (int i = 0; i < schema->_fields.size(); i++) {
         _fields[i] = schema->_fields[i];
     }
+    _sort_key_idxes = schema->sort_key_idxes();
     if (schema->_name_to_index_append_buffer == nullptr) {
         // share the name_to_index with schema, later append fields will be added to _name_to_index_append_buffer
         schema->_share_name_to_index = true;
@@ -52,6 +86,7 @@ Schema::Schema(Schema* schema)
         _share_name_to_index = false;
         _build_index_map(_fields);
     }
+    _init_sort_key_idxes();
 }
 
 // if we use this constructor and share the name_to_index with another schema,
@@ -62,6 +97,7 @@ Schema::Schema(const Schema& schema)
     for (int i = 0; i < schema._fields.size(); i++) {
         _fields[i] = schema._fields[i];
     }
+    _sort_key_idxes = schema.sort_key_idxes();
     if (schema._name_to_index_append_buffer == nullptr) {
         // share the name_to_index with schema&, later append fields will be added to _name_to_index_append_buffer
         schema._share_name_to_index = true;
@@ -71,6 +107,7 @@ Schema::Schema(const Schema& schema)
         _share_name_to_index = false;
         _build_index_map(_fields);
     }
+    _init_sort_key_idxes();
 }
 
 // if we use this constructor and share the name_to_index with another schema,
@@ -83,6 +120,7 @@ Schema& Schema::operator=(const Schema& other) {
     for (int i = 0; i < this->_fields.size(); i++) {
         this->_fields[i] = other._fields[i];
     }
+    this->_sort_key_idxes = other.sort_key_idxes();
     if (other._name_to_index_append_buffer == nullptr) {
         // share the name_to_index with schema&, later append fields will be added to _name_to_index_append_buffer
         other._share_name_to_index = true;
@@ -111,6 +149,7 @@ void Schema::append(const FieldPtr& field) {
     }
 }
 
+// it's not being used, especially in sort key scenario, so do not handle this case
 void Schema::insert(size_t idx, const FieldPtr& field) {
     DCHECK_LT(idx, _fields.size());
 
@@ -127,6 +166,7 @@ void Schema::insert(size_t idx, const FieldPtr& field) {
     _build_index_map(_fields);
 }
 
+// it's not being used, especially in sort key scenario, so do not handle this case
 void Schema::remove(size_t idx) {
     DCHECK_LT(idx, _fields.size());
     _num_keys -= _fields[idx]->is_key();
@@ -165,6 +205,37 @@ std::vector<std::string> Schema::field_names() const {
     return names;
 }
 
+// without _row
+std::vector<std::string> Schema::value_field_names() const {
+    std::vector<std::string> names;
+    for (const auto& field : _fields) {
+        if (!field->is_key() && Schema::FULL_ROW_COLUMN != field->name()) {
+            names.emplace_back(field->name());
+        }
+    }
+    return names;
+}
+
+std::vector<ColumnId> Schema::value_field_column_ids() const {
+    std::vector<ColumnId> column_ids;
+    for (const auto& field : _fields) {
+        if (!field->is_key() && Schema::FULL_ROW_COLUMN != field->name()) {
+            column_ids.emplace_back(field->id());
+        }
+    }
+    return column_ids;
+}
+
+std::vector<ColumnId> Schema::field_column_ids(bool use_rowstore) const {
+    std::vector<ColumnId> column_ids;
+    for (const auto& field : _fields) {
+        if (use_rowstore || Schema::FULL_ROW_COLUMN != field->name()) {
+            column_ids.emplace_back(field->id());
+        }
+    }
+    return column_ids;
+}
+
 FieldPtr Schema::get_field_by_name(const std::string& name) const {
     size_t idx = get_field_index_by_name(name);
     return idx == -1 ? nullptr : _fields[idx];
@@ -196,10 +267,10 @@ size_t Schema::get_field_index_by_name(const std::string& name) const {
     return p->second;
 }
 
-void Schema::convert_to(Schema* new_schema, const std::vector<FieldType>& new_types) const {
-    int num_fields = _fields.size();
+void Schema::convert_to(Schema* new_schema, const std::vector<LogicalType>& new_types) const {
+    size_t num_fields = _fields.size();
     new_schema->_fields.resize(num_fields);
-    for (int i = 0; i < num_fields; ++i) {
+    for (size_t i = 0; i < num_fields; ++i) {
         auto cid = _fields[i]->id();
         auto new_type = new_types[cid];
         if (_fields[i]->type()->type() == new_type) {
@@ -216,4 +287,4 @@ void Schema::convert_to(Schema* new_schema, const std::vector<FieldType>& new_ty
     }
 }
 
-} // namespace starrocks::vectorized
+} // namespace starrocks

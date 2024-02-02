@@ -1,4 +1,17 @@
-// This file is made available under Elastic License 2.0.
+// Copyright 2021-present StarRocks, Inc. All rights reserved.
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     https://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
 // This file is based on code available under the Apache license here:
 //   https://github.com/apache/incubator-doris/blob/master/fe/fe-core/src/main/java/org/apache/doris/planner/SetOperationNode.java
 
@@ -27,13 +40,18 @@ import com.google.common.collect.Lists;
 import com.google.common.collect.Maps;
 import com.google.common.collect.Sets;
 import com.starrocks.analysis.Analyzer;
+import com.starrocks.analysis.DescriptorTable;
 import com.starrocks.analysis.Expr;
+import com.starrocks.analysis.SlotDescriptor;
+import com.starrocks.analysis.SlotId;
 import com.starrocks.analysis.SlotRef;
 import com.starrocks.analysis.TupleId;
 import com.starrocks.thrift.TExceptNode;
 import com.starrocks.thrift.TExplainLevel;
 import com.starrocks.thrift.TExpr;
 import com.starrocks.thrift.TIntersectNode;
+import com.starrocks.thrift.TNormalPlanNode;
+import com.starrocks.thrift.TNormalSetOperationNode;
 import com.starrocks.thrift.TPlanNode;
 import com.starrocks.thrift.TPlanNodeType;
 import com.starrocks.thrift.TUnionNode;
@@ -41,6 +59,7 @@ import org.apache.commons.collections.CollectionUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -76,6 +95,7 @@ public abstract class SetOperationNode extends PlanNode {
     // Set in init() and substituted against the corresponding child's output smap.
     protected List<List<Expr>> materializedResultExprLists_ = Lists.newArrayList();
     protected List<List<Expr>> materializedConstExprLists_ = Lists.newArrayList();
+    protected List<Expr> setOperationOutputList = Lists.newArrayList();
 
     // Indicates if this UnionNode is inside a subplan.
     protected boolean isInSubplan_;
@@ -129,6 +149,10 @@ public abstract class SetOperationNode extends PlanNode {
 
     public void setOutputSlotIdToChildSlotIdMaps(List<Map<Integer, Integer>> outputSlotIdToChildSlotIdMaps) {
         this.outputSlotIdToChildSlotIdMaps = outputSlotIdToChildSlotIdMaps;
+    }
+
+    public void setSetOperationOutputList(List<Expr> setOperationOutputList) {
+        this.setOperationOutputList = setOperationOutputList;
     }
 
     @Override
@@ -198,6 +222,13 @@ public abstract class SetOperationNode extends PlanNode {
             }
         }
         if (detailLevel == TExplainLevel.VERBOSE) {
+            if (CollectionUtils.isNotEmpty(setOperationOutputList)) {
+                output.append(prefix).append("output exprs:").append("\n");
+                output.append(prefix).append("    ")
+                        .append(setOperationOutputList.stream().map(Expr::explain).collect(
+                                Collectors.joining(" | "))).append("\n");
+            }
+
             if (CollectionUtils.isNotEmpty(materializedResultExprLists_)) {
                 output.append(prefix).append("child exprs:").append("\n");
                 for (List<Expr> exprs : materializedResultExprLists_) {
@@ -264,7 +295,7 @@ public abstract class SetOperationNode extends PlanNode {
                 newSlotExprs.add(mexpr);
             }
         }
-        return newSlotExprs.size() > 0? Optional.of(newSlotExprs) : Optional.empty();
+        return newSlotExprs.size() > 0 ? Optional.of(newSlotExprs) : Optional.empty();
     }
 
     public Optional<List<List<Expr>>> candidatesOfSlotExprsForChild(List<Expr> exprs, int childIdx) {
@@ -277,7 +308,7 @@ public abstract class SetOperationNode extends PlanNode {
     }
 
     @Override
-    public boolean pushDownRuntimeFilters(RuntimeFilterDescription description, Expr probeExpr, List<Expr> partitionByExprs) {
+    public boolean pushDownRuntimeFilters(DescriptorTable descTbl, RuntimeFilterDescription description, Expr probeExpr, List<Expr> partitionByExprs) {
         if (!canPushDownRuntimeFilter()) {
             return false;
         }
@@ -290,7 +321,7 @@ public abstract class SetOperationNode extends PlanNode {
             boolean pushDown = false;
             // try to push all children if any expr of a child can match `probeExpr`
             for (int i = 0; i < materializedResultExprLists_.size(); i++) {
-                pushDown |= pushdownRuntimeFilterForChildOrAccept(description, probeExpr,
+                pushDown |= pushdownRuntimeFilterForChildOrAccept(descTbl, description, probeExpr,
                         candidatesOfSlotExprForChild(probeExpr, i), partitionByExprs,
                         candidatesOfSlotExprsForChild(partitionByExprs, i), i, false);
             }
@@ -308,5 +339,43 @@ public abstract class SetOperationNode extends PlanNode {
             return true;
         }
         return false;
+    }
+
+    @Override
+    protected void toNormalForm(TNormalPlanNode planNode, FragmentNormalizer normalizer) {
+        TNormalSetOperationNode setOperationNode = new TNormalSetOperationNode();
+        setOperationNode.setTuple_id(normalizer.remapTupleId(tupleId_).asInt());
+        setOperationNode.setResult_expr_lists(
+                materializedConstExprLists_.stream().map(normalizer::normalizeOrderedExprs)
+                        .collect(Collectors.toList()));
+        setOperationNode.setConst_expr_lists(
+                constExprLists_.stream().map(normalizer::normalizeOrderedExprs).collect(Collectors.toList()));
+        setOperationNode.setFirst_materialized_child_idx(firstMaterializedChildIdx_);
+        if (this instanceof UnionNode) {
+            planNode.setNode_type(TPlanNodeType.UNION_NODE);
+        } else if (this instanceof ExceptNode) {
+            planNode.setNode_type(TPlanNodeType.EXCEPT_NODE);
+        } else if (this instanceof IntersectNode) {
+            planNode.setNode_type(TPlanNodeType.INTERSECT_NODE);
+        } else {
+            Preconditions.checkState(false);
+        }
+        planNode.setSet_operation_node(setOperationNode);
+        normalizeConjuncts(normalizer, planNode, conjuncts);
+        super.toNormalForm(planNode, normalizer);
+    }
+
+    @Override
+    public void collectEquivRelation(FragmentNormalizer normalizer) {
+        List<SlotId> slots = normalizer.getExecPlan().getDescTbl().getTupleDesc(tupleId_).getSlots().stream().map(
+                SlotDescriptor::getId).collect(Collectors.toList());
+        for (PlanNode child : getChildren()) {
+            List<SlotId> childSlots =
+                    normalizer.getExecPlan().getDescTbl().getTupleDesc(child.getTupleIds().get(0)).getSlots().stream()
+                            .map(SlotDescriptor::getId).collect(Collectors.toList());
+            for (int i = 0; i < slots.size(); ++i) {
+                normalizer.getEquivRelation().union(slots.get(i), childSlots.get(i));
+            }
+        }
     }
 }
